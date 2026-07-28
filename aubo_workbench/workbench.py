@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import BOTH, LEFT, RIGHT, X, Y, filedialog, messagebox, ttk
@@ -202,6 +204,141 @@ class CalibrationHubPanel(ttk.Frame):
                 close()
 
 
+class RobotQuickActions(ttk.LabelFrame):
+    """工作台顶部的高频机器人操作；每次动作使用独立短连接。"""
+
+    def __init__(self, master: tk.Misc, get_connection) -> None:
+        super().__init__(master, text="公共机器人操作", padding=8)
+        self.get_connection = get_connection
+        self.busy = False
+        self.status_var = tk.StringVar(value="未读取机器人状态")
+        self._buttons: list[ttk.Button] = []
+        self._build()
+
+    def _button(self, text: str, command) -> ttk.Button:
+        button = ttk.Button(self, text=text, command=command)
+        button.pack(side=LEFT, padx=(0, 6))
+        self._buttons.append(button)
+        return button
+
+    def _build(self) -> None:
+        self._button("刷新状态", self.refresh_status)
+        self._button("上电并启动", self.power_on)
+        self._button("停止运动", self.stop_motion)
+        self._button("清空队列", self.clear_queue)
+        self._button("回原点", self.move_home)
+        ttk.Label(self, textvariable=self.status_var, foreground="#555555").pack(side=LEFT, padx=(10, 0))
+
+    def _set_busy(self, busy: bool, text: str | None = None) -> None:
+        self.busy = busy
+        for button in self._buttons:
+            button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        if text is not None:
+            self.status_var.set(text)
+
+    def _with_session(self, label: str, action, *, confirm: str | None = None) -> None:
+        if self.busy:
+            return
+        if confirm and not messagebox.askyesno(label, confirm, parent=self.winfo_toplevel()):
+            return
+        try:
+            cfg = self.get_connection()
+        except Exception as exc:
+            messagebox.showerror("连接参数错误", str(exc), parent=self.winfo_toplevel())
+            return
+        self._set_busy(True, f"{label}：连接机械臂…")
+
+        def work() -> None:
+            session = None
+            try:
+                from .motion_control import AuboMotionSession
+
+                session = AuboMotionSession()
+                session.connect(cfg["ip"], cfg["port"], cfg["user"], cfg["password"], cfg["timeout_ms"])
+                result = action(session)
+                snapshot = session.snapshot()
+                message = self._format_snapshot(label, snapshot, result)
+            except Exception as exc:
+                self.after(0, lambda: self._show_action_error(label, exc))
+                return
+            finally:
+                if session is not None:
+                    session.disconnect()
+            self.after(0, lambda: self._finish_action(message))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _format_snapshot(label: str, snapshot: dict[str, Any], result: Any = None) -> str:
+        tcp = snapshot.get("tcp_pose_m_rad", [])
+        xyz = [round(float(value) * 1000.0, 2) for value in tcp[:3]] if len(tcp) >= 3 else ["-", "-", "-"]
+        suffix = "" if result is None else f"，返回={result}"
+        return (
+            f"{label}完成：上电={snapshot.get('power_on')}，静止={snapshot.get('steady')}，"
+            f"碰撞={snapshot.get('collision')}，TCP XYZ(mm)={xyz}{suffix}"
+        )
+
+    def _finish_action(self, message: str) -> None:
+        self._set_busy(False, message)
+
+    def _show_action_error(self, label: str, exc: Exception) -> None:
+        self._set_busy(False, f"{label}失败")
+        messagebox.showerror(f"{label}失败", str(exc), parent=self.winfo_toplevel())
+
+    def refresh_status(self) -> None:
+        self._with_session("刷新状态", lambda session: None)
+
+    def power_on(self) -> None:
+        self._with_session(
+            "上电并启动", lambda session: session.power_on_startup(),
+            confirm="将对机械臂上电并启动。确认继续吗？",
+        )
+
+    def stop_motion(self) -> None:
+        self._with_session(
+            "停止运动", lambda session: session.stop_motion(),
+            confirm="将向控制器发送停止运动命令。确认继续吗？",
+        )
+
+    def clear_queue(self) -> None:
+        self._with_session(
+            "清空运动队列", lambda session: session.clear_path(),
+            confirm="将清空控制器当前运动队列。确认继续吗？",
+        )
+
+    def move_home(self) -> None:
+        from .motion_control import load_home_point
+
+        home = load_home_point()
+        if home is None:
+            messagebox.showwarning("未设置原点", "请先在“机器人控制”页面设定原点。", parent=self.winfo_toplevel())
+            return
+        target = [round(float(value), 4) for value in home.tcp_pose_m_rad[:3]]
+
+        def action(session) -> Any:
+            response = session.move_joint(home.joints_rad, math.radians(20.0), math.radians(40.0))
+            deadline = time.monotonic() + 45.0
+            while time.monotonic() < deadline:
+                snapshot = session.snapshot()
+                if snapshot.get("collision"):
+                    raise RuntimeError("回原点后检测到碰撞标志")
+                joints = snapshot.get("joints_rad", [])
+                at_home = (
+                    len(joints) == len(home.joints_rad)
+                    and max(abs(float(actual) - float(target)) for actual, target in zip(joints, home.joints_rad))
+                    <= math.radians(0.5)
+                )
+                if snapshot.get("power_on") and snapshot.get("steady") and at_home:
+                    return response
+                time.sleep(0.25)
+            raise RuntimeError("回原点超时：机械臂未稳定到达保存的关节原点")
+
+        self._with_session(
+            "回原点", action,
+            confirm=f"将以关节运动回到原点“{home.name}”，目标 TCP XYZ(m)={target}。确认继续吗？",
+        )
+
+
 class AuboWorkbench(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -246,6 +383,9 @@ class AuboWorkbench(tk.Tk):
         ttk.Entry(top, textvariable=self.timeout_var, width=8).pack(side=LEFT, padx=(4, 12))
         ttk.Button(top, text="同步当前页面", command=self.sync_current_page).pack(side=LEFT, padx=(0, 8))
         ttk.Label(top, text="连接信息只在此处维护；切换页面会自动同步。", foreground="#555555").pack(side=LEFT)
+
+        self.quick_actions = RobotQuickActions(self, self.get_connection)
+        self.quick_actions.pack(fill=X, padx=10, pady=(0, 6))
 
         body = ttk.Frame(self)
         body.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
