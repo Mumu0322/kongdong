@@ -1,0 +1,1659 @@
+{
+  "record_type": "e7_handeye_cross_validation",
+  "record_policy": "candidate_current_replace_on_refresh",
+  "template_only": false,
+  "validated": false,
+  "do_not_use_for_motion": true,
+  "production_eligible": false,
+  "candidate_ready_for_independent_review": false,
+  "generated_at": "2026-07-20T14:21:09+08:00",
+  "camera_serial": "CP4B85P001L",
+  "robot_id": "AUBO:rob1:aubo_i5H",
+  "camera_mount_id": "",
+  "calibration_id": "handeye-e7-20260720-142109-982",
+  "verified_by": "",
+  "raw_data_sha256": "bab4da83283393378566da426770759b74c094cce546ec577af749de0e6e38bc",
+  "raw_data_manifest": {
+    "algorithm": "sha256",
+    "raw_data_sha256": "bab4da83283393378566da426770759b74c094cce546ec577af749de0e6e38bc",
+    "files": [
+      {
+        "sample_index": 1,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_001_20260720_134408_732.json",
+        "size_bytes": 13453,
+        "sha256": "be7714250690d2f3c9cb11ce3ed6cba007a626167141a5847d4e079c22d06952"
+      },
+      {
+        "sample_index": 1,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_001_20260720_134408_732_rgb.png",
+        "size_bytes": 1338644,
+        "sha256": "188393d7ff0ec6ae4b92de5d35563b8d1416c4816b5fdd7314151101651523e4"
+      },
+      {
+        "sample_index": 1,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_001_20260720_134408_732_overlay.png",
+        "size_bytes": 1319929,
+        "sha256": "d305a410b74b302b0addcc14a844b62b2b28b5489d363bbff43ef58167365f9d"
+      },
+      {
+        "sample_index": 2,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_002_20260720_134426_528.json",
+        "size_bytes": 13450,
+        "sha256": "353c99b85f2b62b839f041a73163c2ef9c8b1af0b7e576d7516fd0bf0c8ee967"
+      },
+      {
+        "sample_index": 2,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_002_20260720_134426_528_rgb.png",
+        "size_bytes": 1354461,
+        "sha256": "28b2ebaf03704f19bb47853e6fe406c77c5461c869edc3c67c520c84606a481c"
+      },
+      {
+        "sample_index": 2,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_002_20260720_134426_528_overlay.png",
+        "size_bytes": 1342082,
+        "sha256": "d85eff32ba503177b25cde003e7730f8d45aaf8b8fc1749135811bd84d3c74f9"
+      },
+      {
+        "sample_index": 4,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_004_20260720_134853_306.json",
+        "size_bytes": 13489,
+        "sha256": "397482b8614d40ef5a97fcf0246b6f54be13d5ef2558587a2cf77d21a360a7bb"
+      },
+      {
+        "sample_index": 4,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_004_20260720_134853_306_rgb.png",
+        "size_bytes": 1343547,
+        "sha256": "b525b2d826bb2dc2cb42f1a0e745889ce50449c8da49a3c5c9927400c49eaa89"
+      },
+      {
+        "sample_index": 4,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_004_20260720_134853_306_overlay.png",
+        "size_bytes": 1330368,
+        "sha256": "6cde26488ced02c4fe55fbb41825bf74756f53cf1945c17f8e33072ba18ccc92"
+      },
+      {
+        "sample_index": 5,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_005_20260720_134923_512.json",
+        "size_bytes": 13518,
+        "sha256": "e9710e915d551856832de7d34574009fdae28baae0bf87dd29437e91146aa22c"
+      },
+      {
+        "sample_index": 5,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_005_20260720_134923_512_rgb.png",
+        "size_bytes": 1368132,
+        "sha256": "033ba7d65de9a4f5db89c58a77b95dd6bfa1399396eeaa3df5695f854146c384"
+      },
+      {
+        "sample_index": 5,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_005_20260720_134923_512_overlay.png",
+        "size_bytes": 1333493,
+        "sha256": "7d15f6b858ab0c0c01b38e680dc266ace2a5e31d0b5199f660140116655e5e63"
+      },
+      {
+        "sample_index": 6,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_006_20260720_135004_803.json",
+        "size_bytes": 13585,
+        "sha256": "69df7bfbce6bdd2794131c11225ac6c78eab20c82809d6a656de5b9bb0e36696"
+      },
+      {
+        "sample_index": 6,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_006_20260720_135004_803_rgb.png",
+        "size_bytes": 1348575,
+        "sha256": "b800742cc069c137e875bed1f2b9982a5f4ea242854657e05f33065a815a4ca6"
+      },
+      {
+        "sample_index": 6,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_006_20260720_135004_803_overlay.png",
+        "size_bytes": 1339192,
+        "sha256": "d6a889403ffbcc3f2c30fb36d8a5de83e593c605a8631c642c43048442ff720a"
+      },
+      {
+        "sample_index": 8,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_008_20260720_135048_991.json",
+        "size_bytes": 13698,
+        "sha256": "c36619ea529c2362b5094c8c46a3f086290eb0ab95f67e743b8bbf50ee74f989"
+      },
+      {
+        "sample_index": 8,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_008_20260720_135048_991_rgb.png",
+        "size_bytes": 1290910,
+        "sha256": "9c5980209fd39763ebc9b37790005724faf98b897b592c7cf736cb9142d1fccc"
+      },
+      {
+        "sample_index": 8,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_008_20260720_135048_991_overlay.png",
+        "size_bytes": 1268840,
+        "sha256": "d3d2eb838c922a16636998746d3a0c3e0c5fc29a525655b831aab1fd4b6bf412"
+      },
+      {
+        "sample_index": 10,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_010_20260720_135134_296.json",
+        "size_bytes": 13416,
+        "sha256": "7c5ca8875f2b86e5b58271e4ac75f3a6d9f3bf3286395c22c9024de974c9951a"
+      },
+      {
+        "sample_index": 10,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_010_20260720_135134_296_rgb.png",
+        "size_bytes": 1311115,
+        "sha256": "9237165bd081cbd254424e36ca0523c0dae027a3db899e450afb51ccf1fe0ea7"
+      },
+      {
+        "sample_index": 10,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_010_20260720_135134_296_overlay.png",
+        "size_bytes": 1304375,
+        "sha256": "9397f5c0284bcb599ba4e9c92332e612b62424eeb546b6a0d7466d693987bc06"
+      },
+      {
+        "sample_index": 11,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_011_20260720_135210_492.json",
+        "size_bytes": 13629,
+        "sha256": "7dd12389181588bcd74360ce6279d4a0658ddf01fba5886f2e0033d757712919"
+      },
+      {
+        "sample_index": 11,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_011_20260720_135210_492_rgb.png",
+        "size_bytes": 1304345,
+        "sha256": "cc4e5940f2f98fca7d54cc7af8f1ebd2e058052feecb5507fbc2738d09a272f6"
+      },
+      {
+        "sample_index": 11,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_011_20260720_135210_492_overlay.png",
+        "size_bytes": 1305468,
+        "sha256": "5cccbe12f677c1e5e6db042738ef516921059160798ad27503c5119e70bc9d4c"
+      },
+      {
+        "sample_index": 12,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_012_20260720_135239_873.json",
+        "size_bytes": 13629,
+        "sha256": "58a13ee12679d3376f5515b91827f555c07f917b6c2e0ea30c5e27b427b343ef"
+      },
+      {
+        "sample_index": 12,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_012_20260720_135239_873_rgb.png",
+        "size_bytes": 1394625,
+        "sha256": "d287e30059d853f23f87cc19bb0e1b2e5b499fd421de24eeb203f78a4273fc1a"
+      },
+      {
+        "sample_index": 12,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_012_20260720_135239_873_overlay.png",
+        "size_bytes": 1384975,
+        "sha256": "e864b8bbd8e281240d2595dc14f689775876b911bb9bd9bb1d28b36ef005d3a7"
+      },
+      {
+        "sample_index": 13,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_013_20260720_135259_184.json",
+        "size_bytes": 13603,
+        "sha256": "ea1be6ff011dd36aecb5dc857ce5c2c0c4798e1d47c4944caf6bc0f76afcd75c"
+      },
+      {
+        "sample_index": 13,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_013_20260720_135259_184_rgb.png",
+        "size_bytes": 1343860,
+        "sha256": "f1cca3a454df3e9f4874471c4e61c908343bcc4eaa14ff7540c5897f57f58d17"
+      },
+      {
+        "sample_index": 13,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_013_20260720_135259_184_overlay.png",
+        "size_bytes": 1332799,
+        "sha256": "61b9ebcccb8d714953875443c54e661b047cd6f697a2b02aa3dbcbe7920a6fe7"
+      },
+      {
+        "sample_index": 14,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_014_20260720_135334_067.json",
+        "size_bytes": 13478,
+        "sha256": "bec7eadacbedd99cbc25a5ff8bb7621605f640a7f175c15b093da474d36737dc"
+      },
+      {
+        "sample_index": 14,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_014_20260720_135334_067_rgb.png",
+        "size_bytes": 1322351,
+        "sha256": "b21a1e2edab890cb4ed767383bf989b4c1822d9f3015aba3dfb98e2f9431b47a"
+      },
+      {
+        "sample_index": 14,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_014_20260720_135334_067_overlay.png",
+        "size_bytes": 1301593,
+        "sha256": "cceca541fdae7e1d7128d7483bf2b208b29c76e46beb773b836cf98f350f264a"
+      },
+      {
+        "sample_index": 15,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_015_20260720_135404_493.json",
+        "size_bytes": 13624,
+        "sha256": "136d5fa5de43a23e92ad22c8481857d3ddc9f9811f9567bbac4884014ef0df4a"
+      },
+      {
+        "sample_index": 15,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_015_20260720_135404_493_rgb.png",
+        "size_bytes": 1210658,
+        "sha256": "3b758da7545841b6fbb0c23b3f29a252dd3253806e1037c824d65dc4239cf0ca"
+      },
+      {
+        "sample_index": 15,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_015_20260720_135404_493_overlay.png",
+        "size_bytes": 1203790,
+        "sha256": "285dc0643a7896030f3a6b41c2e5b18c980cefddd95408bbf544f8faaf57dade"
+      },
+      {
+        "sample_index": 16,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_016_20260720_135441_200.json",
+        "size_bytes": 13620,
+        "sha256": "ab1fab1286bb5bcf34fb3442fe7b203debab8e676055d1ebd608bda94b4da8f5"
+      },
+      {
+        "sample_index": 16,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_016_20260720_135441_200_rgb.png",
+        "size_bytes": 1281913,
+        "sha256": "bc73b66dc7fad07b3275cd179156fb822887b620d2b9f45fee0a1598cd45274b"
+      },
+      {
+        "sample_index": 16,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_016_20260720_135441_200_overlay.png",
+        "size_bytes": 1281385,
+        "sha256": "785bafc19d7bc1580508b9ea8c6abfb28e468c361f6aaf863a26a00017f35374"
+      },
+      {
+        "sample_index": 17,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_017_20260720_135516_006.json",
+        "size_bytes": 13532,
+        "sha256": "5857d2b6e1e2866f47d1d46c5be978b0e4d3b15cae05a24734f5b97f1e64c77b"
+      },
+      {
+        "sample_index": 17,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_017_20260720_135516_006_rgb.png",
+        "size_bytes": 1446325,
+        "sha256": "5995f68ed2bc1d41ad518fee9fc84e59b8fdeac1f1c504836c5437689f7712fb"
+      },
+      {
+        "sample_index": 17,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_017_20260720_135516_006_overlay.png",
+        "size_bytes": 1431136,
+        "sha256": "acef8a537e6e4bb84941cccde37ed0cf419441bb3926a40e2712d7f1a45e29dd"
+      },
+      {
+        "sample_index": 18,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_018_20260720_135551_956.json",
+        "size_bytes": 13576,
+        "sha256": "7ef667116cddfe6e56dac9e0d98c441302c270a022eaa12fa904715d52610055"
+      },
+      {
+        "sample_index": 18,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_018_20260720_135551_956_rgb.png",
+        "size_bytes": 1400974,
+        "sha256": "0c74897a0cfd2358710a0fc384c402c0ba8e83d4cfbba2ddf37619376f0b1d9c"
+      },
+      {
+        "sample_index": 18,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_018_20260720_135551_956_overlay.png",
+        "size_bytes": 1390130,
+        "sha256": "e2a3a7321f659fa0f317a24e214ea69b0d94e923f957bc0d142ef3f07c8e3754"
+      },
+      {
+        "sample_index": 19,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_019_20260720_141724_866.json",
+        "size_bytes": 13599,
+        "sha256": "d41e8ea26022b029ebc370e5fe41804cd4702a4a42162de1336fece205267e83"
+      },
+      {
+        "sample_index": 19,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_019_20260720_141724_866_rgb.png",
+        "size_bytes": 1239694,
+        "sha256": "682718c6e8b82cd59f893dff1eac38379f9eccb4ead7f72d0b8a68189af6f534"
+      },
+      {
+        "sample_index": 19,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_019_20260720_141724_866_overlay.png",
+        "size_bytes": 1226154,
+        "sha256": "6a34650e4d75a312dc05bc9dc14b338541ece7a8f7807dbe586f2f18b83f75ab"
+      },
+      {
+        "sample_index": 20,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_020_20260720_141755_241.json",
+        "size_bytes": 13584,
+        "sha256": "816add1c96d7c1d5a48da3a3ffb574a9859979fb090f6857c49a8ce6c82ad82e"
+      },
+      {
+        "sample_index": 20,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_020_20260720_141755_241_rgb.png",
+        "size_bytes": 1215923,
+        "sha256": "8b58acddba635ac19f4178404c30e7bb5faa7be46ba9743186f7eef29efb60b8"
+      },
+      {
+        "sample_index": 20,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_020_20260720_141755_241_overlay.png",
+        "size_bytes": 1202894,
+        "sha256": "c04c17d22780edbefc6a94fb6bc9a9a81c0fdf660dc942364fa978ff5b1b16c1"
+      },
+      {
+        "sample_index": 21,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_021_20260720_141821_148.json",
+        "size_bytes": 13421,
+        "sha256": "49733638514460d01008c6940f7d4835585e3e288c95009cb239946bdf683460"
+      },
+      {
+        "sample_index": 21,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_021_20260720_141821_148_rgb.png",
+        "size_bytes": 1217921,
+        "sha256": "4dff5deaecc477bae128cd32b08c66d6ddd64861f057cc983399f407ea92a7be"
+      },
+      {
+        "sample_index": 21,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_021_20260720_141821_148_overlay.png",
+        "size_bytes": 1207113,
+        "sha256": "6a0c275ae69e8d1412a1277ae0cba9fb9a1066fc669fc1f7e36f7f93c866380b"
+      },
+      {
+        "sample_index": 22,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_022_20260720_141853_123.json",
+        "size_bytes": 13512,
+        "sha256": "83fc93ec075985d43c77bb42eb89f89b471b9c89d8864219f95a9faf0006587b"
+      },
+      {
+        "sample_index": 22,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_022_20260720_141853_123_rgb.png",
+        "size_bytes": 1401384,
+        "sha256": "7d983401fa7fc36d0f2104332fdf8f0a419afe757e76e3c174bea47147db87c8"
+      },
+      {
+        "sample_index": 22,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_022_20260720_141853_123_overlay.png",
+        "size_bytes": 1392902,
+        "sha256": "415efb2c598f631b64e5e8035d4835cb8ecf5ecc8e1e7496b61be211eba86eb1"
+      },
+      {
+        "sample_index": 23,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_023_20260720_141912_071.json",
+        "size_bytes": 13546,
+        "sha256": "10e766c4ff5639438a311582af7f4ea9d0e331b3d6c3d0ecd933eaa970a6ab19"
+      },
+      {
+        "sample_index": 23,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_023_20260720_141912_071_rgb.png",
+        "size_bytes": 1294866,
+        "sha256": "fafd507ae66b5282b21fd200728f63c9f6b008ab3912d7be6257dc8d43ecc627"
+      },
+      {
+        "sample_index": 23,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_023_20260720_141912_071_overlay.png",
+        "size_bytes": 1289290,
+        "sha256": "055a3b40f73d56b49a837b80dde8ddb06d100849f1a2db2017474900a37a6193"
+      },
+      {
+        "sample_index": 24,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_024_20260720_141934_148.json",
+        "size_bytes": 13633,
+        "sha256": "bd9f80503c4d383e6b0aeb9cee1c2ec64aa53b33d740969aa924cf98ba092348"
+      },
+      {
+        "sample_index": 24,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_024_20260720_141934_148_rgb.png",
+        "size_bytes": 1343421,
+        "sha256": "3f42a7b6d567bc7453c1ce97efe5b34e63bf846a89e79db270839a576544ffe4"
+      },
+      {
+        "sample_index": 24,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_024_20260720_141934_148_overlay.png",
+        "size_bytes": 1337818,
+        "sha256": "67cdcd51f7b5191ccc9ded5c6a9380be726e265c168d3da19f1fecc6cde25890"
+      },
+      {
+        "sample_index": 25,
+        "kind": "sample_json_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_025_20260720_142025_608.json",
+        "size_bytes": 13615,
+        "sha256": "971eaa0bab896e818c9c34b8799b6bd4966bd1dd4bc9f8645e6052874bc77537"
+      },
+      {
+        "sample_index": 25,
+        "kind": "rgb_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_025_20260720_142025_608_rgb.png",
+        "size_bytes": 1228984,
+        "sha256": "ee1a40482f5338f16c179d44c77fdff6fdd3ae58eda7d4b7c8ed67b12c20e5d5"
+      },
+      {
+        "sample_index": 25,
+        "kind": "overlay_path",
+        "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_025_20260720_142025_608_overlay.png",
+        "size_bytes": 1225036,
+        "sha256": "90ab8879572cdf33af86fb2ba66a5390ee1c444aa08141fa2758af0ef4d4189d"
+      }
+    ],
+    "missing_files": [],
+    "complete": true
+  },
+  "fixed_board_during_validation": true,
+  "total_pose_count": 22,
+  "calibration_pose_count": 17,
+  "validation_pose_count": 5,
+  "split_assignment_before_fit": true,
+  "split_assignment_uses_measurement_residuals": false,
+  "validation_poses_excluded_from_fit": true,
+  "view_center_and_edges_covered": true,
+  "calibration_sample_indices": [
+    2,
+    4,
+    5,
+    8,
+    11,
+    12,
+    13,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    23,
+    24,
+    25
+  ],
+  "validation_sample_indices": [
+    1,
+    6,
+    10,
+    14,
+    22
+  ],
+  "split_rule": "deterministic_stratified_by_view_region_then_even_index_before_fit",
+  "pose_source": "tcp",
+  "calibration_frame": "rgb_camera",
+  "rgb_coordinate_convention": "opencv_optical_x_right_y_down_z_forward",
+  "T_tcp_rgb_camera": [
+    [
+      0.011285932524370712,
+      -0.9999209911271794,
+      -0.005535271474317231,
+      89.29000329635471
+    ],
+    [
+      -0.9999361684315229,
+      -0.011288722653221117,
+      0.000473078580625346,
+      22.859535011281267
+    ],
+    [
+      -0.0005355273477037877,
+      0.005529579016317416,
+      -0.9999845683641134,
+      154.20747509001535
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_base_board_reference_from_calibration": [
+    [
+      0.014636196598173057,
+      -0.9998688083887883,
+      0.00693885871914033,
+      690.3510462566197
+    ],
+    [
+      -0.9998918460795807,
+      -0.014645833396141783,
+      -0.001340040186209319,
+      195.29478922577414
+    ],
+    [
+      0.0014414897529380962,
+      -0.006918495162751807,
+      -0.9999750279541861,
+      -99.92265378658168
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "validation_reference_source": "calibration_set_T_base_board_mean",
+  "validation_center_scatter_rms_mm": 0.5868011817679154,
+  "validation_center_scatter_p95_mm": 0.7497136058569236,
+  "validation_rotation_scatter_rms_deg": 0.10782328168324833,
+  "validation_numeric_pass": false,
+  "validation_pose_results": [
+    {
+      "sample_index": 1,
+      "view_region": "top",
+      "T_base_board": [
+        [
+          0.014531052490311296,
+          -0.9998516603839751,
+          0.009246931433271724,
+          690.1277578375414
+        ],
+        [
+          -0.9998937144721474,
+          -0.014541396580384735,
+          -0.0010523994411058308,
+          195.23476122777268
+        ],
+        [
+          0.0011867066256996647,
+          -0.009230656146763846,
+          -0.9999566924194692,
+          -99.3651176750497
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "board_center_base_mm": [
+        690.1277578375414,
+        195.23476122777268,
+        -99.3651176750497
+      ],
+      "center_error_xyz_mm": [
+        -0.22328841907835795,
+        -0.06002799800145908,
+        0.5575361115319737
+      ],
+      "center_scatter_mm": 0.6035789876236324,
+      "rotation_scatter_deg": 0.13341147663149386
+    },
+    {
+      "sample_index": 6,
+      "view_region": "bottom",
+      "T_base_board": [
+        [
+          0.01356292587986749,
+          -0.9998921207152229,
+          0.00563861447443158,
+          690.3863449821214
+        ],
+        [
+          -0.9999053234920744,
+          -0.013575768218088093,
+          -0.00224556663194845,
+          195.18019191053497
+        ],
+        [
+          0.0023218729050023656,
+          -0.00560762417631625,
+          -0.9999815815590356,
+          -100.68859223268703
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "board_center_base_mm": [
+        690.3863449821214,
+        195.18019191053497,
+        -100.68859223268703
+      ],
+      "center_error_xyz_mm": [
+        0.035298725501661465,
+        -0.11459731523916616,
+        -0.765938446105352
+      ],
+      "center_scatter_mm": 0.7752678555856342,
+      "rotation_scatter_deg": 0.10947685480221113
+    },
+    {
+      "sample_index": 10,
+      "view_region": "center",
+      "T_base_board": [
+        [
+          0.015359947723040787,
+          -0.999859271219715,
+          0.006746092344870986,
+          689.8859071569599
+        ],
+        [
+          -0.9998805725856155,
+          -0.015371091522045124,
+          -0.0016031566618587034,
+          195.53860243695806
+        ],
+        [
+          0.0017066258544263938,
+          -0.006720662273987125,
+          -0.9999759597744298,
+          -100.3014051456833
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "board_center_base_mm": [
+        689.8859071569599,
+        195.53860243695806,
+        -100.3014051456833
+      ],
+      "center_error_xyz_mm": [
+        -0.4651390996598366,
+        0.24381321118391952,
+        -0.3787513591016278
+      ],
+      "center_scatter_mm": 0.6474966069420813,
+      "rotation_scatter_deg": 0.045582712078972965
+    },
+    {
+      "sample_index": 14,
+      "view_region": "right",
+      "T_base_board": [
+        [
+          0.014935951061770638,
+          -0.9998636046272833,
+          0.0070490784940541425,
+          689.962505246079
+        ],
+        [
+          -0.9998877443007551,
+          -0.014927178854511352,
+          0.0012954260277031069,
+          195.31917987691537
+        ],
+        [
+          -0.0011900264821471033,
+          -0.007067635614572425,
+          -0.9999743158520578,
+          -99.56761922332856
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "board_center_base_mm": [
+        689.962505246079,
+        195.31917987691537,
+        -99.56761922332856
+      ],
+      "center_error_xyz_mm": [
+        -0.38854101054073453,
+        0.024390651141231956,
+        0.35503456325311333
+      ],
+      "center_scatter_mm": 0.5268857199046463,
+      "rotation_scatter_deg": 0.15199055121181865
+    },
+    {
+      "sample_index": 22,
+      "view_region": "left",
+      "T_base_board": [
+        [
+          0.015132910412690964,
+          -0.9998553007328137,
+          0.007769981913475544,
+          690.3771447720163
+        ],
+        [
+          -0.9998846590876616,
+          -0.015142464801165231,
+          -0.0011722972728463786,
+          195.41758951128077
+        ],
+        [
+          0.0012897843199205395,
+          -0.007751345447065701,
+          -0.9999691260734844,
+          -99.7135872135753
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "board_center_base_mm": [
+        690.3771447720163,
+        195.41758951128077,
+        -99.7135872135753
+      ],
+      "center_error_xyz_mm": [
+        0.026098515396597577,
+        0.12280028550662792,
+        0.20906657300638187
+      ],
+      "center_scatter_mm": 0.24386445943402366,
+      "rotation_scatter_deg": 0.056272419818224395
+    }
+  ],
+  "calibration_quality": {
+    "translation_mean_mm": 0.5266193473154036,
+    "translation_rmse_mm": 0.561589129450031,
+    "translation_max_mm": 0.9597070334092515,
+    "rotation_mean_deg": 0.10112134921366855,
+    "rotation_rmse_deg": 0.1069789261560029,
+    "rotation_max_deg": 0.18324549008849253,
+    "per_sample_translation_error_mm": [
+      0.6083322985707142,
+      0.6545523343742012,
+      0.6742528492634299,
+      0.5193949073743072,
+      0.6321959196849407,
+      0.3721616108054713,
+      0.4217163363869351,
+      0.4146683802813272,
+      0.3159457618567292,
+      0.582447638880764,
+      0.5682446142198431,
+      0.5847960399231618,
+      0.5028982787680132,
+      0.24660132913789298,
+      0.7726958034687664,
+      0.12191776795611221,
+      0.9597070334092515
+    ],
+    "per_sample_translation_error_xyz_mm": [
+      [
+        -0.06328494749652691,
+        0.30254190800172864,
+        0.5239576269197386
+      ],
+      [
+        -0.11762556629298615,
+        0.48779536551845126,
+        0.4203078228723456
+      ],
+      [
+        -0.1709858108284834,
+        -0.38747963791905704,
+        -0.5246334791388136
+      ],
+      [
+        -0.2815764126122531,
+        -0.3184525761543,
+        -0.2984522581711673
+      ],
+      [
+        -0.032583325115751904,
+        0.06439842488398995,
+        -0.6280627760528006
+      ],
+      [
+        -0.1515592022326473,
+        0.3310863225082983,
+        0.07691501689434688
+      ],
+      [
+        -0.05641131022184709,
+        -0.10115198450375829,
+        -0.40550056533329837
+      ],
+      [
+        0.3418075051931737,
+        -0.22039122061127614,
+        0.0809024404837686
+      ],
+      [
+        0.2411181763309287,
+        -0.15927115498288913,
+        -0.12773585506228358
+      ],
+      [
+        -0.361806727970702,
+        0.03870102954888921,
+        -0.454800367133501
+      ],
+      [
+        -0.064910258474697,
+        0.3940351522565493,
+        -0.40425845534851135
+      ],
+      [
+        -0.06871435194409514,
+        0.15793877071939733,
+        0.5588560555727753
+      ],
+      [
+        0.16584203675586195,
+        -0.11032879237393445,
+        -0.46176904964040943
+      ],
+      [
+        0.16535856796849657,
+        -0.16639789095017932,
+        -0.07602960883311027
+      ],
+      [
+        0.05032445311462652,
+        -0.03924827411321985,
+        0.7700557298638131
+      ],
+      [
+        -9.02807663578642e-05,
+        -0.008643983333428196,
+        0.12161091869118934
+      ],
+      [
+        0.40509745459110036,
+        -0.26513145849514785,
+        0.8286368034158471
+      ]
+    ],
+    "per_sample_rotation_error_deg": [
+      0.06901248440406751,
+      0.13337434151036912,
+      0.10997629207522606,
+      0.07187410066269707,
+      0.10432594464678588,
+      0.05840437588563515,
+      0.06772412510829368,
+      0.1126419077726453,
+      0.09787655519617679,
+      0.07566787104298384,
+      0.09556510488244535,
+      0.1414286544892094,
+      0.18324549008849253,
+      0.08115806078787006,
+      0.16091492418321585,
+      0.0941690020059613,
+      0.06170370189029059
+    ]
+  },
+  "calibration_pose_coverage": {
+    "ok": true,
+    "pose_ranges": {
+      "X": {
+        "min": 282.62965176926974,
+        "max": 617.4868670924117,
+        "range": 334.85721532314193,
+        "std": 90.10079946919484
+      },
+      "Y": {
+        "min": -158.82390078869324,
+        "max": 231.70664526539184,
+        "range": 390.5305460540851,
+        "std": 104.90992689774824
+      },
+      "Z": {
+        "min": 58.846085247426046,
+        "max": 267.00063724162186,
+        "range": 208.1545519941958,
+        "std": 67.55973302524062
+      },
+      "A": {
+        "min": -18.630964392768448,
+        "max": 19.325795947186617,
+        "range": 37.95676033995507,
+        "std": 9.375189341106843
+      },
+      "B": {
+        "min": -24.986830892122413,
+        "max": 17.287312958822667,
+        "range": 42.27414385094508,
+        "std": 11.506627976291025
+      },
+      "C": {
+        "min": -14.979001551574392,
+        "max": 44.82456078182852,
+        "range": 59.80356233340291,
+        "std": 14.559283928444277
+      }
+    },
+    "angle_circular_span_deg": {
+      "A": 37.95676033995505,
+      "B": 42.27414385094505,
+      "C": 59.80356233340285
+    },
+    "relative_rotation_deg": {
+      "min": 4.766876195486713,
+      "mean": 27.394400071608263,
+      "max": 70.46132362726378,
+      "std": 12.457888883333908,
+      "pair_count": 136,
+      "pair_count_lt_5deg": 2,
+      "pair_count_lt_10deg": 9
+    },
+    "warnings": []
+  },
+  "validation_pose_coverage": {
+    "ok": true,
+    "pose_ranges": {
+      "X": {
+        "min": 300.79296851386414,
+        "max": 635.337413298893,
+        "range": 334.5444447850289,
+        "std": 123.49046471385151
+      },
+      "Y": {
+        "min": -158.81842113078386,
+        "max": 38.085897745990046,
+        "range": 196.9043188767739,
+        "std": 73.68376949135184
+      },
+      "Z": {
+        "min": 143.3110889014075,
+        "max": 327.2132791375222,
+        "range": 183.9021902361147,
+        "std": 66.19758167984054
+      },
+      "A": {
+        "min": -16.089844412207135,
+        "max": 27.452639362093638,
+        "range": 43.54248377430078,
+        "std": 15.719183671976708
+      },
+      "B": {
+        "min": -10.39174835474203,
+        "max": 21.84719589988214,
+        "range": 32.23894425462417,
+        "std": 12.356381585083097
+      },
+      "C": {
+        "min": -13.693998462711754,
+        "max": 49.45433960984349,
+        "range": 63.14833807255524,
+        "std": 20.95430765612939
+      }
+    },
+    "angle_circular_span_deg": {
+      "A": 43.54248377430076,
+      "B": 32.23894425462419,
+      "C": 63.14833807255525
+    },
+    "relative_rotation_deg": {
+      "min": 21.87879684202634,
+      "mean": 41.745402273586365,
+      "max": 68.75645975216932,
+      "std": 14.771872457544623,
+      "pair_count": 10,
+      "pair_count_lt_5deg": 0,
+      "pair_count_lt_10deg": 0
+    },
+    "warnings": []
+  },
+  "dataset_preflight": {
+    "ok": true,
+    "checks": {
+      "minimum_total_poses": true,
+      "sample_indices_unique": true,
+      "fixed_board_confirmed": true,
+      "all_samples_use_tcp_pose": true,
+      "manual_pose_not_used": true,
+      "all_robot_pose_values_valid": true,
+      "all_samples_use_rgb_pnp": true,
+      "single_robot_identified": true,
+      "production_camera_serial_matches": true,
+      "camera_profile_consistent": true,
+      "camera_frame_metadata_complete": true,
+      "camera_frame_pose_bracket_verified": true,
+      "view_center_and_edges_covered": true,
+      "view_region_labels_match_measurements": true,
+      "robot_pose_excitation_sufficient": true,
+      "all_samples_pass_capture_quality": true,
+      "raw_data_manifest_complete": true
+    },
+    "failed_checks": [],
+    "total_pose_count": 22,
+    "pose_sources": [
+      "tcp"
+    ],
+    "calibration_frames": [
+      "rgb_camera"
+    ],
+    "camera_serials": [
+      "CP4B85P001L"
+    ],
+    "robot_ids": [
+      "AUBO:rob1:aubo_i5H"
+    ],
+    "view_coverage": {
+      "counts": {
+        "center": 9,
+        "left": 3,
+        "right": 8,
+        "top": 1,
+        "bottom": 1,
+        "unknown": 0
+      },
+      "center_covered": true,
+      "edge_regions_covered": [
+        "left",
+        "right",
+        "top",
+        "bottom"
+      ],
+      "minimum_distinct_edge_regions": 2,
+      "stored_label_mismatch_indices": [],
+      "ok": true
+    },
+    "robot_pose_coverage": {
+      "ok": true,
+      "pose_ranges": {
+        "X": {
+          "min": 282.62965176926974,
+          "max": 635.337413298893,
+          "range": 352.70776152962327,
+          "std": 98.687953874639
+        },
+        "Y": {
+          "min": -158.82390078869324,
+          "max": 231.70664526539184,
+          "range": 390.5305460540851,
+          "std": 103.19917492784367
+        },
+        "Z": {
+          "min": 58.846085247426046,
+          "max": 327.2132791375222,
+          "range": 268.36719389009613,
+          "std": 68.90097645102414
+        },
+        "A": {
+          "min": -18.630964392768448,
+          "max": 27.452639362093638,
+          "range": 46.08360375486208,
+          "std": 11.303211093311166
+        },
+        "B": {
+          "min": -24.986830892122413,
+          "max": 21.84719589988214,
+          "range": 46.83402679200455,
+          "std": 11.822070349818507
+        },
+        "C": {
+          "min": -14.979001551574392,
+          "max": 49.45433960984349,
+          "range": 64.43334116141787,
+          "std": 16.285504570337764
+        }
+      },
+      "angle_circular_span_deg": {
+        "A": 46.083603754862054,
+        "B": 46.83402679200452,
+        "C": 64.43334116141784
+      },
+      "relative_rotation_deg": {
+        "min": 3.199814457507127,
+        "mean": 29.74581475865343,
+        "max": 71.01539074057226,
+        "std": 13.833880708682049,
+        "pair_count": 231,
+        "pair_count_lt_5deg": 5,
+        "pair_count_lt_10deg": 14
+      },
+      "warnings": []
+    },
+    "bad_quality_samples": {},
+    "raw_data_manifest": {
+      "algorithm": "sha256",
+      "raw_data_sha256": "bab4da83283393378566da426770759b74c094cce546ec577af749de0e6e38bc",
+      "files": [
+        {
+          "sample_index": 1,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_001_20260720_134408_732.json",
+          "size_bytes": 13453,
+          "sha256": "be7714250690d2f3c9cb11ce3ed6cba007a626167141a5847d4e079c22d06952"
+        },
+        {
+          "sample_index": 1,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_001_20260720_134408_732_rgb.png",
+          "size_bytes": 1338644,
+          "sha256": "188393d7ff0ec6ae4b92de5d35563b8d1416c4816b5fdd7314151101651523e4"
+        },
+        {
+          "sample_index": 1,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_001_20260720_134408_732_overlay.png",
+          "size_bytes": 1319929,
+          "sha256": "d305a410b74b302b0addcc14a844b62b2b28b5489d363bbff43ef58167365f9d"
+        },
+        {
+          "sample_index": 2,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_002_20260720_134426_528.json",
+          "size_bytes": 13450,
+          "sha256": "353c99b85f2b62b839f041a73163c2ef9c8b1af0b7e576d7516fd0bf0c8ee967"
+        },
+        {
+          "sample_index": 2,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_002_20260720_134426_528_rgb.png",
+          "size_bytes": 1354461,
+          "sha256": "28b2ebaf03704f19bb47853e6fe406c77c5461c869edc3c67c520c84606a481c"
+        },
+        {
+          "sample_index": 2,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_002_20260720_134426_528_overlay.png",
+          "size_bytes": 1342082,
+          "sha256": "d85eff32ba503177b25cde003e7730f8d45aaf8b8fc1749135811bd84d3c74f9"
+        },
+        {
+          "sample_index": 4,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_004_20260720_134853_306.json",
+          "size_bytes": 13489,
+          "sha256": "397482b8614d40ef5a97fcf0246b6f54be13d5ef2558587a2cf77d21a360a7bb"
+        },
+        {
+          "sample_index": 4,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_004_20260720_134853_306_rgb.png",
+          "size_bytes": 1343547,
+          "sha256": "b525b2d826bb2dc2cb42f1a0e745889ce50449c8da49a3c5c9927400c49eaa89"
+        },
+        {
+          "sample_index": 4,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_004_20260720_134853_306_overlay.png",
+          "size_bytes": 1330368,
+          "sha256": "6cde26488ced02c4fe55fbb41825bf74756f53cf1945c17f8e33072ba18ccc92"
+        },
+        {
+          "sample_index": 5,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_005_20260720_134923_512.json",
+          "size_bytes": 13518,
+          "sha256": "e9710e915d551856832de7d34574009fdae28baae0bf87dd29437e91146aa22c"
+        },
+        {
+          "sample_index": 5,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_005_20260720_134923_512_rgb.png",
+          "size_bytes": 1368132,
+          "sha256": "033ba7d65de9a4f5db89c58a77b95dd6bfa1399396eeaa3df5695f854146c384"
+        },
+        {
+          "sample_index": 5,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_005_20260720_134923_512_overlay.png",
+          "size_bytes": 1333493,
+          "sha256": "7d15f6b858ab0c0c01b38e680dc266ace2a5e31d0b5199f660140116655e5e63"
+        },
+        {
+          "sample_index": 6,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_006_20260720_135004_803.json",
+          "size_bytes": 13585,
+          "sha256": "69df7bfbce6bdd2794131c11225ac6c78eab20c82809d6a656de5b9bb0e36696"
+        },
+        {
+          "sample_index": 6,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_006_20260720_135004_803_rgb.png",
+          "size_bytes": 1348575,
+          "sha256": "b800742cc069c137e875bed1f2b9982a5f4ea242854657e05f33065a815a4ca6"
+        },
+        {
+          "sample_index": 6,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_006_20260720_135004_803_overlay.png",
+          "size_bytes": 1339192,
+          "sha256": "d6a889403ffbcc3f2c30fb36d8a5de83e593c605a8631c642c43048442ff720a"
+        },
+        {
+          "sample_index": 8,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_008_20260720_135048_991.json",
+          "size_bytes": 13698,
+          "sha256": "c36619ea529c2362b5094c8c46a3f086290eb0ab95f67e743b8bbf50ee74f989"
+        },
+        {
+          "sample_index": 8,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_008_20260720_135048_991_rgb.png",
+          "size_bytes": 1290910,
+          "sha256": "9c5980209fd39763ebc9b37790005724faf98b897b592c7cf736cb9142d1fccc"
+        },
+        {
+          "sample_index": 8,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_008_20260720_135048_991_overlay.png",
+          "size_bytes": 1268840,
+          "sha256": "d3d2eb838c922a16636998746d3a0c3e0c5fc29a525655b831aab1fd4b6bf412"
+        },
+        {
+          "sample_index": 10,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_010_20260720_135134_296.json",
+          "size_bytes": 13416,
+          "sha256": "7c5ca8875f2b86e5b58271e4ac75f3a6d9f3bf3286395c22c9024de974c9951a"
+        },
+        {
+          "sample_index": 10,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_010_20260720_135134_296_rgb.png",
+          "size_bytes": 1311115,
+          "sha256": "9237165bd081cbd254424e36ca0523c0dae027a3db899e450afb51ccf1fe0ea7"
+        },
+        {
+          "sample_index": 10,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_010_20260720_135134_296_overlay.png",
+          "size_bytes": 1304375,
+          "sha256": "9397f5c0284bcb599ba4e9c92332e612b62424eeb546b6a0d7466d693987bc06"
+        },
+        {
+          "sample_index": 11,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_011_20260720_135210_492.json",
+          "size_bytes": 13629,
+          "sha256": "7dd12389181588bcd74360ce6279d4a0658ddf01fba5886f2e0033d757712919"
+        },
+        {
+          "sample_index": 11,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_011_20260720_135210_492_rgb.png",
+          "size_bytes": 1304345,
+          "sha256": "cc4e5940f2f98fca7d54cc7af8f1ebd2e058052feecb5507fbc2738d09a272f6"
+        },
+        {
+          "sample_index": 11,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_011_20260720_135210_492_overlay.png",
+          "size_bytes": 1305468,
+          "sha256": "5cccbe12f677c1e5e6db042738ef516921059160798ad27503c5119e70bc9d4c"
+        },
+        {
+          "sample_index": 12,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_012_20260720_135239_873.json",
+          "size_bytes": 13629,
+          "sha256": "58a13ee12679d3376f5515b91827f555c07f917b6c2e0ea30c5e27b427b343ef"
+        },
+        {
+          "sample_index": 12,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_012_20260720_135239_873_rgb.png",
+          "size_bytes": 1394625,
+          "sha256": "d287e30059d853f23f87cc19bb0e1b2e5b499fd421de24eeb203f78a4273fc1a"
+        },
+        {
+          "sample_index": 12,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_012_20260720_135239_873_overlay.png",
+          "size_bytes": 1384975,
+          "sha256": "e864b8bbd8e281240d2595dc14f689775876b911bb9bd9bb1d28b36ef005d3a7"
+        },
+        {
+          "sample_index": 13,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_013_20260720_135259_184.json",
+          "size_bytes": 13603,
+          "sha256": "ea1be6ff011dd36aecb5dc857ce5c2c0c4798e1d47c4944caf6bc0f76afcd75c"
+        },
+        {
+          "sample_index": 13,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_013_20260720_135259_184_rgb.png",
+          "size_bytes": 1343860,
+          "sha256": "f1cca3a454df3e9f4874471c4e61c908343bcc4eaa14ff7540c5897f57f58d17"
+        },
+        {
+          "sample_index": 13,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_013_20260720_135259_184_overlay.png",
+          "size_bytes": 1332799,
+          "sha256": "61b9ebcccb8d714953875443c54e661b047cd6f697a2b02aa3dbcbe7920a6fe7"
+        },
+        {
+          "sample_index": 14,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_014_20260720_135334_067.json",
+          "size_bytes": 13478,
+          "sha256": "bec7eadacbedd99cbc25a5ff8bb7621605f640a7f175c15b093da474d36737dc"
+        },
+        {
+          "sample_index": 14,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_014_20260720_135334_067_rgb.png",
+          "size_bytes": 1322351,
+          "sha256": "b21a1e2edab890cb4ed767383bf989b4c1822d9f3015aba3dfb98e2f9431b47a"
+        },
+        {
+          "sample_index": 14,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_014_20260720_135334_067_overlay.png",
+          "size_bytes": 1301593,
+          "sha256": "cceca541fdae7e1d7128d7483bf2b208b29c76e46beb773b836cf98f350f264a"
+        },
+        {
+          "sample_index": 15,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_015_20260720_135404_493.json",
+          "size_bytes": 13624,
+          "sha256": "136d5fa5de43a23e92ad22c8481857d3ddc9f9811f9567bbac4884014ef0df4a"
+        },
+        {
+          "sample_index": 15,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_015_20260720_135404_493_rgb.png",
+          "size_bytes": 1210658,
+          "sha256": "3b758da7545841b6fbb0c23b3f29a252dd3253806e1037c824d65dc4239cf0ca"
+        },
+        {
+          "sample_index": 15,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_015_20260720_135404_493_overlay.png",
+          "size_bytes": 1203790,
+          "sha256": "285dc0643a7896030f3a6b41c2e5b18c980cefddd95408bbf544f8faaf57dade"
+        },
+        {
+          "sample_index": 16,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_016_20260720_135441_200.json",
+          "size_bytes": 13620,
+          "sha256": "ab1fab1286bb5bcf34fb3442fe7b203debab8e676055d1ebd608bda94b4da8f5"
+        },
+        {
+          "sample_index": 16,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_016_20260720_135441_200_rgb.png",
+          "size_bytes": 1281913,
+          "sha256": "bc73b66dc7fad07b3275cd179156fb822887b620d2b9f45fee0a1598cd45274b"
+        },
+        {
+          "sample_index": 16,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_016_20260720_135441_200_overlay.png",
+          "size_bytes": 1281385,
+          "sha256": "785bafc19d7bc1580508b9ea8c6abfb28e468c361f6aaf863a26a00017f35374"
+        },
+        {
+          "sample_index": 17,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_017_20260720_135516_006.json",
+          "size_bytes": 13532,
+          "sha256": "5857d2b6e1e2866f47d1d46c5be978b0e4d3b15cae05a24734f5b97f1e64c77b"
+        },
+        {
+          "sample_index": 17,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_017_20260720_135516_006_rgb.png",
+          "size_bytes": 1446325,
+          "sha256": "5995f68ed2bc1d41ad518fee9fc84e59b8fdeac1f1c504836c5437689f7712fb"
+        },
+        {
+          "sample_index": 17,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_017_20260720_135516_006_overlay.png",
+          "size_bytes": 1431136,
+          "sha256": "acef8a537e6e4bb84941cccde37ed0cf419441bb3926a40e2712d7f1a45e29dd"
+        },
+        {
+          "sample_index": 18,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_018_20260720_135551_956.json",
+          "size_bytes": 13576,
+          "sha256": "7ef667116cddfe6e56dac9e0d98c441302c270a022eaa12fa904715d52610055"
+        },
+        {
+          "sample_index": 18,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_018_20260720_135551_956_rgb.png",
+          "size_bytes": 1400974,
+          "sha256": "0c74897a0cfd2358710a0fc384c402c0ba8e83d4cfbba2ddf37619376f0b1d9c"
+        },
+        {
+          "sample_index": 18,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_018_20260720_135551_956_overlay.png",
+          "size_bytes": 1390130,
+          "sha256": "e2a3a7321f659fa0f317a24e214ea69b0d94e923f957bc0d142ef3f07c8e3754"
+        },
+        {
+          "sample_index": 19,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_019_20260720_141724_866.json",
+          "size_bytes": 13599,
+          "sha256": "d41e8ea26022b029ebc370e5fe41804cd4702a4a42162de1336fece205267e83"
+        },
+        {
+          "sample_index": 19,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_019_20260720_141724_866_rgb.png",
+          "size_bytes": 1239694,
+          "sha256": "682718c6e8b82cd59f893dff1eac38379f9eccb4ead7f72d0b8a68189af6f534"
+        },
+        {
+          "sample_index": 19,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_019_20260720_141724_866_overlay.png",
+          "size_bytes": 1226154,
+          "sha256": "6a34650e4d75a312dc05bc9dc14b338541ece7a8f7807dbe586f2f18b83f75ab"
+        },
+        {
+          "sample_index": 20,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_020_20260720_141755_241.json",
+          "size_bytes": 13584,
+          "sha256": "816add1c96d7c1d5a48da3a3ffb574a9859979fb090f6857c49a8ce6c82ad82e"
+        },
+        {
+          "sample_index": 20,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_020_20260720_141755_241_rgb.png",
+          "size_bytes": 1215923,
+          "sha256": "8b58acddba635ac19f4178404c30e7bb5faa7be46ba9743186f7eef29efb60b8"
+        },
+        {
+          "sample_index": 20,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_020_20260720_141755_241_overlay.png",
+          "size_bytes": 1202894,
+          "sha256": "c04c17d22780edbefc6a94fb6bc9a9a81c0fdf660dc942364fa978ff5b1b16c1"
+        },
+        {
+          "sample_index": 21,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_021_20260720_141821_148.json",
+          "size_bytes": 13421,
+          "sha256": "49733638514460d01008c6940f7d4835585e3e288c95009cb239946bdf683460"
+        },
+        {
+          "sample_index": 21,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_021_20260720_141821_148_rgb.png",
+          "size_bytes": 1217921,
+          "sha256": "4dff5deaecc477bae128cd32b08c66d6ddd64861f057cc983399f407ea92a7be"
+        },
+        {
+          "sample_index": 21,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_021_20260720_141821_148_overlay.png",
+          "size_bytes": 1207113,
+          "sha256": "6a0c275ae69e8d1412a1277ae0cba9fb9a1066fc669fc1f7e36f7f93c866380b"
+        },
+        {
+          "sample_index": 22,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_022_20260720_141853_123.json",
+          "size_bytes": 13512,
+          "sha256": "83fc93ec075985d43c77bb42eb89f89b471b9c89d8864219f95a9faf0006587b"
+        },
+        {
+          "sample_index": 22,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_022_20260720_141853_123_rgb.png",
+          "size_bytes": 1401384,
+          "sha256": "7d983401fa7fc36d0f2104332fdf8f0a419afe757e76e3c174bea47147db87c8"
+        },
+        {
+          "sample_index": 22,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_022_20260720_141853_123_overlay.png",
+          "size_bytes": 1392902,
+          "sha256": "415efb2c598f631b64e5e8035d4835cb8ecf5ecc8e1e7496b61be211eba86eb1"
+        },
+        {
+          "sample_index": 23,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_023_20260720_141912_071.json",
+          "size_bytes": 13546,
+          "sha256": "10e766c4ff5639438a311582af7f4ea9d0e331b3d6c3d0ecd933eaa970a6ab19"
+        },
+        {
+          "sample_index": 23,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_023_20260720_141912_071_rgb.png",
+          "size_bytes": 1294866,
+          "sha256": "fafd507ae66b5282b21fd200728f63c9f6b008ab3912d7be6257dc8d43ecc627"
+        },
+        {
+          "sample_index": 23,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_023_20260720_141912_071_overlay.png",
+          "size_bytes": 1289290,
+          "sha256": "055a3b40f73d56b49a837b80dde8ddb06d100849f1a2db2017474900a37a6193"
+        },
+        {
+          "sample_index": 24,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_024_20260720_141934_148.json",
+          "size_bytes": 13633,
+          "sha256": "bd9f80503c4d383e6b0aeb9cee1c2ec64aa53b33d740969aa924cf98ba092348"
+        },
+        {
+          "sample_index": 24,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_024_20260720_141934_148_rgb.png",
+          "size_bytes": 1343421,
+          "sha256": "3f42a7b6d567bc7453c1ce97efe5b34e63bf846a89e79db270839a576544ffe4"
+        },
+        {
+          "sample_index": 24,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_024_20260720_141934_148_overlay.png",
+          "size_bytes": 1337818,
+          "sha256": "67cdcd51f7b5191ccc9ded5c6a9380be726e265c168d3da19f1fecc6cde25890"
+        },
+        {
+          "sample_index": 25,
+          "kind": "sample_json_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\samples\\sample_025_20260720_142025_608.json",
+          "size_bytes": 13615,
+          "sha256": "971eaa0bab896e818c9c34b8799b6bd4966bd1dd4bc9f8645e6052874bc77537"
+        },
+        {
+          "sample_index": 25,
+          "kind": "rgb_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_025_20260720_142025_608_rgb.png",
+          "size_bytes": 1228984,
+          "sha256": "ee1a40482f5338f16c179d44c77fdff6fdd3ae58eda7d4b7c8ed67b12c20e5d5"
+        },
+        {
+          "sample_index": 25,
+          "kind": "overlay_path",
+          "path": "C:\\MM\\aubo_tools\\charuco_pointcloud_calib\\images\\sample_025_20260720_142025_608_overlay.png",
+          "size_bytes": 1225036,
+          "sha256": "90ab8879572cdf33af86fb2ba66a5390ee1c444aa08141fa2758af0ef4d4189d"
+        }
+      ],
+      "missing_files": [],
+      "complete": true
+    }
+  },
+  "solver": {
+    "best_opencv_method": "PARK",
+    "nonlinear_refine": {
+      "enabled": true,
+      "success": true,
+      "message": "Both `ftol` and `xtol` termination conditions are satisfied.",
+      "cost_before": 4.020615636904978,
+      "cost_after": 2.872469733625865,
+      "nfev": 5,
+      "rotation_weight_mm": 80.0,
+      "accepted": true
+    },
+    "measurement_source": "charuco_rgb_2d_corners_plus_intrinsics_solvepnp",
+    "depth_based_board_pose_used": false,
+    "rgb_pnp_board_pose_used": true,
+    "note": "正式手眼与孔洞2D定位共用RGB光学坐标系；深度和点云不参与手眼求解。"
+  },
+  "limits": {
+    "minimum_total_poses": 11,
+    "minimum_validation_fraction": 0.2,
+    "minimum_validation_poses": 3,
+    "maximum_validation_center_scatter_rms_mm": 0.1,
+    "require_tcp_pose_source": true,
+    "allow_manual_pose": false,
+    "candidate_dir": "C:\\MM\\aubo_tools\\data\\e7_candidates",
+    "center_region_half_width_ratio": 0.22,
+    "center_region_half_height_ratio": 0.22,
+    "minimum_distinct_edge_regions": 2,
+    "maximum_pose_bracket_xyz_mm": 0.05,
+    "maximum_pose_bracket_abc_deg": 0.01
+  },
+  "review_requirements": [
+    "填写camera_mount_id并核对安装ID/紧固状态",
+    "由独立复核人填写verified_by并确认原始数据清单",
+    "复核通过后显式设置validated=true、do_not_use_for_motion=false、production_eligible=true",
+    "设置上述字段前重新运行证据检查工具",
+    "候选验证通过后才可显式安装为唯一e7_handeye_validation_current.json"
+  ]
+}
