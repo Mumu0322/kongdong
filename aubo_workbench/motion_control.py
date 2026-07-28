@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import socket
 import sys
 import threading
@@ -33,7 +32,7 @@ DEFAULT_SDK_DIR = Path(r"C:\MM\third_party\aubo_sdk")
 
 DEFAULT_IP = os.getenv("AUBO_ROBOT_IP", "192.168.1.100")
 DEFAULT_PORT = 30004
-DEFAULT_USER = os.getenv("AUBO_ROBOT_USER", "AUBO")
+DEFAULT_USER = "AUBO"
 DEFAULT_PASSWORD = os.getenv("AUBO_ROBOT_PASSWORD", "")
 DEFAULT_TIMEOUT_MS = 3000
 MOTION_FRAME_CHOICES = ("基坐标系", "工具/TCP坐标系")
@@ -497,21 +496,16 @@ class AuboMotionPanel(ttk.Frame):
         self.main_content.bind("<Enter>", lambda _event: self.bind_all("<MouseWheel>", self._on_mouse_wheel))
         self.main_content.bind("<Leave>", lambda _event: self.unbind_all("<MouseWheel>"))
 
-        top = ttk.LabelFrame(self.main_content, text="连接参数", padding=8)
+        top = ttk.LabelFrame(self.main_content, text="机器人会话", padding=8)
         top.pack(fill=X, padx=10, pady=(10, 6))
-        self._top_entry(top, 0, 0, "IP", self.ip_var, 16)
-        self._top_entry(top, 0, 2, "端口", self.port_var, 7)
-        self._top_entry(top, 0, 4, "账号", self.user_var, 10)
-        self._top_entry(top, 0, 6, "密码", self.password_var, 12, show="*")
-        self._top_entry(top, 0, 8, "超时ms", self.timeout_var, 8)
-        ttk.Button(top, text="网络诊断", command=self.network_diagnostic).grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6), pady=(8, 0))
-        ttk.Button(top, text="扫描AUBO端口", command=self.scan_aubo_port_async).grid(row=1, column=2, columnspan=2, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Label(top, text="连接参数来自工作台顶部；如有修改，请点击顶部“同步当前页面”。", foreground="#555555").grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=(0, 12)
+        )
         self.connect_btn = ttk.Button(top, text="连接", command=self.connect_async)
-        self.connect_btn.grid(row=1, column=4, columnspan=2, sticky="ew", padx=(0, 6), pady=(8, 0))
-        ttk.Button(top, text="断开", command=self.disconnect_async).grid(row=1, column=6, columnspan=2, sticky="ew", padx=(0, 12), pady=(8, 0))
-        ttk.Label(top, textvariable=self.connection_var).grid(row=1, column=8, columnspan=2, sticky="w", pady=(8, 0))
-        for col in (1, 3, 5, 7, 9):
-            top.columnconfigure(col, weight=1)
+        self.connect_btn.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        ttk.Button(top, text="断开", command=self.disconnect_async).grid(row=0, column=5, sticky="ew", padx=(0, 12))
+        ttk.Label(top, textvariable=self.connection_var).grid(row=0, column=6, sticky="w")
+        top.columnconfigure(0, weight=1)
 
         body = ttk.Frame(self.main_content)
         body.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))

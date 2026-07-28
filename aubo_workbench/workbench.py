@@ -173,6 +173,35 @@ class RobotInfoPanel(ttk.Frame):
         self.status_var.set(f"已保存：{path}")
 
 
+class CalibrationHubPanel(ttk.Frame):
+    """将 TCP 示教与手眼标定收敛到同一个“标定中心”。"""
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=BOTH, expand=True)
+        self.tcp_panel = TcpTeachPanel(notebook)
+        self.handeye_panel = HandEyeGuiPanel(notebook, autostart=False)
+        notebook.add(self.tcp_panel, text="TCP 示教")
+        notebook.add(self.handeye_panel, text="RGB 手眼标定")
+
+    def sync_connection(self, cfg: dict[str, Any]) -> None:
+        for panel in (self.tcp_panel, self.handeye_panel):
+            for attr, value in [
+                ("ip_var", cfg["ip"]), ("port_var", str(cfg["port"])),
+                ("user_var", cfg["user"]), ("password_var", cfg["password"]),
+            ]:
+                variable = getattr(panel, attr, None)
+                if isinstance(variable, tk.StringVar):
+                    variable.set(value)
+
+    def on_close(self) -> None:
+        for panel in (self.tcp_panel, self.handeye_panel):
+            close = getattr(panel, "on_close", None)
+            if callable(close):
+                close()
+
+
 class AuboWorkbench(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -194,7 +223,7 @@ class AuboWorkbench(tk.Tk):
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.show_page("robot_info")
+        self.show_page("hole_localization")
 
     def _build(self) -> None:
         style = ttk.Style(self)
@@ -203,7 +232,7 @@ class AuboWorkbench(tk.Tk):
         except Exception:
             pass
 
-        top = ttk.LabelFrame(self, text="AUBO 连接参数", padding=8)
+        top = ttk.LabelFrame(self, text="统一连接参数", padding=8)
         top.pack(fill=X, padx=10, pady=(10, 6))
         ttk.Label(top, text="IP").pack(side=LEFT)
         ttk.Entry(top, textvariable=self.ip_var, width=16).pack(side=LEFT, padx=(4, 10))
@@ -215,7 +244,8 @@ class AuboWorkbench(tk.Tk):
         ttk.Entry(top, textvariable=self.password_var, width=12, show="*").pack(side=LEFT, padx=(4, 10))
         ttk.Label(top, text="超时ms").pack(side=LEFT)
         ttk.Entry(top, textvariable=self.timeout_var, width=8).pack(side=LEFT, padx=(4, 12))
-        ttk.Button(top, text="同步到当前功能", command=self.sync_current_page).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(top, text="同步当前页面", command=self.sync_current_page).pack(side=LEFT, padx=(0, 8))
+        ttk.Label(top, text="连接信息只在此处维护；切换页面会自动同步。", foreground="#555555").pack(side=LEFT)
 
         body = ttk.Frame(self)
         body.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
@@ -223,13 +253,21 @@ class AuboWorkbench(tk.Tk):
         nav = ttk.Frame(body, width=170)
         nav.pack(side=LEFT, fill=Y, padx=(0, 10))
         nav.pack_propagate(False)
+        ttk.Label(nav, text="现场执行", foreground="#555555").pack(anchor="w", pady=(2, 5))
+        for key, text in [("hole_localization", "孔洞定位")]:
+            btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
+            btn.pack(fill=X, pady=(0, 8))
+            self.nav_buttons[key] = btn
+        ttk.Label(nav, text="机器人与标定", foreground="#555555").pack(anchor="w", pady=(8, 5))
         for key, text in [
-            ("robot_info", "机械臂信息"),
-            ("motion_control", "机械臂运动"),
-            ("tcp_teach", "TCP 示教"),
-            ("handeye", "眼在手标定"),
-            ("hole_localization", "孔洞两阶段定位"),
+            ("motion_control", "机器人控制"),
+            ("calibration", "标定中心"),
         ]:
+            btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
+            btn.pack(fill=X, pady=(0, 8))
+            self.nav_buttons[key] = btn
+        ttk.Label(nav, text="系统", foreground="#555555").pack(anchor="w", pady=(8, 5))
+        for key, text in [("robot_info", "系统信息")]:
             btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
             btn.pack(fill=X, pady=(0, 8))
             self.nav_buttons[key] = btn
@@ -270,15 +308,13 @@ class AuboWorkbench(tk.Tk):
             return RobotInfoPanel(self.content, self.get_connection)
         if key == "motion_control":
             return AuboMotionPanel(self.content)
-        if key == "tcp_teach":
-            return TcpTeachPanel(self.content)
-        if key == "handeye":
-            panel = HandEyeGuiPanel(self.content, autostart=False)
+        if key == "calibration":
+            panel = CalibrationHubPanel(self.content)
             if self.old_stdout is None:
                 self.old_stdout = sys.stdout
                 self.old_stderr = sys.stderr
-                sys.stdout = GuiLogWriter(panel.log_queue, self.old_stdout)  # type: ignore[assignment]
-                sys.stderr = GuiLogWriter(panel.log_queue, self.old_stderr)  # type: ignore[assignment]
+                sys.stdout = GuiLogWriter(panel.handeye_panel.log_queue, self.old_stdout)  # type: ignore[assignment]
+                sys.stderr = GuiLogWriter(panel.handeye_panel.log_queue, self.old_stderr)  # type: ignore[assignment]
             return panel
         if key == "hole_localization":
             return HoleLocalizationPanel(self.content, self.get_connection)
@@ -293,6 +329,10 @@ class AuboWorkbench(tk.Tk):
             return
         page = self.pages.get(self.current_page)
         if page is None:
+            return
+        sync = getattr(page, "sync_connection", None)
+        if callable(sync):
+            sync(cfg)
             return
         for attr, value in [
             ("ip_var", cfg["ip"]), ("port_var", str(cfg["port"])),

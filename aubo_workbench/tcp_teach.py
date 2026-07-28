@@ -162,7 +162,7 @@ class TcpTeachSession:
             return False, (
                 f"无法连接 {ip}:{port}。\n系统错误: {exc}\n\n"
                 "请检查：\n1. 机械臂控制柜是否已上电并启动完成。\n2. 网线是否接在当前电脑的“以太网”口。\n"
-                "3. 本机以太网与机械臂控制器是否处于同一网段。\n4. 机械臂控制器 IP 是否正确。\n"
+                "3. 本机以太网 IP 是否位于机械臂网段。\n4. 机械臂控制器 IP 是否正确。\n"
                 "5. 控制器通信服务端口 30004 是否开启。"
             )
         finally:
@@ -385,7 +385,7 @@ class TcpTeachPanel(ttk.Frame):
 
         self.ip_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_IP", "192.168.1.100"))
         self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value="AUBO")
+        self.user_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_USER", "AUBO"))
         self.password_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_PASSWORD", ""))
         self.status_var = tk.StringVar(value="未连接")
         self.robot_var = tk.StringVar(value="-")
@@ -409,19 +409,11 @@ class TcpTeachPanel(ttk.Frame):
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill=BOTH, expand=True)
 
-        top = ttk.Frame(outer)
+        top = ttk.LabelFrame(outer, text="TCP 示教会话", padding=8)
         top.pack(fill=X)
-        ttk.Label(top, text="IP").pack(side=LEFT)
-        ttk.Entry(top, textvariable=self.ip_var, width=16).pack(side=LEFT, padx=(4, 10))
-        ttk.Label(top, text="端口").pack(side=LEFT)
-        ttk.Entry(top, textvariable=self.port_var, width=7).pack(side=LEFT, padx=(4, 10))
-        ttk.Label(top, text="账号").pack(side=LEFT)
-        ttk.Entry(top, textvariable=self.user_var, width=8).pack(side=LEFT, padx=(4, 10))
-        ttk.Label(top, text="密码").pack(side=LEFT)
-        ttk.Entry(top, textvariable=self.password_var, width=10, show="*").pack(side=LEFT, padx=(4, 10))
+        ttk.Label(top, text="连接参数使用工作台顶部统一设置。", foreground="#555555").pack(side=LEFT, padx=(0, 12))
         self.connect_btn = ttk.Button(top, text="连接机械臂", command=self.toggle_connect)
         self.connect_btn.pack(side=LEFT, padx=(0, 8))
-        ttk.Button(top, text="网络诊断", command=self.network_diagnostic).pack(side=LEFT, padx=(0, 8))
         ttk.Label(top, textvariable=self.status_var).pack(side=LEFT, padx=8)
 
         info = ttk.LabelFrame(outer, text="机械臂状态")
@@ -443,8 +435,8 @@ class TcpTeachPanel(ttk.Frame):
 
         toolbar = ttk.Frame(left)
         toolbar.pack(fill=X, pady=(0, 6))
-        self.connect_action_btn = ttk.Button(toolbar, text="连接机械臂", command=self.toggle_connect)
-        self.connect_action_btn.pack(side=LEFT, padx=(0, 12))
+        # 同一个连接按钮只保留在上方会话区；保留别名兼容已有状态刷新逻辑。
+        self.connect_action_btn = self.connect_btn
         ttk.Button(toolbar, text="采集当前点", command=self.capture_point).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="删除选中", command=self.delete_selected).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="清空", command=self.clear_points).pack(side=LEFT, padx=(0, 6))

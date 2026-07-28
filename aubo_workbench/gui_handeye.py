@@ -126,44 +126,34 @@ class HandEyeGuiPanel(ttk.Frame):
         root = ttk.Frame(self, padding=10)
         root.pack(fill=tk.BOTH, expand=True)
 
-        config = ttk.LabelFrame(root, text="连接与路径")
+        config = ttk.LabelFrame(root, text="标定文件与位姿源")
         config.pack(fill=tk.X)
-        for col in range(10):
-            config.columnconfigure(col, weight=0)
-        config.columnconfigure(9, weight=1)
-
-        ttk.Label(config, text="机械臂IP").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.ip_var, width=16).grid(row=0, column=1, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(config, text="端口").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.port_var, width=7).grid(row=0, column=3, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(config, text="账号").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.user_var, width=10).grid(row=0, column=5, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(config, text="密码").grid(row=0, column=6, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.password_var, width=12, show="*").grid(row=0, column=7, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(config, text="位姿源").grid(row=0, column=8, sticky="w", padx=(0, 4), pady=3)
-        ttk.Combobox(config, textvariable=self.pose_source_var, values=("tcp", "tool"), width=8, state="readonly").grid(row=0, column=9, sticky="w", pady=3)
+        config.columnconfigure(1, weight=1)
+        ttk.Label(config, text="机械臂连接参数使用工作台顶部统一设置。", foreground="#555555").grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=(0, 12), pady=3
+        )
+        ttk.Label(config, text="位姿源").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=3)
+        ttk.Combobox(config, textvariable=self.pose_source_var, values=("tcp", "tool"), width=8, state="readonly").grid(row=0, column=5, sticky="w", pady=3)
 
         ttk.Label(config, text="采集目录").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.save_dir_var).grid(row=1, column=1, columnspan=7, sticky="ew", padx=(0, 8), pady=3)
-        ttk.Button(config, text="选择", command=self.browse_save_dir).grid(row=1, column=8, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(config, text="打开目录", command=self.open_save_dir).grid(row=1, column=9, sticky="w", pady=3)
+        ttk.Entry(config, textvariable=self.save_dir_var).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=3)
+        ttk.Button(config, text="选择", command=self.browse_save_dir).grid(row=1, column=4, sticky="w", padx=(0, 8), pady=3)
+        ttk.Button(config, text="打开目录", command=self.open_save_dir).grid(row=1, column=5, sticky="w", pady=3)
 
         ttk.Label(config, text="输出JSON").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=3)
-        ttk.Entry(config, textvariable=self.output_json_var).grid(row=2, column=1, columnspan=7, sticky="ew", padx=(0, 8), pady=3)
-        ttk.Button(config, text="选择", command=self.browse_output_json).grid(row=2, column=8, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(config, textvariable=self.output_json_var).grid(row=2, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=3)
+        ttk.Button(config, text="选择", command=self.browse_output_json).grid(row=2, column=4, sticky="w", padx=(0, 8), pady=3)
 
         toolbar = ttk.Frame(root)
         toolbar.pack(fill=tk.X, pady=(8, 8))
         self.start_btn = ttk.Button(toolbar, text="启动相机", command=self.start_worker)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(toolbar, text="停止相机", command=self.stop_worker)
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 12))
-        self.network_btn = ttk.Button(toolbar, text="网络诊断", command=lambda: self.enqueue_command("network"))
-        self.network_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 14))
         self.connect_btn = ttk.Button(toolbar, text="连接机械臂", command=lambda: self.enqueue_command("connect"))
         self.connect_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.disconnect_btn = ttk.Button(toolbar, text="断开机械臂", command=lambda: self.enqueue_command("disconnect"))
-        self.disconnect_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.disconnect_btn.pack(side=tk.LEFT, padx=(0, 14))
         self.capture_btn = ttk.Button(toolbar, text="采集5帧选1帧", command=lambda: self.enqueue_command("capture"))
         self.capture_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.solve_btn = ttk.Button(toolbar, text="诊断求解(≥8)", command=lambda: self.enqueue_command("solve"))
@@ -173,12 +163,15 @@ class HandEyeGuiPanel(ttk.Frame):
             text=f"E7独立验证(≥{E7_HAND_EYE_CFG.minimum_total_poses})",
             command=self.request_e7_validation,
         )
-        self.e7_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.prune_btn = ttk.Button(toolbar, text="自动剔除并诊断", command=lambda: self.enqueue_command("prune"))
-        self.prune_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.delete_btn = ttk.Button(toolbar, text="归档最后样本", command=lambda: self.enqueue_command("delete_last"))
-        self.delete_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="手动TCP位姿", command=self.set_manual_pose_gui).pack(side=tk.LEFT, padx=(0, 6))
+        self.e7_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.maintenance_btn = ttk.Menubutton(toolbar, text="样本维护")
+        maintenance_menu = tk.Menu(self.maintenance_btn, tearoff=False)
+        maintenance_menu.add_command(label="自动剔除并诊断", command=lambda: self.enqueue_command("prune"))
+        maintenance_menu.add_command(label="归档最后样本", command=lambda: self.enqueue_command("delete_last"))
+        maintenance_menu.add_separator()
+        maintenance_menu.add_command(label="手动 TCP 位姿", command=self.set_manual_pose_gui)
+        self.maintenance_btn.configure(menu=maintenance_menu)
+        self.maintenance_btn.pack(side=tk.LEFT)
 
         status = ttk.LabelFrame(root, text="状态")
         status.pack(fill=tk.X, pady=(0, 8))
@@ -572,8 +565,8 @@ class HandEyeGuiPanel(ttk.Frame):
         self.stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
         state = tk.NORMAL if running else tk.DISABLED
         for button in (
-            self.network_btn, self.connect_btn, self.disconnect_btn,
-            self.capture_btn, self.solve_btn, self.e7_btn, self.prune_btn, self.delete_btn,
+            self.connect_btn, self.disconnect_btn, self.capture_btn,
+            self.solve_btn, self.e7_btn, self.maintenance_btn,
         ):
             button.configure(state=state)
 
