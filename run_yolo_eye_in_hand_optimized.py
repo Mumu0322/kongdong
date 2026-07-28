@@ -79,7 +79,8 @@ class TwoStageConfig:
     max_z_corrections: int = 4
     min_coarse_valid: int = 12
     min_fine_valid: int = 24
-    initial_max_plane_rmse_mm: float = 3.0
+    # 球面伞具的初始环带深度允许少量结构化噪声；粗/精阶段门限保持不变。
+    initial_max_plane_rmse_mm: float = 3.5
     max_plane_rmse_mm: float = 3.5
     coarse_settle_frames: int = 10
     coarse_max_attempt_multiplier: int = 6
@@ -818,12 +819,18 @@ def _print_motion_preview(label: str, current: np.ndarray, target: np.ndarray, e
         print("  " + extra)
 
 
+def _request_motion_confirmation(label: str, prompt: str) -> str:
+    """控制台保持原有 m 确认，同时向工作台输出可逐行读取的确认事件。"""
+    print(f"[MOTION_CONFIRM_REQUIRED] {label}", flush=True)
+    return input(prompt).strip().lower()
+
+
 def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, args: Any,
                            motion_session: Any, pose_session: Any, extra: str = "",
                            require_confirmation: bool = True) -> np.ndarray:
     _print_motion_preview(label, current, target, extra)
     if require_confirmation:
-        command = input("输入 m 确认运动，其他任意键取消：").strip().lower()
+        command = _request_motion_confirmation(label, "输入 m 确认运动，其他任意键取消：")
         if command != "m":
             raise RuntimeError(f"用户取消：{label}")
     else:
@@ -849,7 +856,7 @@ def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_sessi
     home_target = pose_session.pose_sdk_to_transform_mm(home.tcp_pose_m_rad)
     _print_motion_preview("回机械臂原点（关节运动）", current, home_target,
                           f"home={home.name} created_at={home.created_at}")
-    command = input("输入 m 确认回原点，其他任意键取消：").strip().lower()
+    command = _request_motion_confirmation("回机械臂原点", "输入 m 确认回原点，其他任意键取消：")
     if command != "m":
         raise RuntimeError("用户取消回原点")
     speed = math.radians(20.0)
@@ -1459,11 +1466,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="仅排障使用：关闭精定位后的最终 TCP XY 微调")
     p.add_argument("--tcp-xy-offset-mm", type=float, nargs=2, metavar=("DX", "DY"), default=None,
                    help="临时固定TCP XY补偿(mm)；默认不施加任何XY偏置")
+    # 工作台 GUI 可用这些参数覆盖本机默认连接配置；命令行既有用法保持兼容。
+    p.add_argument("--robot-ip", type=str, help="AUBO RPC IP（工作台传入）")
+    p.add_argument("--robot-port", type=int, help="AUBO RPC 端口（工作台传入）")
+    p.add_argument("--robot-user", type=str, help="AUBO 用户名（工作台传入）")
+    p.add_argument("--robot-password", type=str, help="AUBO 密码（工作台传入）")
+    p.add_argument("--robot-timeout-ms", type=int, help="AUBO 请求超时毫秒（工作台传入）")
     return p
+
+
+def _apply_robot_connection_overrides(args: Any) -> None:
+    """让工作台顶栏连接参数对独立定位进程生效。"""
+    for arg_name, config_name in (
+        ("robot_ip", "ip"),
+        ("robot_port", "rpc_port"),
+        ("robot_user", "user"),
+        ("robot_password", "password"),
+        ("robot_timeout_ms", "request_timeout_ms"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(ROBOT_CFG, config_name, value)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _apply_robot_connection_overrides(args)
     handeye = load_handeye_experiment_result(args.handeye)
     model = load_yolo(args.model)
     if args.two_stage_hole_localization:

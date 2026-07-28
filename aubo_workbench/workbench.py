@@ -19,6 +19,7 @@ from typing import Any
 
 from .gui_common import GuiLogWriter
 from .gui_handeye import HandEyeGuiPanel
+from .gui_hole_localization import HoleLocalizationPanel
 from .motion_control import AuboMotionPanel
 from .robot_info import read_all
 from .tcp_teach import TcpTeachPanel
@@ -181,7 +182,7 @@ class AuboWorkbench(tk.Tk):
 
         self.ip_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_IP", "192.168.1.100"))
         self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value="AUBO")
+        self.user_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_USER", "AUBO"))
         self.password_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_PASSWORD", ""))
         self.timeout_var = tk.StringVar(value="3000")
 
@@ -227,6 +228,7 @@ class AuboWorkbench(tk.Tk):
             ("motion_control", "机械臂运动"),
             ("tcp_teach", "TCP 示教"),
             ("handeye", "眼在手标定"),
+            ("hole_localization", "孔洞两阶段定位"),
         ]:
             btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
             btn.pack(fill=X, pady=(0, 8))
@@ -278,6 +280,8 @@ class AuboWorkbench(tk.Tk):
                 sys.stdout = GuiLogWriter(panel.log_queue, self.old_stdout)  # type: ignore[assignment]
                 sys.stderr = GuiLogWriter(panel.log_queue, self.old_stderr)  # type: ignore[assignment]
             return panel
+        if key == "hole_localization":
+            return HoleLocalizationPanel(self.content, self.get_connection)
         raise KeyError(key)
 
     def sync_current_page(self, show_errors: bool = True) -> None:

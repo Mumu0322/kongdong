@@ -22,7 +22,7 @@ class FinalXyPlanningTests(unittest.TestCase):
 
     def test_coarse_normal_gate_matches_measured_depth_repeatability(self):
         self.assertEqual(TwoStageConfig().normal_tolerance_deg, 2.0)
-        self.assertEqual(TwoStageConfig().initial_max_plane_rmse_mm, 3.0)
+        self.assertEqual(TwoStageConfig().initial_max_plane_rmse_mm, 3.5)
         self.assertEqual(TwoStageConfig().max_plane_rmse_mm, 3.5)
         self.assertEqual(TwoStageConfig().coarse_settle_frames, 10)
         self.assertEqual(TwoStageConfig().coarse_max_attempt_multiplier, 6)
