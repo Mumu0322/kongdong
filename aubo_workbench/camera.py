@@ -168,7 +168,7 @@ def format_orbbec_error_hint(exc: Exception) -> str:
     if "VendorTCPClient" in text or "192.168.1.10" in text or "port=8090" in text:
         hints.extend([
             "[ERROR] SDK 正在按以太网相机访问 192.168.1.10:8090，但该地址/端口没有响应。",
-            "[CHECK] 这不是 AUBO 机械臂错误，而是 Gemini 435Le 相机网络错误。",
+            "[CHECK] 这不是 AUBO 机械臂 192.168.50.200 的错误，而是 Gemini 435Le 相机网络错误。",
             "[CHECK] 如果相机走网口，请确认本机连接相机的网卡在 192.168.1.x/24 网段，且能 ping 通 192.168.1.10。",
             "[CHECK] 如果相机走 USB，请检查 Orbbec SDK/设备配置里是否误把相机切到了 ethernet 模式。",
         ])

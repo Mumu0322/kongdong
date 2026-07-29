@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sys
 import threading
 import time
@@ -346,10 +345,10 @@ class AuboWorkbench(tk.Tk):
         self.geometry("1440x880")
         self.minsize(1160, 720)
 
-        self.ip_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_IP", "192.168.1.100"))
+        self.ip_var = tk.StringVar(value="192.168.50.200")
         self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_USER", "AUBO"))
-        self.password_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_PASSWORD", ""))
+        self.user_var = tk.StringVar(value="AUBO")
+        self.password_var = tk.StringVar(value="123456")
         self.timeout_var = tk.StringVar(value="3000")
 
         self.pages: dict[str, ttk.Frame] = {}

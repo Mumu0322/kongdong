@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import itertools
 import math
-import os
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -162,7 +161,7 @@ class TcpTeachSession:
             return False, (
                 f"无法连接 {ip}:{port}。\n系统错误: {exc}\n\n"
                 "请检查：\n1. 机械臂控制柜是否已上电并启动完成。\n2. 网线是否接在当前电脑的“以太网”口。\n"
-                "3. 本机以太网 IP 是否位于机械臂网段。\n4. 机械臂控制器 IP 是否正确。\n"
+                "3. 本机以太网 IP 是否为 192.168.50.196/24。\n4. 机械臂控制器 IP 是否仍为 192.168.50.200。\n"
                 "5. 控制器通信服务端口 30004 是否开启。"
             )
         finally:
@@ -383,10 +382,10 @@ class TcpTeachPanel(ttk.Frame):
         self.poll_after_id: str | None = None
         self.last_poll_error = ""
 
-        self.ip_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_IP", "192.168.1.100"))
+        self.ip_var = tk.StringVar(value="192.168.50.200")
         self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_USER", "AUBO"))
-        self.password_var = tk.StringVar(value=os.getenv("AUBO_ROBOT_PASSWORD", ""))
+        self.user_var = tk.StringVar(value="AUBO")
+        self.password_var = tk.StringVar(value="123456")
         self.status_var = tk.StringVar(value="未连接")
         self.robot_var = tk.StringVar(value="-")
         self.mode_var = tk.StringVar(value="-")

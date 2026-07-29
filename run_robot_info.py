@@ -3,7 +3,7 @@
 """命令行只读查询 AUBO 机械臂信息。
 
 用法：
-    python run_robot_info.py --ip <机器人IP> --port 30004
+    python run_robot_info.py --ip 192.168.50.200 --port 30004
 """
 
 from pathlib import Path

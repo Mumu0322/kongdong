@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import socket
 import sys
 import threading
@@ -31,10 +30,10 @@ POINTS_FILE = DATA_DIR / "aubo_motion_points.json"
 HOME_POINT_FILE = DATA_DIR / "aubo_home_point.json"
 DEFAULT_SDK_DIR = Path(r"C:\MM\third_party\aubo_sdk")
 
-DEFAULT_IP = os.getenv("AUBO_ROBOT_IP", "192.168.1.100")
+DEFAULT_IP = "192.168.50.200"
 DEFAULT_PORT = 30004
 DEFAULT_USER = "AUBO"
-DEFAULT_PASSWORD = os.getenv("AUBO_ROBOT_PASSWORD", "")
+DEFAULT_PASSWORD = "123456"
 DEFAULT_TIMEOUT_MS = 3000
 MOTION_FRAME_CHOICES = ("基坐标系", "工具/TCP坐标系")
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-import run_yolo_eye_in_hand as module
+import run_yolo_eye_in_hand_optimized as module
 from aubo_workbench.camera import CameraIntrinsics
 from aubo_workbench.geometry import make_transform
 
@@ -39,7 +39,9 @@ class TwoStageGeometryTests(unittest.TestCase):
 
     def test_final_tcp_xy_preserves_tcp_z_and_orientation(self) -> None:
         current = make_transform(self.R_down, np.array([0.0, 0.0, 260.0]))
-        target, before = module.plan_final_tcp_xy(current, np.array([25.0, -10.0, 0.0]))
+        target, before = module.plan_final_tcp_xy(
+            current, np.array([25.0, -10.0, 0.0]), xy_offset_mm=(0.0, 0.0),
+        )
         self.assertTrue(np.allclose(before, [0.0, 0.0, 260.0]))
         self.assertTrue(np.allclose(target[:3, 3], [25.0, -10.0, 260.0]))
         self.assertTrue(np.allclose(target[:3, :3], current[:3, :3]))
@@ -96,11 +98,11 @@ class TwoStageGeometryTests(unittest.TestCase):
         for diameter in (64.6, 70.2, 74.7):
             self.assertEqual(min(module.HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter)), round(diameter / 5.0) * 5.0)
 
-    def test_experimental_handeye_override_is_explicit(self) -> None:
+    def test_current_handeye_and_charuco_defaults_are_explicit(self) -> None:
         parser = module.build_parser()
-        self.assertFalse(parser.parse_args([]).allow_experimental_handeye)
-        self.assertTrue(parser.parse_args(["--allow-experimental-handeye"]).allow_experimental_handeye)
-        self.assertEqual(tuple(parser.parse_args([]).tcp_xy_offset_mm), (0.0, 0.0))
+        self.assertTrue(parser.parse_args([]).allow_experimental_handeye)
+        self.assertFalse(parser.parse_args(["--require-validated-handeye"]).allow_experimental_handeye)
+        self.assertIsNone(parser.parse_args([]).tcp_xy_offset_mm)
         self.assertEqual(tuple(parser.parse_args(["--tcp-xy-offset-mm", "0", "0"]).tcp_xy_offset_mm), (0.0, 0.0))
 
 

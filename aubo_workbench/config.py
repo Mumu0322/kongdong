@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 
@@ -190,10 +189,10 @@ class HoleVisionConfig:
 class RobotConfig:
     # 默认自动读取 AUBO 当前 TCP 位姿。只读，不写 TCP，不控制运动。
     robot_pose_read_enable: bool = True
-    ip: str = os.getenv("AUBO_ROBOT_IP", "192.168.1.100")
+    ip: str = "192.168.50.200"
     rpc_port: int = 30004
-    user: str = os.getenv("AUBO_ROBOT_USER", "AUBO")
-    password: str = os.getenv("AUBO_ROBOT_PASSWORD", "")
+    user: str = "AUBO"
+    password: str = "123456"
     request_timeout_ms: int = 1500
     network_precheck_timeout_s: float = 1.0
 

@@ -1,5 +1,13 @@
+# Python runtime cache
 __pycache__/
 *.py[cod]
-.env
-data/hole_localization_runs/
-*.zip
+
+# Camera/SDK runtime logs
+Log/
+*.log
+
+# Local editor and virtual-environment files
+.idea/
+.vscode/
+.venv/
+venv/

@@ -31,7 +31,7 @@ from aubo_workbench.e7_handeye import (
 )
 from aubo_workbench.gui_handeye import _format_e7_candidate_summary
 from aubo_workbench.geometry import invert_transform, make_transform
-from aubo_workbench.hole_localization import CameraIntrinsics
+from aubo_workbench.camera import CameraIntrinsics
 from aubo_workbench.samples import CalibSample, archive_samples, load_existing_samples
 from aubo_workbench.solve import auto_prune_samples, solve_and_save
 

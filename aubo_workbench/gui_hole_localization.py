@@ -48,6 +48,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.fine_height_var = tk.StringVar(value="260")
         self.coarse_frames_var = tk.StringVar(value="15")
         self.fine_frames_var = tk.StringVar(value="30")
+        # 默认三孔：界面会要求逐个点击三个孔，第一孔作为粗定位参考。
         self.hole_count_var = tk.StringVar(value="3")
         self.speed_var = tk.StringVar(value="0.03")
         self.acc_var = tk.StringVar(value="0.10")
