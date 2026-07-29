@@ -48,6 +48,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.fine_height_var = tk.StringVar(value="260")
         self.coarse_frames_var = tk.StringVar(value="15")
         self.fine_frames_var = tk.StringVar(value="30")
+        self.hole_count_var = tk.StringVar(value="3")
         self.speed_var = tk.StringVar(value="0.03")
         self.acc_var = tk.StringVar(value="0.10")
         self.execute_var = tk.BooleanVar(value=False)
@@ -77,6 +78,7 @@ class HoleLocalizationPanel(ttk.Frame):
             ("精定位高度 mm", self.fine_height_var, 8),
             ("粗定位帧", self.coarse_frames_var, 6),
             ("精定位帧", self.fine_frames_var, 6),
+            ("输出孔数", self.hole_count_var, 6),
             ("速度 m/s", self.speed_var, 7),
             ("加速度 m/s²", self.acc_var, 7),
         ]):
@@ -174,6 +176,7 @@ class HoleLocalizationPanel(ttk.Frame):
             "--fine-height-mm", str(values["fine_height"]),
             "--coarse-frames", str(values["coarse_frames"]),
             "--fine-frames", str(values["fine_frames"]),
+            "--hole-count", str(int(self.hole_count_var.get())),
             "--speed-m-s", str(values["speed"]), "--acc-m-s2", str(values["acc"]),
             "--robot-ip", str(connection["ip"]), "--robot-port", str(connection["port"]),
             "--robot-user", str(connection["user"]), "--robot-password", str(connection["password"]),
@@ -313,6 +316,21 @@ class HoleLocalizationPanel(ttk.Frame):
         try:
             report = json.loads(reports[0].read_text(encoding="utf-8"))
             final = report.get("final_result", {})
+            holes = final.get("holes")
+            if isinstance(holes, list) and holes:
+                lines = [
+                    f"报告：{reports[0].parent}",
+                    f"三孔共享精拍 TCP：{self._format_vector(final.get('shared_fine_tcp_pose_m_rad'))}",
+                ]
+                for item in holes:
+                    lines.append(
+                        f"孔 {item.get('hole_id', '-')}：中心={self._format_vector(item.get('hole_center_base_mm'))} "
+                        f"法向={self._format_vector(item.get('plane_normal_toward_camera_base'))} "
+                        f"姿态={self._format_vector(item.get('hole_pose_m_rad'))} "
+                        f"孔径={item.get('matched_diameter_mm', '-') } mm"
+                    )
+                self.result_var.set("\n".join(lines))
+                return
             center = final.get("hole_center_base_mm")
             normal = final.get("plane_normal_toward_camera_base")
             tcp = final.get("final_tcp_pose_m_rad")

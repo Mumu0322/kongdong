@@ -6,6 +6,8 @@ from run_yolo_eye_in_hand_optimized import (
     TwoStageConfig,
     build_parser,
     fit_sphere,
+    _ray_sphere_intersection_base,
+    _hole_surface_pose,
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
     plan_final_tcp_xy,
@@ -13,6 +15,27 @@ from run_yolo_eye_in_hand_optimized import (
 
 
 class FinalXyPlanningTests(unittest.TestCase):
+    def test_three_hole_parser_and_sphere_ray_intersection(self):
+        args = build_parser().parse_args(["--hole-count", "3"])
+        self.assertEqual(args.hole_count, 3)
+
+        class Intrinsics:
+            fx = 1000.0
+            fy = 1000.0
+            cx = 320.0
+            cy = 240.0
+            distortion = ()
+
+        point, normal = _ray_sphere_intersection_base(
+            np.array([320.0, 240.0]), Intrinsics(), np.eye(4),
+            np.array([0.0, 0.0, 1000.0]), 100.0,
+        )
+        np.testing.assert_allclose(point, np.array([0.0, 0.0, 900.0]), atol=1e-6)
+        np.testing.assert_allclose(normal, np.array([0.0, 0.0, -1.0]), atol=1e-6)
+        pose = _hole_surface_pose(point, normal, np.array([1.0, 0.0, 0.0]))
+        np.testing.assert_allclose(pose[:3, 3], point, atol=1e-6)
+        np.testing.assert_allclose(pose[:3, 2], normal, atol=1e-6)
+
     def test_final_xy_motion_is_enabled_by_default(self):
         args = build_parser().parse_args([])
         self.assertTrue(args.move_final_xy)

@@ -30,6 +30,7 @@ COARSE_HEIGHT_MM = 340.0
 FINE_HEIGHT_MM = 260.0
 COARSE_FRAMES = 15
 FINE_FRAMES = 30
+HOLE_COUNT = 3
 YOLO_CONFIDENCE = 0.35
 
 # 运动配置。默认关闭。
@@ -82,6 +83,7 @@ def build_arguments() -> list[str]:
             "--fine-height-mm", str(FINE_HEIGHT_MM),
             "--coarse-frames", str(COARSE_FRAMES),
             "--fine-frames", str(FINE_FRAMES),
+            "--hole-count", str(HOLE_COUNT),
         ])
 
     if EXECUTE_MOTION:

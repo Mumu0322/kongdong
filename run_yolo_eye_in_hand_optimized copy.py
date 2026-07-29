@@ -46,6 +46,7 @@ DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidat
 WINDOW = "YOLO eye-in-hand hole selection (click hole, Enter=confirm, Esc=quit)"
 RUNS_DIR = ROOT.parent / "data" / "hole_localization_runs"
 HOLE_DIAMETERS_MM = (65.0, 70.0, 75.0)
+FINAL_BASE_Y_AFTER_Z_MM = 0.2
 
 # 当前使用的 ChArUco 9 点 XY 仿射模型；不启用工作区限制。
 CHARUCO_XY_MODEL_MATRIX = np.array([
@@ -78,9 +79,13 @@ class TwoStageConfig:
     max_z_corrections: int = 4
     min_coarse_valid: int = 12
     min_fine_valid: int = 24
-    initial_max_plane_rmse_mm: float = 3.0
-    max_plane_rmse_mm: float = 2.0
+    # 球面伞具的初始环带深度允许少量结构化噪声；粗/精阶段门限保持不变。
+    initial_max_plane_rmse_mm: float = 3.5
+    max_plane_rmse_mm: float = 3.5
+    coarse_settle_frames: int = 10
+    coarse_max_attempt_multiplier: int = 6
     max_ellipse_residual_px: float = 0.9
+    min_coarse_ellipse_coverage_deg: float = 120.0
     min_ellipse_coverage_deg: float = 200.0
     max_fine_center_scatter_p95_px: float = 0.35
     enable_tilt_center_correction: bool = True
@@ -95,6 +100,9 @@ class PlaneEstimate:
     normal_camera: np.ndarray
     rmse_mm: float
     ring_points: int
+    surface_model: str = "sphere"
+    sphere_center_camera_mm: np.ndarray | None = None
+    sphere_radius_mm: float | None = None
 
 
 @dataclass
@@ -166,6 +174,42 @@ def fit_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     return normal / np.linalg.norm(normal), float(np.sqrt(np.mean(residual ** 2)))
 
 
+def fit_sphere(points: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """鲁棒拟合未知半径球面，返回球心、半径和径向RMSE。"""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if len(pts) < 20:
+        raise ValueError("球面拟合有效深度点不足")
+    origin = np.median(pts, axis=0)
+    active = np.ones(len(pts), dtype=bool)
+    center = radius = None
+    for _ in range(5):
+        work = pts[active]
+        q = work - origin
+        A = np.column_stack((2.0 * q, np.ones(len(q))))
+        b = np.sum(q * q, axis=1)
+        solution, *_ = np.linalg.lstsq(A, b, rcond=None)
+        center_local = solution[:3]
+        radius_sq = float(solution[3] + center_local @ center_local)
+        if not math.isfinite(radius_sq) or radius_sq <= 0.0:
+            raise ValueError("球面半径估计无效")
+        center = origin + center_local
+        radius = math.sqrt(radius_sq)
+        residual = np.abs(np.linalg.norm(pts - center, axis=1) - radius)
+        median = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median)))
+        threshold = max(2.0, median + 4.0 * 1.4826 * max(mad, 1e-6))
+        new_active = residual <= threshold
+        if new_active.sum() < 20 or np.array_equal(new_active, active):
+            active = new_active if new_active.sum() >= 20 else active
+            break
+        active = new_active
+    if center is None or radius is None:
+        raise ValueError("球面拟合失败")
+    final_residual = np.linalg.norm(pts[active] - center, axis=1) - radius
+    return center, float(radius), float(np.sqrt(np.mean(final_residual ** 2)))
+
+
 def hole_camera_point(
     ring_center_xy: tuple[float, float],
     xyz_map_mm: np.ndarray,
@@ -189,27 +233,37 @@ def hole_camera_point(
     points = xyz_map_mm[ring]
     points = points[np.isfinite(points).all(axis=1)]
     points = points[(points[:, 2] > 100.0) & (points[:, 2] < 3000.0)]
-    normal, rmse = fit_plane(points)
+    sphere_center, sphere_radius, rmse = fit_sphere(points)
 
     ray_center = np.asarray(
         ring_center_xy if ray_center_xy is None else ray_center_xy,
         dtype=np.float64,
     ).reshape(2)
     ray = camera_ray(intrinsics, ray_center, already_undistorted=ray_center_is_undistorted)
-    denom = float(normal @ ray)
-    if abs(denom) < 1e-8:
-        raise ValueError("孔中心视线与局部平面近乎平行")
-
-    p0 = np.median(points, axis=0)
-    scale = float(normal @ p0) / denom
+    b = -2.0 * float(sphere_center @ ray)
+    c = float(sphere_center @ sphere_center - sphere_radius * sphere_radius)
+    discriminant = b * b - 4.0 * c
+    if discriminant <= 0.0:
+        raise ValueError("孔中心视线未与拟合球面相交")
+    roots = [(-b - math.sqrt(discriminant)) / 2.0, (-b + math.sqrt(discriminant)) / 2.0]
+    positive_roots = [value for value in roots if value > 0.0 and math.isfinite(value)]
+    if not positive_roots:
+        raise ValueError("球面交点位于相机反向")
+    scale = min(positive_roots)
     point = ray * scale
     if not np.isfinite(point).all() or point[2] <= 0:
         raise ValueError("孔中心反投影得到无效深度")
+    normal = _unit(point - sphere_center, "sphere surface normal")
+    if normal[2] > 0:
+        normal = -normal
     return point, {
         "ring_points": int(len(points)),
         "plane_rmse_mm": rmse,
         "plane_normal_camera": normal.tolist(),
-        "plane_point_camera_mm": p0.tolist(),
+        "plane_point_camera_mm": point.tolist(),
+        "surface_model": "sphere",
+        "sphere_center_camera_mm": sphere_center.tolist(),
+        "sphere_radius_mm": sphere_radius,
         "ring_center_px_distorted": [ring_u, ring_v],
         "ray_center_px": ray_center.tolist(),
         "ray_center_is_undistorted": bool(ray_center_is_undistorted),
@@ -532,6 +586,20 @@ def plan_final_tcp_xy(T_base_tcp: np.ndarray, hole_center_base: np.ndarray,
     return target, np.asarray(T_base_tcp, dtype=np.float64)[:3, 3].copy()
 
 
+def plan_final_tcp_base_z(T_base_tcp: np.ndarray, hole_center_base: np.ndarray) -> np.ndarray:
+    """保持当前 TCP 的 XY 和姿态，仅令基坐标 Z 等于孔中心基坐标 Z。"""
+    target = np.asarray(T_base_tcp, dtype=np.float64).copy()
+    target[2, 3] = float(np.asarray(hole_center_base, dtype=np.float64).reshape(3)[2])
+    return target
+
+
+def plan_final_tcp_base_y_trim(T_base_tcp: np.ndarray, delta_y_mm: float = FINAL_BASE_Y_AFTER_Z_MM) -> np.ndarray:
+    """保持当前 TCP 的 X、Z 和姿态，仅沿基坐标 Y 做最终微调。"""
+    target = np.asarray(T_base_tcp, dtype=np.float64).copy()
+    target[1, 3] += float(delta_y_mm)
+    return target
+
+
 def fit_hole_ellipse(
     image_bgr: np.ndarray,
     detection: dict[str, Any],
@@ -652,9 +720,11 @@ def _nearest_detection(detections: list[dict[str, Any]], anchor_px: np.ndarray,
     return min(detections, key=lambda item: float(np.linalg.norm(np.asarray(item["center"]) - anchor_px)))
 
 
-def _ellipse_ok(ellipse: dict[str, Any] | None, cfg: TwoStageConfig) -> bool:
+def _ellipse_ok(ellipse: dict[str, Any] | None, cfg: TwoStageConfig,
+                min_coverage_deg: float | None = None) -> bool:
+    coverage_gate = cfg.min_ellipse_coverage_deg if min_coverage_deg is None else float(min_coverage_deg)
     return bool(ellipse and ellipse["residual_px"] <= cfg.max_ellipse_residual_px
-                and ellipse["coverage_deg"] >= cfg.min_ellipse_coverage_deg
+                and ellipse["coverage_deg"] >= coverage_gate
                 and ellipse["roundness"] >= 0.70)
 
 
@@ -751,12 +821,18 @@ def _print_motion_preview(label: str, current: np.ndarray, target: np.ndarray, e
         print("  " + extra)
 
 
+def _request_motion_confirmation(label: str, prompt: str) -> str:
+    """控制台保持原有 m 确认，同时向工作台输出可逐行读取的确认事件。"""
+    print(f"[MOTION_CONFIRM_REQUIRED] {label}", flush=True)
+    return input(prompt).strip().lower()
+
+
 def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, args: Any,
                            motion_session: Any, pose_session: Any, extra: str = "",
                            require_confirmation: bool = True) -> np.ndarray:
     _print_motion_preview(label, current, target, extra)
     if require_confirmation:
-        command = input("输入 m 确认运动，其他任意键取消：").strip().lower()
+        command = _request_motion_confirmation(label, "输入 m 确认运动，其他任意键取消：")
         if command != "m":
             raise RuntimeError(f"用户取消：{label}")
     else:
@@ -771,23 +847,41 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
 
 
 def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_session: Any) -> np.ndarray:
-    _, current = _require_safe_snapshot(pose_session)
+    snapshot, current = _require_safe_snapshot(pose_session)
+    current_joints = np.asarray(snapshot.get("joints_rad", []), dtype=np.float64)
+    home_joints = np.asarray(home.joints_rad, dtype=np.float64)
+    if current_joints.size == home_joints.size and current_joints.size > 0:
+        max_joint_error_deg = float(np.max(np.abs(current_joints - home_joints)) * 180.0 / math.pi)
+        if max_joint_error_deg <= 0.5:
+            print(f"[MOTION] 当前已在原点关节位，最大关节偏差={max_joint_error_deg:.3f}°，跳过回原点运动")
+            return current
     home_target = pose_session.pose_sdk_to_transform_mm(home.tcp_pose_m_rad)
     _print_motion_preview("回机械臂原点（关节运动）", current, home_target,
                           f"home={home.name} created_at={home.created_at}")
-    command = input("输入 m 确认回原点，其他任意键取消：").strip().lower()
+    command = _request_motion_confirmation("回机械臂原点", "输入 m 确认回原点，其他任意键取消：")
     if command != "m":
         raise RuntimeError("用户取消回原点")
     speed = math.radians(20.0)
     acc = math.radians(40.0)
     response = motion_session.move_joint(home.joints_rad, speed, acc)
     print("[MOTION]", response)
-    _, actual = _wait_robot_steady(pose_session)
+    from aubo_workbench.motion_control import sdk_ok
+    settled_snapshot, actual = _wait_robot_steady(pose_session)
+    if not response or not sdk_ok(response[-1]):
+        settled_joints = np.asarray(settled_snapshot.get("joints_rad", []), dtype=np.float64)
+        reached_home = (
+            settled_joints.size == home_joints.size
+            and settled_joints.size > 0
+            and float(np.max(np.abs(settled_joints - home_joints)) * 180.0 / math.pi) <= 0.5
+        )
+        if not reached_home:
+            raise RuntimeError(f"回原点 moveJoint 下发失败：{response}")
+        print("[MOTION] 控制器返回非成功码，但关节已处于原点，按到位处理")
     return actual
 
 
 def _capture_initial_selection(pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-                               run_dir: Path, max_plane_rmse_mm: float
+                               run_dir: Path, max_plane_rmse_mm: float, hole_count: int = 1
                                ) -> tuple[Any, dict[str, Any], np.ndarray, PlaneEstimate, Any]:
     bundle = None
     for _ in range(10):
@@ -803,6 +897,24 @@ def _capture_initial_selection(pipeline: Any, align: Any, chain: Any, model: Any
     if selected is None:
         raise RuntimeError("未选择目标孔")
     chosen = detections[selected]
+    if hole_count > 1:
+        candidates = [item for item in detections if item.get("class_id") == chosen.get("class_id")]
+        if len(candidates) < hole_count:
+            raise RuntimeError(f"当前画面同类孔数量不足：检测到 {len(candidates)} 个，需要 {hole_count} 个")
+        # 保留用户点选的参考孔，再按置信度补齐目标孔，最后按图像X/Y排序固定编号。
+        selected_key = tuple(chosen["box"])
+        ranked = sorted(candidates, key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        group = [chosen]
+        group.extend(item for item in ranked if tuple(item["box"]) != selected_key)
+        group = group[:hole_count]
+        group.sort(key=lambda item: (float(item["center"][1]), float(item["center"][0])))
+        chosen["tracked_holes"] = [
+            {"hole_id": index + 1, "initial_center_px": list(item["center"]), "class_id": item["class_id"]}
+            for index, item in enumerate(group)
+        ]
+        chosen["reference_hole_id"] = next(
+            index + 1 for index, item in enumerate(group) if tuple(item["box"]) == selected_key
+        )
     ellipse = fit_hole_ellipse(bundle.color_bgr, chosen, bundle.intrinsics)
     radius = max(chosen["box"][2] - chosen["box"][0], chosen["box"][3] - chosen["box"][1]) / 2.0
     ring_center = tuple(ellipse["center_px_distorted"] if ellipse is not None else chosen["center"])
@@ -815,6 +927,12 @@ def _capture_initial_selection(pipeline: Any, align: Any, chain: Any, model: Any
         point_camera_mm=np.asarray(info["plane_point_camera_mm"], dtype=np.float64),
         normal_camera=_unit(np.asarray(info["plane_normal_camera"], dtype=np.float64), "initial plane normal"),
         rmse_mm=float(info["plane_rmse_mm"]), ring_points=int(info["ring_points"]),
+        surface_model=str(info.get("surface_model", "sphere")),
+        sphere_center_camera_mm=(
+            np.asarray(info["sphere_center_camera_mm"], dtype=np.float64)
+            if info.get("sphere_center_camera_mm") is not None else None
+        ),
+        sphere_radius_mm=(float(info["sphere_radius_mm"]) if info.get("sphere_radius_mm") is not None else None),
     )
     cv2.imwrite(str(run_dir / "01_home_selected.png"), _overlay(bundle.color_bgr, chosen, ellipse, "home selected hole"))
     if plane.rmse_mm > float(max_plane_rmse_mm):
@@ -833,7 +951,9 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
     latest_detection: dict[str, Any] | None = None
     latest_ellipse: dict[str, Any] | None = None
     anchor = np.array([0.0, 0.0])
-    for attempt in range(cfg.coarse_frames * 3):
+    for _ in range(cfg.coarse_settle_frames):
+        get_aligned_frame_bundle(pipeline, align, chain)
+    for attempt in range(cfg.coarse_frames * cfg.coarse_max_attempt_multiplier):
         if len([item for item in observations if item.error is None]) >= cfg.coarse_frames:
             break
         bundle = get_aligned_frame_bundle(pipeline, align, chain)
@@ -847,7 +967,7 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
             observations.append(Observation(name, attempt, anchor, timestamp_ns=bundle.host_timestamp_ns, error="yolo_missing"))
             continue
         ellipse = fit_hole_ellipse(bundle.color_bgr, detection, bundle.intrinsics)
-        ellipse_valid = _ellipse_ok(ellipse, cfg)
+        ellipse_valid = _ellipse_ok(ellipse, cfg, cfg.min_coarse_ellipse_coverage_deg)
         center = np.asarray(ellipse["center_px"] if ellipse_valid else detection["center"], dtype=np.float64)
         radius = max(detection["box"][2] - detection["box"][0], detection["box"][3] - detection["box"][1]) / 2.0
         try:
@@ -860,6 +980,12 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
                 point_camera_mm=np.asarray(plane_info["plane_point_camera_mm"], dtype=np.float64),
                 normal_camera=_unit(np.asarray(plane_info["plane_normal_camera"], dtype=np.float64), "coarse plane normal"),
                 rmse_mm=float(plane_info["plane_rmse_mm"]), ring_points=int(plane_info["ring_points"]),
+                surface_model=str(plane_info.get("surface_model", "sphere")),
+                sphere_center_camera_mm=(
+                    np.asarray(plane_info["sphere_center_camera_mm"], dtype=np.float64)
+                    if plane_info.get("sphere_center_camera_mm") is not None else None
+                ),
+                sphere_radius_mm=(float(plane_info["sphere_radius_mm"]) if plane_info.get("sphere_radius_mm") is not None else None),
             )
             valid = ellipse_valid and plane.rmse_mm <= cfg.max_plane_rmse_mm
             observations.append(Observation(name, attempt, center, ellipse, plane, bundle.host_timestamp_ns,
@@ -909,6 +1035,118 @@ def _capture_fine_burst(pipeline: Any, model: Any, confidence: float, chosen: di
     return observations, latest_bundle.intrinsics, latest_bundle.color_bgr, latest_ellipse
 
 
+def _overlay_multi(image: np.ndarray, detections: list[tuple[dict[str, Any], dict[str, Any] | None]], title: str) -> np.ndarray:
+    view = image.copy()
+    for index, (detection, ellipse) in enumerate(detections, start=1):
+        view = _overlay(view, detection, ellipse, f"{title}  hole-{index}")
+        cv2.putText(view, f"H{index}", tuple(map(int, detection["center"])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+    return view
+
+
+def _capture_multi_fine_burst(
+    pipeline: Any, model: Any, confidence: float, tracked_holes: list[dict[str, Any]],
+    cfg: TwoStageConfig, run_dir: Path,
+) -> tuple[dict[int, list[Observation]], Any, np.ndarray]:
+    """一次 RGB 精拍同时跟踪多个孔；检测按上一帧中心贪心匹配，避免孔编号跳变。"""
+    if not tracked_holes:
+        raise RuntimeError("没有可跟踪的多孔目标")
+    observations = {int(item["hole_id"]): [] for item in tracked_holes}
+    anchors = {int(item["hole_id"]): np.asarray(item["initial_center_px"], dtype=np.float64) for item in tracked_holes}
+    latest_bundle = None
+    latest_pairs: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    reference_class = int(tracked_holes[0]["class_id"])
+    max_attempts = cfg.fine_frames * 4
+    for attempt in range(max_attempts):
+        if all(len([item for item in values if item.error is None]) >= cfg.fine_frames for values in observations.values()):
+            break
+        bundle = get_rgb_frame_bundle(pipeline)
+        if bundle is None or bundle.intrinsics is None:
+            continue
+        latest_bundle = bundle
+        detections = [item for item in detect(model, bundle.color_bgr, confidence)
+                      if int(item.get("class_id", -1)) == reference_class]
+        candidates: list[tuple[dict[str, Any], dict[str, Any] | None, np.ndarray, bool]] = []
+        for detection in detections:
+            ellipse = fit_hole_ellipse(bundle.color_bgr, detection, bundle.intrinsics)
+            valid = _ellipse_ok(ellipse, cfg)
+            center = np.asarray(ellipse["center_px"] if valid else detection["center"], dtype=np.float64)
+            candidates.append((detection, ellipse, center, valid))
+        unused = set(range(len(candidates)))
+        pairs_for_overlay: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        for hole in tracked_holes:
+            hole_id = int(hole["hole_id"])
+            if not unused:
+                observations[hole_id].append(Observation(
+                    f"fine_hole_{hole_id}", attempt, anchors[hole_id], timestamp_ns=bundle.host_timestamp_ns,
+                    error="yolo_missing",
+                ))
+                continue
+            candidate_index = min(unused, key=lambda idx: float(np.linalg.norm(candidates[idx][2] - anchors[hole_id])))
+            unused.remove(candidate_index)
+            detection, ellipse, center, valid = candidates[candidate_index]
+            pairs_for_overlay.append((detection, ellipse))
+            if valid:
+                observations[hole_id].append(Observation(
+                    f"fine_hole_{hole_id}", attempt, center, ellipse, timestamp_ns=bundle.host_timestamp_ns,
+                ))
+                anchors[hole_id] = center
+            else:
+                observations[hole_id].append(Observation(
+                    f"fine_hole_{hole_id}", attempt, center, ellipse, timestamp_ns=bundle.host_timestamp_ns,
+                    error="ellipse_quality",
+                ))
+        latest_pairs = pairs_for_overlay
+    if latest_bundle is None:
+        raise RuntimeError("多孔精定位期间未获得 RGB 帧")
+    cv2.imwrite(str(run_dir / "04_fine_multi_overlay.png"),
+                _overlay_multi(latest_bundle.color_bgr, latest_pairs, "fine RGB multi-hole"))
+    return observations, latest_bundle.intrinsics, latest_bundle.color_bgr
+
+
+def _ray_sphere_intersection_base(
+    pixel_xy: np.ndarray, intrinsics: Any, T_base_camera: np.ndarray,
+    sphere_center_base_mm: np.ndarray, sphere_radius_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    ray_camera = camera_ray(intrinsics, pixel_xy, already_undistorted=True)
+    origin = np.asarray(T_base_camera[:3, 3], dtype=np.float64)
+    direction = _unit(T_base_camera[:3, :3] @ ray_camera, "base camera ray")
+    center = np.asarray(sphere_center_base_mm, dtype=np.float64).reshape(3)
+    offset = origin - center
+    b = 2.0 * float(direction @ offset)
+    c = float(offset @ offset - sphere_radius_mm * sphere_radius_mm)
+    discriminant = b * b - 4.0 * c
+    if discriminant < 0.0:
+        raise RuntimeError(f"RGB射线与粗定位球面无交点：D={discriminant:.3f}")
+    roots = [(-b - math.sqrt(discriminant)) / 2.0, (-b + math.sqrt(discriminant)) / 2.0]
+    positive = [value for value in roots if value > 0.0]
+    if not positive:
+        raise RuntimeError("RGB射线与粗定位球面的交点在相机后方")
+    point = origin + min(positive) * direction
+    normal = _unit(point - center, "hole sphere normal")
+    if float(normal @ (origin - point)) < 0.0:
+        normal = -normal
+    return point, normal
+
+
+def _hole_surface_pose(
+    point_base_mm: np.ndarray, normal_toward_camera_base: np.ndarray,
+    reference_x_base: np.ndarray,
+) -> np.ndarray:
+    """构造孔面局部姿态：Z=朝相机法向，X=相机X在孔面内的投影。"""
+    z_axis = _unit(normal_toward_camera_base, "hole surface z axis")
+    x_axis = np.asarray(reference_x_base, dtype=np.float64) - float(reference_x_base @ z_axis) * z_axis
+    if np.linalg.norm(x_axis) < 1e-8:
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        x_axis -= float(x_axis @ z_axis) * z_axis
+    x_axis = _unit(x_axis, "hole surface x axis")
+    y_axis = _unit(np.cross(z_axis, x_axis), "hole surface y axis")
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.column_stack((x_axis, y_axis, z_axis))
+    transform[:3, 3] = np.asarray(point_base_mm, dtype=np.float64)
+    return transform
+
+
 def _fuse_coarse(observations: list[Observation], cfg: TwoStageConfig) -> dict[str, Any]:
     valid = [item for item in observations if item.error is None and item.plane is not None]
     if len(valid) < cfg.min_coarse_valid:
@@ -918,11 +1156,16 @@ def _fuse_coarse(observations: list[Observation], cfg: TwoStageConfig) -> dict[s
     normals = _fuse_normals([item.plane.normal_camera for item in valid])
     center = np.median(centers, axis=0)
     scatter = np.linalg.norm(centers - center, axis=1)
+    sphere_centers = [item.plane.sphere_center_camera_mm for item in valid if item.plane.sphere_center_camera_mm is not None]
+    sphere_radii = [item.plane.sphere_radius_mm for item in valid if item.plane.sphere_radius_mm is not None]
     return {
         "valid_frames": len(valid), "total_frames": len(observations), "center_px": center,
         "center_scatter_p95_px": float(np.percentile(scatter, 95)),
         "plane_point_camera_mm": plane_points, "plane_normal_camera": normals,
         "plane_rmse_median_mm": float(np.median([item.plane.rmse_mm for item in valid])),
+        "surface_model": valid[0].plane.surface_model,
+        "sphere_center_camera_mm": _fuse_vectors(sphere_centers, "sphere centers") if sphere_centers else None,
+        "sphere_radius_mm": float(np.median(sphere_radii)) if sphere_radii else None,
     }
 
 
@@ -958,6 +1201,7 @@ def _observation_rows(observations: list[Observation]) -> list[dict[str, Any]]:
             row.update({
                 "plane_rmse_mm": item.plane.rmse_mm, "ring_points": item.plane.ring_points,
                 "plane_point_z_mm": float(item.plane.point_camera_mm[2]),
+                "surface_model": item.plane.surface_model,
             })
         if item.ellipse is not None:
             row.update({
@@ -1064,7 +1308,7 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
 
         initial_bundle, chosen, selected_point_camera, initial_plane_camera, intrinsics = _capture_initial_selection(
             rgbd_pipeline, align, chain, model, args.confidence, run_dir,
-            cfg.initial_max_plane_rmse_mm,
+            cfg.initial_max_plane_rmse_mm, args.hole_count,
         )
         T_base_camera_home = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
         selected_point_base = T_base_camera_home[:3, :3] @ selected_point_camera + T_base_camera_home[:3, 3]
@@ -1077,6 +1321,7 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             "hole_center_base_mm": selected_point_base, "plane_point_base_mm": plane_point_base,
             "plane_normal_base": plane_normal_base, "plane_rmse_mm": initial_plane_camera.rmse_mm,
             "ring_points": initial_plane_camera.ring_points,
+            "surface_model": initial_plane_camera.surface_model,
         }
 
         if not args.execute:
@@ -1191,6 +1436,72 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
         finally:
             rgbd_pipeline = None
         rgb_pipeline = init_rgb_handeye_pipeline()
+        if args.hole_count == 3:
+            tracked_holes = list(chosen.get("tracked_holes", []))
+            if len(tracked_holes) != 3:
+                raise RuntimeError("三孔模式没有建立完整的三个目标跟踪组")
+            multi_obs, fine_intrinsics, _, = _capture_multi_fine_burst(
+                rgb_pipeline, model, args.confidence, tracked_holes, cfg, run_dir,
+            )
+            rows.extend(row for hole_rows in multi_obs.values() for row in _observation_rows(hole_rows))
+            T_base_camera_fine = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+            sphere_center_camera = coarse.get("sphere_center_camera_mm")
+            sphere_radius = coarse.get("sphere_radius_mm")
+            if sphere_center_camera is None or sphere_radius is None:
+                raise RuntimeError("三孔模式需要粗定位球面模型，但当前粗定位未返回球心/半径")
+            sphere_center_base = (
+                T_base_camera[:3, :3] @ np.asarray(sphere_center_camera, dtype=np.float64)
+                + T_base_camera[:3, 3]
+            )
+            holes_result: list[dict[str, Any]] = []
+            for hole in tracked_holes:
+                hole_id = int(hole["hole_id"])
+                summary = _fuse_fine(multi_obs[hole_id], cfg)
+                point_base, normal_base = _ray_sphere_intersection_base(
+                    summary["center_px"], fine_intrinsics, T_base_camera_fine,
+                    sphere_center_base, float(sphere_radius),
+                )
+                hole_pose = _hole_surface_pose(
+                    point_base, normal_base, T_base_camera_fine[:3, 0],
+                )
+                diameter_px = float(max(float(summary["axes_px_median"][0]), float(summary["axes_px_median"][1])))
+                ray_distance = float(np.linalg.norm(point_base - T_base_camera_fine[:3, 3]))
+                diameter_estimate = diameter_px * ray_distance / ((fine_intrinsics.fx + fine_intrinsics.fy) / 2.0)
+                matched_diameter = min(HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter_estimate))
+                summary.update({
+                    "hole_id": hole_id,
+                    "center_px": summary["center_px"],
+                    "hole_center_base_mm": point_base,
+                    "plane_normal_toward_camera_base": normal_base,
+                    "hole_pose_m_rad": transform_to_sdk_pose_m_rad(hole_pose),
+                    "diameter_estimate_mm": diameter_estimate,
+                    "matched_diameter_mm": matched_diameter,
+                    "shared_fine_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                })
+                holes_result.append(summary)
+            holes_result.sort(key=lambda item: int(item["hole_id"]))
+            report["stages"]["fine_multi"] = {
+                "hole_count": 3,
+                "surface_model": "sphere",
+                "sphere_center_base_mm": sphere_center_base,
+                "sphere_radius_mm": float(sphere_radius),
+                "shared_fine_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                "holes": holes_result,
+            }
+            report["final_result"] = {
+                "hole_count": 3,
+                "reference_hole_id": chosen.get("reference_hole_id"),
+                "holes": holes_result,
+                "shared_fine_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                "final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                "motion": "skipped_multi_hole_output_only",
+            }
+            report["status"] = "completed_experimental_handeye" if not handeye.validated_for_motion else "completed"
+            _write_report(run_dir, report, rows)
+            print("\n[三孔结果] 粗定位和精定位各执行一次；最终不移动到单个孔。")
+            print(json.dumps(_jsonable(report["final_result"]), ensure_ascii=False, indent=2))
+            print(f"[DONE] 结果目录: {run_dir}")
+            return 0
         fine_obs, fine_intrinsics, _, _ = _capture_fine_burst(rgb_pipeline, model, args.confidence, chosen, cfg, run_dir)
         rows.extend(_observation_rows(fine_obs))
         fine = _fuse_fine(fine_obs, cfg)
@@ -1229,6 +1540,8 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
         report["stages"]["fine"] = fine
         fine_tcp = current_tcp.copy()
         final_xy_motion: dict[str, Any] | None = None
+        final_z_motion: dict[str, Any] | None = None
+        final_y_trim_motion: dict[str, Any] | None = None
         if args.move_final_xy:
             fixed_offset = (None if args.tcp_xy_offset_mm is None
                             else (float(args.tcp_xy_offset_mm[0]), float(args.tcp_xy_offset_mm[1])))
@@ -1257,6 +1570,36 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
                 "tcp_xy_offset_mm": None if fixed_offset is None else list(fixed_offset),
             }
             report["stages"]["final_xy_motion"] = final_xy_motion
+            z_target = plan_final_tcp_base_z(current_tcp, final_point_base)
+            z_delta_mm = float(z_target[2, 3] - current_tcp[2, 3])
+            current_tcp = _confirm_and_move_line(
+                "最终孔中心基坐标Z运动", current_tcp, z_target,
+                args, motion_session, pose_session,
+                f"保持最终XY与姿态；目标TCP基坐标Z={z_target[2, 3]:.3f} mm",
+                require_confirmation=bool(abs(z_delta_mm) > 30.0),
+            )
+            final_z_motion = {
+                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(z_target),
+                "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                "target_base_z_mm": float(z_target[2, 3]),
+                "delta_base_z_mm": z_delta_mm,
+                "motion_frame": "base_z_only",
+            }
+            report["stages"]["final_z_motion"] = final_z_motion
+            y_trim_target = plan_final_tcp_base_y_trim(current_tcp)
+            current_tcp = _confirm_and_move_line(
+                "最终基坐标+Y微调", current_tcp, y_trim_target,
+                args, motion_session, pose_session,
+                f"保持X、Z与姿态；基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm",
+                require_confirmation=False,
+            )
+            final_y_trim_motion = {
+                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(y_trim_target),
+                "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                "delta_base_y_mm": FINAL_BASE_Y_AFTER_Z_MM,
+                "motion_frame": "base_y_only",
+            }
+            report["stages"]["final_y_trim_motion"] = final_y_trim_motion
         report["final_result"] = {
             "hole_center_base_mm": final_point_base,
             "hole_center_base_naive_mm": naive_final_point_base,
@@ -1266,6 +1609,8 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             "final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
             "matched_diameter_mm": nearest_diameter,
             "final_xy_motion": final_xy_motion,
+            "final_z_motion": final_z_motion,
+            "final_y_trim_motion": final_y_trim_motion,
         }
         report["status"] = "completed_experimental_handeye" if not handeye.validated_for_motion else "completed"
         _write_report(run_dir, report, rows)
@@ -1327,17 +1672,40 @@ def build_parser() -> argparse.ArgumentParser:
                    help="两阶段模式的孔面RGB-Z精定位高度，默认260")
     p.add_argument("--coarse-frames", type=int, default=15, help="两阶段粗定位有效RGB-D帧数")
     p.add_argument("--fine-frames", type=int, default=30, help="两阶段精定位有效RGB帧数")
+    p.add_argument("--hole-count", type=int, choices=(1, 3), default=1,
+                   help="两阶段输出孔数量；3表示一次粗/精定位同时推算三个孔")
     p.add_argument("--move-final-xy", dest="move_final_xy", action="store_true", default=True,
                    help="兼容参数：两阶段流程默认已启用最终 TCP XY 微调")
     p.add_argument("--no-move-final-xy", dest="move_final_xy", action="store_false",
                    help="仅排障使用：关闭精定位后的最终 TCP XY 微调")
     p.add_argument("--tcp-xy-offset-mm", type=float, nargs=2, metavar=("DX", "DY"), default=None,
                    help="临时固定TCP XY补偿(mm)；默认不施加任何XY偏置")
+    # 工作台 GUI 可用这些参数覆盖本机默认连接配置；命令行既有用法保持兼容。
+    p.add_argument("--robot-ip", type=str, help="AUBO RPC IP（工作台传入）")
+    p.add_argument("--robot-port", type=int, help="AUBO RPC 端口（工作台传入）")
+    p.add_argument("--robot-user", type=str, help="AUBO 用户名（工作台传入）")
+    p.add_argument("--robot-password", type=str, help="AUBO 密码（工作台传入）")
+    p.add_argument("--robot-timeout-ms", type=int, help="AUBO 请求超时毫秒（工作台传入）")
     return p
+
+
+def _apply_robot_connection_overrides(args: Any) -> None:
+    """让工作台顶栏连接参数对独立定位进程生效。"""
+    for arg_name, config_name in (
+        ("robot_ip", "ip"),
+        ("robot_port", "rpc_port"),
+        ("robot_user", "user"),
+        ("robot_password", "password"),
+        ("robot_timeout_ms", "request_timeout_ms"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(ROBOT_CFG, config_name, value)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _apply_robot_connection_overrides(args)
     handeye = load_handeye_experiment_result(args.handeye)
     model = load_yolo(args.model)
     if args.two_stage_hole_localization:
