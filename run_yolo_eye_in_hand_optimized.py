@@ -79,7 +79,7 @@ class TwoStageConfig:
     max_z_corrections: int = 4
     min_coarse_valid: int = 12
     min_fine_valid: int = 24
-    # 球面伞具的初始环带深度允许少量结构化噪声；粗/精阶段门限保持不变。
+    # 镀膜曲面工件的初始环带深度允许少量结构化噪声；粗/精阶段门限保持不变。
     initial_max_plane_rmse_mm: float = 3.5
     max_plane_rmse_mm: float = 3.5
     coarse_settle_frames: int = 10
