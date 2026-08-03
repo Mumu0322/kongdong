@@ -1,0 +1,114 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>镀膜伞具三孔眼在手定位项目——阶段技术评审 DR</title><style>
+  :root { --ink:#152536; --muted:#5b6d7d; --line:#d9e2ea; --blue:#1267a8; --blue-soft:#eaf4fb; --accent:#0f766e; --paper:#fff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:#eef3f7; color:var(--ink); font:15px/1.65 "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; }
+  .page { max-width:1180px; margin:28px auto; background:var(--paper); box-shadow:0 2px 18px rgba(20,45,65,.10); padding:50px 62px 72px; }
+  h1 { font-size:30px; line-height:1.28; margin:0 0 28px; color:#0c3657; letter-spacing:.3px; border-bottom:3px solid var(--blue); padding-bottom:15px; }
+  h2 { font-size:22px; margin:42px 0 15px; padding-top:4px; color:#0c4f83; border-bottom:1px solid var(--line); padding-bottom:7px; }
+  h3 { font-size:17px; margin:28px 0 10px; color:#1267a8; }
+  p { margin:10px 0; text-align:justify; }
+  code { font:13px/1.35 Consolas, "Courier New", monospace; background:#f1f5f8; border:1px solid #dfe7ec; border-radius:3px; padding:1px 4px; color:#294860; overflow-wrap:anywhere; }
+  strong { color:#123e62; }
+  a { color:#075f9d; text-decoration:none; border-bottom:1px dotted currentColor; }
+  .note { margin:15px 0; padding:11px 15px; background:#f5f9fc; border-left:4px solid var(--blue); color:#334e63; }
+  .toc { background:var(--blue-soft); border:1px solid #cfe2f0; border-radius:6px; margin:20px 0 30px; padding:13px 18px; }
+  .toc-title { font-weight:700; color:#0c4f83; margin-bottom:5px; }
+  .toc ul { margin:3px 0; padding-left:20px; }
+  .toc li { margin:2px 0; } .toc-level-3 { margin-left:17px; font-size:14px; }
+  .table-wrap { overflow-x:auto; margin:14px 0 22px; border:1px solid var(--line); border-radius:5px; }
+  table { border-collapse:collapse; min-width:100%; width:100%; font-size:13px; line-height:1.48; }
+  th { background:#e7f1f8; color:#123e62; font-weight:700; text-align:left; }
+  th,td { border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:8px 10px; vertical-align:top; }
+  tr:last-child td { border-bottom:0; } th:last-child,td:last-child { border-right:0; }
+  tbody tr:nth-child(even) { background:#fbfdfe; }
+  ul { margin:8px 0 12px; }
+  @media print { body { background:white; } .page { max-width:none; margin:0; box-shadow:none; padding:15mm 14mm; } a { color:inherit; border:0; } .table-wrap { overflow:visible; } table { font-size:10pt; } h2 { break-after:avoid; } tr { break-inside:avoid; } }
+  @media (max-width:700px) { .page { margin:0; padding:25px 18px 40px; } h1 { font-size:24px; } h2 { font-size:20px; } }
+</style></head><body><main class="page"><h1 id="dr">镀膜伞具三孔眼在手定位项目——阶段技术评审 DR</h1><nav class="toc" aria-label="目录"><div class="toc-title">文档目录</div><ul><li class="toc-level-2"><a href="#1">1. 项目概览</a></li><li class="toc-level-2"><a href="#2">2. 工作内容与当前结果</a></li><li class="toc-level-3"><a href="#2-1">2.1 现场任务和当前难点</a></li><li class="toc-level-3"><a href="#2-2">2.2 从单孔到三孔的做法</a></li><li class="toc-level-3"><a href="#2-3">2.3 粗定位和精定位分别做什么</a></li><li class="toc-level-3"><a href="#2-4">2.4 已有一次三孔运行结果</a></li><li class="toc-level-3"><a href="#2-5">2.5 几个关键做法</a></li><li class="toc-level-3"><a href="#2-6">2.6 坐标怎么换算、哪些结论还不能下</a></li><li class="toc-level-3"><a href="#2-7">2.7 已完成的工作和下一步实验</a></li><li class="toc-level-2"><a href="#3">3. 当前方案与实现状态</a></li><li class="toc-level-2"><a href="#4">4. 标定与精度验证</a></li><li class="toc-level-3"><a href="#4-1-rgb">4.1 RGB 相对定位实验</a></li><li class="toc-level-3"><a href="#4-2-charuco-tcp-xy">4.2 ChArUco TCP-XY 仿射模型</a></li><li class="toc-level-3"><a href="#4-3">4.3 手眼候选状态</a></li><li class="toc-level-2"><a href="#5-two-stage-20260729-170949">5. 最新三孔实验结果（two-stage-20260729_170949）</a></li><li class="toc-level-3"><a href="#5-1">5.1 粗定位与闭环质量</a></li><li class="toc-level-3"><a href="#5-2-rgb">5.2 RGB 精定位与坐标修正</a></li><li class="toc-level-3"><a href="#5-3">5.3 三孔顺序安放</a></li><li class="toc-level-2"><a href="#6">6. 当前事实与边界</a></li><li class="toc-level-2"><a href="#7">7. 追溯与结论</a></li><li class="toc-level-3"><a href="#s241">结论</a></li><li class="toc-level-2"><a href="#a-tcp">附录 A：最新三孔坐标与 TCP 记录</a></li></ul></nav>
+<p>这张封面表确定这份 DR 讨论的是哪一版项目记录。首次阅读时先看日期、评审周期和结论，再由负责人、评审人栏补齐正式评审信息。</p>
+<div class="table-wrap"><table><thead><tr><th>文档项</th><th>内容</th></tr></thead><tbody><tr><td>文档编号</td><td>DR-EIH-20260730-001</td></tr><tr><td>版本</td><td>V1.0</td></tr><tr><td>日期</td><td>2026-07-30</td></tr><tr><td>负责人</td><td>____________________</td></tr><tr><td>评审人</td><td>____________________</td></tr><tr><td>评审结论</td><td><strong>实验阶段完成</strong></td></tr></tbody></table></div>
+<aside class="note">说明：本 DR 基于既有 JSON/CSV 运行记录，结论仅覆盖机器人相对视觉定位验证；不作为外部绝对精度或生产验收声明。</aside>
+<p>“实验阶段完成”表示本阶段已经形成对应实验记录。负责人和评审人栏当前仍为空白，正式签署和生产验收需要在后续流程中单独完成。</p>
+<h2 id="1">1. 项目概览</h2>
+<p>项目概览把这次实验的边界放在同一处：操作对象是镀膜伞架三孔，视觉设备为 Gemini 435Le，机器人为 AUBO i5H，软件入口也已列出。刚接手项目的人可用它确认本 DR 对应的现场配置。</p>
+<div class="table-wrap"><table><thead><tr><th>项目项</th><th>评审内容</th></tr></thead><tbody><tr><td>项目名称</td><td>镀膜伞具三孔眼在手定位项目</td></tr><tr><td>文档编号</td><td>DR-EIH-20260730-001</td></tr><tr><td>版本 / 日期</td><td>V1.0 / 2026-07-30</td></tr><tr><td>评审周期</td><td>2026-07-20 至 2026-07-29</td></tr><tr><td>目标</td><td>计算三个孔的相对视觉坐标和目标 TCP，并完成逐孔安放实验。</td></tr><tr><td>对象</td><td>镀膜伞具上的三孔；孔径类别在本次成功运行中匹配为 70 mm。</td></tr><tr><td>相机</td><td>Orbbec Gemini 435Le，序列号 CP4B85P001L；RGB 1280×800 @ 10 FPS。</td></tr><tr><td>机器人</td><td>AUBO:rob1:aubo_i5H；相机标识 未填写。</td></tr><tr><td>软件入口</td><td>run_yolo_eye_in_hand_optimized.py（当前核心实现）；aubo_workbench GUI。</td></tr><tr><td>阶段结论</td><td>实验阶段完成：已完成机器人相对视觉定位和三孔顺序安放记录；不作为量产或外部绝对精度声明。</td></tr></tbody></table></div>
+<p>后文的精度、模型和安放记录都基于这套配置。工装、相机安装或 TCP 示教发生变化后，应重新采集标定或运行记录，再判断结果是否仍然成立。</p>
+<h2 id="2">2. 工作内容与当前结果</h2>
+<p>项目最终需要的是机械臂的 TCP 目标，不是图像上的孔中心。伞架孔位处在局部曲面上，视觉计算出的孔中心还要经过手眼变换、工具 TCP 和运动规划，才能变成机械臂可执行的位姿。本次评审看从选孔到实际到位 TCP 的记录，不只看单帧检测框或像素坐标。</p>
+<h3 id="2-1">2.1 现场任务和当前难点</h3>
+<p>本项目用于将镜片依次放入镀膜伞架上的三个孔位。系统先计算孔位，再换算成机械臂可执行的 TCP 目标，使工具以合适姿态接近孔位。当前是否真正放入孔洞，仍由现场人员人工确认；记录中的 <code>placement_confirmed</code> 表示该孔已执行安放动作并由人员确认，不代表已有力控、接触传感或自动视觉复核。</p>
+<p>本项目对象为镀膜伞具，其表面具有曲率并伴随反射。在近距离观察时，深度数据在孔周围会出现局部波动；这会使单帧表面拟合的法向和孔面距离不够稳定。与此同时，机器人最终执行的是 TCP 位姿，而视觉侧首先得到的是相机坐标下的孔中心；两者之间还包含手眼变换、工具 TCP、姿态和 XY 系统偏差。若直接把单帧视觉坐标下发给机器人，误差来源会叠加，且无法对三孔的执行结果建立统一追溯。</p>
+<p>本阶段要把识别结果换算成可执行的 TCP 目标。粗定位用于确定孔周局部表面和接近姿态；精定位在较近距离减小圆心波动；ChArUco 数据用于修正视觉 XY 与示教 TCP XY 之间的系统差。</p>
+<h3 id="2-2">2.2 从单孔到三孔的做法</h3>
+<p>最初现场只要求单孔操作，因此围绕被选中的参考孔完成粗定位、精定位和安放验证。需求改为三孔后，三个孔共用一次粗定位和一次精定位的相机姿态、局部几何，再分别计算目标 TCP。这样不用为每个孔重复粗定位，也避免三个孔分别使用不同的局部参考。</p>
+<p>目前要区分参考孔和另外两个孔。用于粗定位的参考孔能稳定放入孔洞。另两个孔已经有坐标计算、安放动作和 <code>placement_confirmed</code> 记录，但受相对 XY 误差影响，能否放入仍不稳定。因此三孔流程已跑通，但还不能说三个孔都能稳定放入。</p>
+<p>方案采用一次粗定位、一次精定位，同时完成三孔推算。先在原点选择参考孔，并在约 340 mm 执行 RGB-D 粗定位和居中/垂直闭环。闭环复采后，程序在粗定位确认位锁定三孔身份，并用粗阶段表面模型给出每个孔的粗中心、朝相机法向和孔面姿态。随后保持粗阶段最终姿态下降到约 260 mm，精拍阶段不重新选择三孔，也不使用新的深度数据更新表面；它只把粗阶段三孔投影为 RGB 跟踪锚点，再对每孔进行圆心多帧融合。最终中心来自精拍 RGB 圆心与粗阶段表面模型求交，最终姿态来自粗阶段三孔位姿。</p>
+<p>执行顺序为“视觉孔中心 → ChArUco XY 修正 → TCP 目标”。XY 使用 9 点 ChArUco 仿射模型修正，Z 不使用该模型修正。三个孔逐个安放时，先抬 Z，再移动 XY 和姿态，最后下降 Z；到最终点后基坐标 Y 正方向再移动 +0.2 mm。每个孔都保存目标 TCP 和实际到位 TCP。</p>
+<h3 id="2-3">2.3 粗定位和精定位分别做什么</h3>
+<p>粗定位使用 RGB-D 获取孔周局部表面点，估计局部法向，并根据孔中心、相机光轴和局部表面法向的偏差进行校正。闭环确认后，粗定位还负责锁定三孔身份，并输出三孔粗中心、法向和孔面姿态；球面模型可用时按球面给每个孔独立法向，球面不可用时退回冻结局部平面。</p>
+<p>精定位只使用 RGB。YOLO 用来刷新粗阶段投影锚点附近的 ROI，最终圆心由 ROI 内的圆/椭圆边缘拟合和多帧融合得到，质量不合格的帧按规则剔除。融合圆心对应的像素射线与粗阶段表面模型相交后得到三维孔中心；倾斜圆心修正用于减小投影椭圆中心的偏差。这样，近距离深度波动不直接影响精拍圆心融合，三孔姿态也不会被全部压到精定位阶段。</p>
+<p>ChArUco 模型用于补偿视觉 XY 到示教 TCP XY 的系统差，不替代手眼标定，也不修改视觉 Z。该模型是由独立 9 点 ChArUco 触碰记录得到的二维仿射映射；训练残差和留一角点交叉验证误差在本 DR 中单独报告。当前状态为 <code>needs_more_or_better_touch_data</code>，因此只作为实验阶段的 XY 修正依据。</p>
+<h3 id="2-4">2.4 已有一次三孔运行结果</h3>
+<p>在 <code>two-stage-20260729_170949</code> 成功运行中，粗定位和闭环复采均获得 15/15 有效帧；闭环后中心偏移为 0.614 px、法向误差为 1.569 deg。三孔 RGB 精定位的圆心 P95 分别为 0.117 px、0.362 px 和 0.258 px，均保留了原始帧数、有效帧数及离群帧记录。三孔均匹配为 70 mm 孔径，倾斜圆心修正量约 0.128–0.130 mm，XY 修正量、目标 TCP 与实际到位 TCP 均已写入附录。</p>
+<p>本次记录中，三个孔都按顺序完成了 <code>placement_confirmed</code> 安放动作，每孔均执行最终基坐标 Y <code>+0.2 mm</code>。RGB 相对定位实验在 200–300 mm 的 11 个高度全部通过质量门，300 mm 为最佳高度；70 项离线测试通过。手眼候选和 ChArUco XY 模型仍保持原始记录中的实验状态，因此本结果只说明实验流程已经跑通，不作为生产验收或外部绝对精度结论。</p>
+<h3 id="2-5">2.5 几个关键做法</h3>
+<p>这张表把五个关键做法放到同一张图里：局部曲面决定姿态，共用粗拍和精拍决定三孔如何取坐标，圆心计算、TCP 换算和接近路径决定最终怎样移动。发生偏差时，可以按表中的做法回查对应环节，而不是只检查 YOLO 检测框。</p>
+<div class="table-wrap"><table><thead><tr><th>做法</th><th>为什么这样做</th><th>怎么实现</th><th>对安放的影响</th></tr></thead><tbody><tr><td>以孔所在局部曲面为姿态参考</td><td>伞具不是全局平面，使用桌面水平或固定世界姿态不能保证 TCP 垂直孔面。</td><td>粗阶段由孔周深度估计局部法向，规划相机光轴和精拍共用姿态。</td><td>输出的精拍 TCP 姿态对应局部孔面，不把“垂直”误写为全局 Z 方向。</td></tr><tr><td>一次粗拍/精拍同时覆盖三孔</td><td>对每孔重复进行粗定位会增加运动次数，也会让三孔使用不同的几何参考。</td><td>粗定位确认位先锁定三孔并生成粗中心、法向和孔面姿态；精拍位只刷新锚点并采集 RGB ROI。</td><td>三孔最终 TCP 姿态来自粗阶段三孔位姿，精拍主要修正圆心。</td></tr><tr><td>将孔识别与圆心计算分开</td><td>YOLO 检测框可用于锁定目标区域，但检测框中心不是最终几何中心。</td><td>YOLO 仅给出候选和 ROI；最终中心由圆/椭圆边缘拟合及多帧融合得到。</td><td>报告记录的是融合圆心 P95、离群帧和椭圆质量，而不是仅记录检测置信度。</td></tr><tr><td>将视觉坐标与机器人 TCP 目标分开</td><td>孔中心是工具点目标；机器人需要执行的是已考虑工具 TCP、姿态与平面内系统差的 TCP。</td><td>像素去畸变后构造射线，与固定局部表面参考求交；再将视觉 XY 通过 ChArUco 仿射映射到 TCP XY。</td><td>附录同时保存孔中心、目标 TCP 与实际到位 TCP，避免将三者混为同一个坐标。</td></tr><tr><td>将接近路径与最终安放分开</td><td>曲面目标附近不适合在低高度进行大范围 XY 横移。</td><td>每孔先抬 Z、再移动 XY/姿态、后降 Z，最后执行 Y <code>+0.2 mm</code>。</td><td>运动记录含顺序、安全 Z、最终 Y 修整和 <code>placement_confirmed</code> 状态。</td></tr></tbody></table></div>
+<p>这里记录的是设计取舍和实际实现，不是算法排名。各做法的作用需结合后面的 RGB 实验、ChArUco 模型结果和三孔运行记录一起判断。</p>
+<h3 id="2-6">2.6 坐标怎么换算、哪些结论还不能下</h3>
+<p>坐标计算顺序为：粗定位三孔身份与粗位姿 → 精拍 RGB 图像圆心 → 去畸变像素射线 → 粗定位后保存的表面模型 → 孔中心基坐标 → ChArUco 修正后的 TCP XY 和粗阶段孔面姿态 → 每个孔的实际到位 TCP。手眼候选负责相机坐标与机器人坐标之间的转换。工具 TCP 将孔中心的工具点目标换算成机器人需要执行的 TCP 位姿。ChArUco 模型只补偿最后一步的 XY 系统差。</p>
+<p>这些环节分开记录后，出现偏差时可以分别检查图像圆心、表面几何、手眼、TCP 和实际执行，不需要把所有误差都归到 YOLO 上。</p>
+<p>后续同类伞具可以沿用本项目的处理顺序和记录字段：先用 RGB-D 建立局部几何，再在较近距离用 RGB 求圆心；多个孔共用一次姿态和几何参考；每个孔仍单独记录圆心质量、XY 修正、目标 TCP 和实际到位 TCP。工装、相机安装或 TCP 示教发生变化时，需重新采集相应标定数据。</p>
+<p>本阶段没有验证外部基准坐标、长期重复性、量产节拍，也没有完成手眼候选的独立验证。现有记录只说明：在已记录的实验配置下，定位、坐标计算和顺序安放已经完成。其他精度或生产结论需要新的独立实验记录支持，不能从本 DR 直接推出。</p>
+<h3 id="2-7">2.7 已完成的工作和下一步实验</h3>
+<p>下一轮实验的重点不是再证明流程能运行，而是补齐目前影响三孔稳定安放的证据。表中分别列出三孔安放、相对 XY、ChArUco 模型和手眼坐标链的当前情况，以及每项应保存的现场记录。</p>
+<div class="table-wrap"><table><thead><tr><th>项目</th><th>当前阶段已形成的能力</th><th>仍需补齐的验证</th><th>进入下一阶段所需记录</th></tr></thead><tbody><tr><td>三孔安放</td><td>已从单孔操作扩展到一次粗定位、一次精定位后推算三孔，并按顺序执行安放动作。</td><td>参考孔之外的两孔尚不能稳定放入孔洞。</td><td>在相同工装与运行配置下，重复记录每轮三个孔的人工安放判定、孔号、目标 TCP、实际到位 TCP 和异常现象。</td></tr><tr><td>三孔相对 XY</td><td>三孔共享粗定位后保存的局部几何和精拍姿态；每孔保留 RGB 圆心、倾斜修正和 ChArUco XY 修正记录。</td><td>需要确认三孔之间的相对 XY 偏差是否具有固定规律，或随视野位置、曲面位置而变化。</td><td>覆盖三个孔位的多轮重复试验，并将“实际进入/未进入孔洞”的人工判定与每孔 XY 修正量关联分析。</td></tr><tr><td>ChArUco TCP-XY 模型</td><td>已有 9 点仿射模型并用于实验阶段 XY 修正。</td><td>留一角点 P95 为 0.535 mm，高于记录内 0.500 mm 门槛；模型状态保持 <code>needs_more_or_better_touch_data</code>。</td><td>在与实际孔位工作区匹配的范围补充或复采 TCP 触碰点，重新输出模型残差和交叉验证报告。</td></tr><tr><td>手眼与 TCP 坐标链</td><td>已形成视觉孔中心、手眼变换、工具 TCP、最终目标 TCP 的可追溯链路。</td><td>手眼候选仍为实验状态；安放成功目前仅有人工确认，没有自动接触或插入证据。</td><td>使用固定标定板和独立验证位姿完成手眼复核；如需减少人工依赖，再增加与镜片/孔接触相关的可记录判定方式。</td></tr></tbody></table></div>
+<p>阅读这张表时，重点看“仍需补齐的验证”。其中参考孔之外两孔的稳定安放、ChArUco 触碰点补充和手眼独立复核，是进入下一阶段前需要完成的实验证据。</p>
+<p>下一阶段先验证三个孔都能稳定放入孔洞，仍按当前安全运动顺序和人工确认方式执行。多轮三孔记录能够支持该结论、ChArUco 模型和手眼候选补齐独立证据后，再讨论工艺节拍和自动化验收。</p>
+<h2 id="3">3. 当前方案与实现状态</h2>
+<p>这张流程表把一次运行拆成七步。前 3 步建立参考孔和固定局部表面参考，第 4、5 步在精拍位置计算三个孔中心，第 6 步只修正 TCP 的 XY，最后一步按“先抬 Z、再走 XY、后降 Z”执行安放。</p>
+<div class="table-wrap"><table><thead><tr><th>序号</th><th>阶段</th><th>实施内容</th><th>输出 / 约束</th></tr></thead><tbody><tr><td>1</td><td>原点选孔</td><td>RGB-D 画面中选择参考孔，估计孔周局部表面。</td><td>孔中心、局部法向与粗拍目标。</td></tr><tr><td>2</td><td>340 mm RGB-D 粗定位</td><td>将相机光轴对准局部孔面，在目标附近采集 RGB-D；闭环确认后锁定三孔身份。</td><td>三孔粗中心、局部表面、每孔法向与孔面姿态。</td></tr><tr><td>3</td><td>闭环居中/垂直校正</td><td>基于画面中心偏移和法向误差进行小幅校正后复采。</td><td>保存粗阶段深度平面，作为后续射线求交的固定参考。</td></tr><tr><td>4</td><td>260 mm RGB 精定位</td><td>仅使用 RGB；YOLO 提供 ROI，椭圆/圆边缘拟合获得三孔圆心。</td><td>RGB 圆心多帧鲁棒融合。</td></tr><tr><td>5</td><td>三孔坐标推算</td><td>精拍像素射线与粗阶段表面模型相交；进行倾斜圆心修正。</td><td>三孔基坐标中心与粗阶段每孔姿态。</td></tr><tr><td>6</td><td>ChArUco XY 修正</td><td>TCP XY 使用 9 点 ChArUco 仿射模型修正。</td><td>仅修正 XY；Z 不使用该模型修正。</td></tr><tr><td>7</td><td>逐孔安放</td><td>每孔依次：先抬 Z、再到 XY/姿态、后降 Z。</td><td>到位后基坐标 Y 正方向再执行 +0.2 mm。</td></tr></tbody></table></div>
+<p>流程结束时，程序能够给出目标和实际到位 TCP；镜片是否真正进入孔洞仍由现场人员确认。后续如果加入力控、接触传感或末端视觉，这一步才可以从人工判断变成可记录的自动判定。</p>
+<p>闭环复采后，粗阶段测得的深度表面保存为固定局部表面参考；精拍阶段不读取深度，使用 RGB 圆心及该参考与像素射线的交点推算孔中心。最终 TCP 保持精拍姿态，XY 采用 ChArUco 模型修正，Z 直接采用视觉基坐标结果。</p>
+<h2 id="4">4. 标定与精度验证</h2>
+<h3 id="4-1-rgb">4.1 RGB 相对定位实验</h3>
+<p>RGB 高度实验用于回答“相机在多近的距离看孔更稳定”。表中给出 200–300 mm 的 11 个测试高度、每层采样量、质量门和结果；300 mm 是记录中的最佳高度，可作为精拍距离选择的参考。</p>
+<div class="table-wrap"><table><thead><tr><th>项</th><th>记录值</th><th>结论</th></tr></thead><tbody><tr><td>实验范围</td><td>200–300 mm，10 mm 步长，11 个高度</td><td>每高度 5 点 × 20 帧。</td></tr><tr><td>总帧数</td><td>1100 / 1100</td><td>记录完成。</td></tr><tr><td>质量门</td><td>有效率≥95%；重投影 RMSE P95≤0.35 px；最大重投影误差 P95≤1.0 px；TCP-RGB 距离误差 P95≤0.5 mm</td><td>11/11 高度通过既定质量门。</td></tr><tr><td>推荐范围</td><td>200–300 mm</td><td>连续通过全部门槛。</td></tr><tr><td>最佳高度</td><td>300 mm</td><td>距离误差 P95=0.095 mm；RMS=0.059 mm；有效率=100%。</td></tr><tr><td>300 mm 图像质量</td><td>RMSE P95=0.154 px；最大误差 P95=0.343 px</td><td>以机器人 TCP 相对运动为参考。</td></tr></tbody></table></div>
+<p>这些数值以机器人 TCP 的相对运动为参考，反映 RGB 定位在不同高度的重复性。它们支持“300 mm 在本次实验中最好”的判断，但不等于相机在任何距离、任何安装状态下的外部绝对精度。</p>
+<h3 id="4-2-charuco-tcp-xy">4.2 ChArUco TCP-XY 仿射模型</h3>
+<p>ChArUco 模型用于把视觉得到的 XY 换成更接近示教 TCP 的 XY。9 个触碰点给出了模型覆盖范围；仿射矩阵和偏置是实际换算参数；训练残差与留一角点结果一起判断模型是否能离开已有点继续使用。</p>
+<div class="table-wrap"><table><thead><tr><th>项</th><th>记录值</th></tr></thead><tbody><tr><td>样本 / 视野</td><td>9 点；X 199.658 mm × Y 307.129 mm</td></tr><tr><td>模型定义</td><td>touch_tcp_xy_mm = matrix_2x2 @ visual_corner_xy_mm + bias_mm</td></tr><tr><td>仿射矩阵</td><td>[[1.000859, -0.001163], [-0.001328, 0.999581]]</td></tr><tr><td>偏置</td><td>[0.052297, 3.195914] mm</td></tr><tr><td>训练角点残差</td><td>RMS 0.206 mm；P95 0.294 mm；最大 0.322 mm</td></tr><tr><td>留一角点交叉验证</td><td>RMS 0.334 mm；P95 0.535 mm；验收阈值 0.500 mm</td></tr><tr><td>当前状态</td><td>needs_more_or_better_touch_data</td></tr></tbody></table></div>
+<p>模型只修正 XY，不碰 Z 和姿态。留一角点 P95 为 0.535 mm，高于 0.500 mm 门槛，说明 9 点数据对当前工作区还不够；它可以用于本阶段实验修正，但还不能当作通用的 TCP XY 模型。</p>
+<h3 id="4-3">4.3 手眼候选状态</h3>
+<p>手眼候选负责把相机坐标下的孔中心换到机器人基坐标。表中保留候选编号、使用的 ChArUco PnP 链路、相机/机器人标识和 22 个采样位姿，便于回到原始数据检查这条坐标链。</p>
+<div class="table-wrap"><table><thead><tr><th>项</th><th>记录值</th></tr></thead><tbody><tr><td>候选标定</td><td>handeye-e7-20260720-142109-982</td></tr><tr><td>测量链路</td><td>RGB ChArUco 2D 角点 + 相机内参 SolvePnP；RGB PnP 板位姿。</td></tr><tr><td>相机 / 机器人</td><td>CP4B85P001L / AUBO:rob1:aubo_i5H</td></tr><tr><td>数据规模</td><td>总位姿 22；标定位姿 17；验证位姿 5。</td></tr><tr><td>候选状态</td><td>validated=False；production_eligible=False；do_not_use_for_motion=True。</td></tr></tbody></table></div>
+<p>候选文件仍写明 <code>validated=False</code>、<code>production_eligible=False</code> 和 <code>do_not_use_for_motion=True</code>。因此，当前三孔运行只能作为实验记录使用，手眼本身仍需按独立验证流程复核。</p>
+<h2 id="5-two-stage-20260729-170949">5. 最新三孔实验结果（two-stage-20260729_170949）</h2>
+<p>运行状态：<code>completed_experimental_handeye</code>；实际执行运动：<code>True</code>；实验手眼覆盖开关：<code>True</code>。</p>
+<h3 id="5-1">5.1 粗定位与闭环质量</h3>
+<p>粗定位表对应成功运行 <code>two-stage-20260729_170949</code>。第一行是相机移动到 340 mm 后的首次观测，第二行是居中和垂直校正后的复采；两行相对比，可以看到画面中心偏移和法向误差在校正后变小。</p>
+<div class="table-wrap"><table><thead><tr><th>阶段</th><th>有效帧/总帧</th><th>中心散布 P95</th><th>平面 RMSE</th><th>关键状态</th></tr></thead><tbody><tr><td>340 mm 粗定位</td><td>15/15</td><td>0.186 px</td><td>2.156 mm</td><td>居中偏移 1.453 px；法向误差 3.516 deg</td></tr><tr><td>粗定位闭环复采</td><td>15/15</td><td>0.124 px</td><td>2.543 mm</td><td>居中偏移 0.614 px；法向误差 1.569 deg；固定局部表面参考</td></tr></tbody></table></div>
+<p>有效帧、中心散布和平面 RMSE 用来判断固定局部表面参考是否足够稳定，供后续 RGB 射线求交使用。它们说明粗定位质量，不直接回答三个孔是否已经放入，也不能替代另外两个孔的实际 XY 验证。</p>
+<h3 id="5-2-rgb">5.2 RGB 精定位与坐标修正</h3>
+<p>三个孔在同一精拍姿态下计算，因此这张表可以直接比较它们的圆心稳定性。有效帧和离群帧说明融合使用了哪些画面；孔径匹配与倾斜修正检查圆/椭圆拟合；最后一列记录实际施加到 TCP 的 XY 修正。</p>
+<div class="table-wrap"><table><thead><tr><th>孔</th><th>RGB 圆心有效帧</th><th>圆心 P95</th><th>离群帧</th><th>孔径匹配</th><th>倾斜圆心修正</th><th>ChArUco XY 修正</th></tr></thead><tbody><tr><td>1</td><td>37/43</td><td>0.117 px</td><td>6</td><td>70 mm（估计 68.887 mm）</td><td>0.129 mm</td><td>[0.607, 2.410] mm</td></tr><tr><td>2</td><td>42/43</td><td>0.362 px</td><td>0</td><td>70 mm（估计 71.028 mm）</td><td>0.128 mm</td><td>[0.710, 2.406] mm</td></tr><tr><td>3</td><td>38/43</td><td>0.258 px</td><td>5</td><td>70 mm（估计 70.408 mm）</td><td>0.130 mm</td><td>[0.539, 2.353] mm</td></tr></tbody></table></div>
+<p>孔 2 的圆心 P95 最大，但三孔都保留了有效帧和修正记录。圆心 P95 只表示图像中圆心的帧间变化；最终基坐标 XY 还同时受固定局部表面参考、手眼、工具 TCP 和 ChArUco 模型影响。</p>
+<h3 id="5-3">5.3 三孔顺序安放</h3>
+<p>三孔按 1→2→3 的顺序安放。每一行都记录了先抬升到的安全 Z，以及到最终点后在基坐标 Y 正方向增加的 0.2 mm；这两项是实际运动路径的一部分。</p>
+<div class="table-wrap"><table><thead><tr><th>顺序</th><th>孔</th><th>安放状态</th><th>安全 Z</th><th>最终 Y 修整</th></tr></thead><tbody><tr><td>1</td><td>1</td><td>placement_confirmed</td><td>191.794 mm</td><td>+0.2 mm</td></tr><tr><td>2</td><td>2</td><td>placement_confirmed</td><td>106.349 mm</td><td>+0.2 mm</td></tr><tr><td>3</td><td>3</td><td>placement_confirmed</td><td>106.319 mm</td><td>+0.2 mm</td></tr></tbody></table></div>
+<p><code>placement_confirmed</code> 是现场人员确认该孔已经执行安放动作后的记录。它不是力控、接触传感或自动视觉的插入判据，所以表中没有镜片与孔位之间的自动量化误差。</p>
+<h2 id="6">6. 当前事实与边界</h2>
+<p>这张表把最容易被误读的三件事放在一起：手眼仍是实验候选、曲面近距离深度会波动、ChArUco XY 模型还需要补点。右侧写的是当前代码面对这些情况时实际采用的处理，而不是理想化的最终方案。</p>
+<div class="table-wrap"><table><thead><tr><th>已记录事实</th><th>本阶段处理方式</th></tr></thead><tbody><tr><td>当前手眼候选处于实验状态：<code>validated=false</code>、<code>production_eligible=false</code>。</td><td>三孔运行报告状态明确为 <code>completed_experimental_handeye</code>。</td></tr><tr><td>镀膜曲面在近距离下的深度表面拟合存在波动。</td><td>粗阶段复采后保存表面模型并生成三孔粗位姿；精定位仅使用 RGB 圆心细化中心，不重新估计孔面姿态。</td></tr><tr><td>ChArUco TCP-XY 模型状态为 <code>needs_more_or_better_touch_data</code>。</td><td>当前用于实验阶段 XY 修正；Z 不套用该模型。</td></tr></tbody></table></div>
+<p>因此，本 DR 的结论范围保持在已有记录内：流程能运行、数据能追溯，但手眼、XY 模型和三孔稳定放入仍有待补实验。没有把这些实验状态扩展成量产可用、外部绝对精度或长期稳定性结论。</p>
+<h2 id="7">7. 追溯与结论</h2>
+<p>这张表是复查入口。需要核对手眼状态时查看 2026-07-20 的候选 JSON；需要核对 RGB 高度结论、ChArUco 模型或三孔运行时，可按日期直接进入对应报告目录；最后一行给出核心代码和 70 项离线测试的位置。</p>
+<div class="table-wrap"><table><thead><tr><th>日期</th><th>记录</th><th>目录 / 主要文件</th></tr></thead><tbody><tr><td>2026-07-20</td><td>手眼候选</td><td>C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json</td></tr><tr><td>2026-07-24</td><td>RGB 相对定位实验</td><td>C:\MM\aubo_tools\data\charuco_height_error\charuco-rgb-precision-20260724_113843_546\（report.json、rgb_height_summary.csv）</td></tr><tr><td>2026-07-27</td><td>ChArUco TCP-XY 模型</td><td>C:\MM\aubo_tools\data\tcp_absolute_xy_model\charuco-tcp-xy-20260727_174559\report.json</td></tr><tr><td>2026-07-29</td><td>三孔成功运行</td><td>C:\MM\aubo_tools\data\hole_localization_runs\two-stage-20260729_170949\（report.json、frames.csv）</td></tr><tr><td>当前工作区</td><td>核心实现与离线测试</td><td>C:\MM\aubo_tools\aubo_workbench_project\run_yolo_eye_in_hand_optimized.py；70 项离线测试通过</td></tr></tbody></table></div>
+<p>这些目录支撑的是当前结论，不会自动补齐缺失的验证。后续完成手眼复核、模型补点或三孔重复安放后，应新增对应报告目录，保留本表中的原始记录供前后比较。</p>
+<h3 id="s241">结论</h3>
+<p>本阶段评审结论为：<strong>实验阶段完成</strong>。已完成 RGB 相对定位、ChArUco TCP-XY 修正、两阶段三孔定位和逐孔安放的实验记录。以上结果属于机器人相对视觉定位验证，不宣称外部绝对精度，不构成生产验收或量产可用结论。</p>
+<h2 id="a-tcp">附录 A：最新三孔坐标与 TCP 记录</h2>
+<p>附录把三种容易混淆的坐标放在一行：视觉计算出的孔中心、用于驱动机器人运动的目标 TCP、以及机器人运动后记录的实际到位 TCP。需要追查某个孔的运动记录时，应按孔号横向比较这三个位置。</p>
+<div class="table-wrap"><table><thead><tr><th>孔</th><th>孔中心（基坐标，mm）</th><th>目标 TCP（基坐标，mm）</th><th>实际到位 TCP（基坐标，mm）</th><th>安放顺序</th></tr></thead><tbody><tr><td>1</td><td>[601.990, -32.337, 42.916]</td><td>[602.597, -29.927, 42.916]</td><td>[602.599, -29.722, 42.908]</td><td>1</td></tr><tr><td>2</td><td>[626.974, -102.581, 46.349]</td><td>[627.684, -100.175, 46.349]</td><td>[627.674, -99.967, 46.319]</td><td>2</td></tr><tr><td>3</td><td>[621.978, 40.628, 45.926]</td><td>[622.517, 42.981, 45.926]</td><td>[622.510, 43.185, 45.914]</td><td>3</td></tr></tbody></table></div>
+<p>注：附录中的“实际到位 TCP”为安放记录的 <code>placement_tcp_pose_m_rad</code> 前三项换算为 mm；其记录包含完成最终基坐标 Y <code>+0.2 mm</code> 后的实际姿态。旋转分量和完整 JSON 字段可追溯至本 DR 第 6 节记录。</p>
+<p>实际到位 TCP 取 <code>placement_tcp_pose_m_rad</code> 前三项并换算为 mm，已经包含最终 Y <code>+0.2 mm</code> 的移动。它适合核对这一次运行的机器人记录；更换孔型、工装或工作区后，仍需重新计算目标，不能直接照搬附录坐标。</p></main></body></html>
