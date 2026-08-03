@@ -75,8 +75,12 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertEqual(TwoStageConfig().normal_tolerance_deg, 2.0)
         self.assertEqual(TwoStageConfig().initial_max_plane_rmse_mm, 3.5)
         self.assertEqual(TwoStageConfig().max_plane_rmse_mm, 3.5)
-        self.assertEqual(TwoStageConfig().coarse_settle_frames, 10)
-        self.assertEqual(TwoStageConfig().coarse_max_attempt_multiplier, 6)
+        self.assertEqual(TwoStageConfig().coarse_frames, 10)
+        self.assertEqual(TwoStageConfig().fine_frames, 20)
+        self.assertEqual(TwoStageConfig().preliminary_coarse_frames, 6)
+        self.assertEqual(TwoStageConfig().multi_fine_extra_frames, 4)
+        self.assertEqual(TwoStageConfig().coarse_settle_frames, 5)
+        self.assertEqual(TwoStageConfig().coarse_max_attempt_multiplier, 4)
         self.assertEqual(TwoStageConfig().min_coarse_ellipse_coverage_deg, 120.0)
 
     def test_default_charuco_model_preserves_z_and_orientation(self):

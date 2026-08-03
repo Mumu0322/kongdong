@@ -80,21 +80,27 @@ DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE = True
 class TwoStageConfig:
     coarse_height_mm: float = 340.0
     fine_height_mm: float = 260.0
-    coarse_frames: int = 15
-    fine_frames: int = 30
+    # 默认帧数按最近一次运行的稳定性下调；达到稳定质量门时还会提前结束。
+    coarse_frames: int = 10
+    fine_frames: int = 20
+    preliminary_coarse_frames: int = 6
     height_tolerance_mm: float = 2.0
     center_tolerance_px: float = 5.0
     # 当前 Gemini 深度平面法向跨帧/跨视角重复性约 1–2°；粗阶段不应追逐到 0.5°。
     # 精定位仍锁定最终粗姿态并使用 RGB 进行 XY 微调。
     normal_tolerance_deg: float = 2.0
     max_z_corrections: int = 4
-    min_coarse_valid: int = 12
-    min_fine_valid: int = 24
+    min_coarse_valid: int = 8
+    min_preliminary_coarse_valid: int = 5
+    min_fine_valid: int = 12
     # 镀膜曲面工件的初始环带深度允许少量结构化噪声；粗/精阶段门限保持不变。
     initial_max_plane_rmse_mm: float = 3.5
     max_plane_rmse_mm: float = 3.5
-    coarse_settle_frames: int = 10
-    coarse_max_attempt_multiplier: int = 6
+    coarse_settle_frames: int = 5
+    coarse_max_attempt_multiplier: int = 4
+    max_coarse_center_scatter_p95_px: float = 0.8
+    fine_stable_min_frames: int = 15
+    fine_stable_center_scatter_p95_px: float = 0.6
     max_ellipse_residual_px: float = 0.9
     # 多孔镀膜表面边缘常有高光，椭圆残差会显著高于单孔测试；
     # 圆心散布仍由 max_fine_center_scatter_p95_px 严格约束。
@@ -107,7 +113,8 @@ class TwoStageConfig:
     # 单孔精定位仍使用 0.35 px；三孔批量输出单独保留可审计门槛。
     multi_fine_max_center_scatter_p95_px: float = 1.0
     # 为反光离群帧预留补采量；原始帧全部写入CSV，最终只融合稳定内点。
-    multi_fine_extra_frames: int = 12
+    # 只在稳定门未通过时补采；默认最多补4帧，而不是固定补12帧。
+    multi_fine_extra_frames: int = 4
     multi_fine_match_tolerance_px: float = 80.0
     multi_fine_tracking_tolerance_px: float = 55.0
     # 粗定位三孔身份关联使用固定锚点；比精拍适当放宽，兼容粗拍时
@@ -257,10 +264,19 @@ def hole_camera_point(
     """
     ring_u, ring_v = map(float, ring_center_xy)
     h, w = xyz_map_mm.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w]
+    # 只在孔附近建立环带网格，避免每个粗定位帧都为整幅RGB-D图创建
+    # 1280x800级别的坐标矩阵；环带定义与原实现保持一致。
+    ring_outer_px = max(8.0, radius_px * 1.35)
+    x0 = max(0, int(math.floor(ring_u - ring_outer_px - 1.0)))
+    x1 = min(w, int(math.ceil(ring_u + ring_outer_px + 2.0)))
+    y0 = max(0, int(math.floor(ring_v - ring_outer_px - 1.0)))
+    y1 = min(h, int(math.ceil(ring_v + ring_outer_px + 2.0)))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("孔环带超出深度图范围，无法提取点云")
+    yy, xx = np.mgrid[y0:y1, x0:x1]
     rr = np.hypot(xx - ring_u, yy - ring_v)
     ring = (rr >= max(4.0, radius_px * 1.08)) & (rr <= max(8.0, radius_px * 1.35))
-    points = xyz_map_mm[ring]
+    points = xyz_map_mm[y0:y1, x0:x1][ring]
     points = points[np.isfinite(points).all(axis=1)]
     points = points[(points[:, 2] > 100.0) & (points[:, 2] < 3000.0)]
     raw_ring_points = int(len(points))
@@ -1233,6 +1249,47 @@ def _capture_initial_selection(pipeline: Any, align: Any, chain: Any, model: Any
     return bundle, chosen, np.asarray(point, dtype=np.float64), plane, bundle.intrinsics
 
 
+def _center_scatter_p95(observations: list[Observation]) -> float:
+    """返回一组有效观测中心相对中位数的P95散布。"""
+    centers = np.asarray([
+        item.center_px for item in observations if item.error is None
+    ], dtype=np.float64)
+    if len(centers) < 2:
+        return math.inf
+    median = np.median(centers, axis=0)
+    return float(np.percentile(np.linalg.norm(centers - median, axis=1), 95.0))
+
+
+def _coarse_burst_stable(
+    observations_by_hole: dict[int, list[Observation]],
+    min_valid: int,
+    max_scatter_p95_px: float,
+) -> bool:
+    """判断粗定位是否已达到可以提前结束的稳定状态。"""
+    for observations in observations_by_hole.values():
+        valid = [item for item in observations if item.error is None and item.plane is not None]
+        if len(valid) < int(min_valid):
+            return False
+        if _center_scatter_p95(valid) > float(max_scatter_p95_px):
+            return False
+    return True
+
+
+def _fine_burst_stable(
+    observations_by_hole: dict[int, list[Observation]],
+    min_valid: int,
+    max_scatter_p95_px: float,
+) -> bool:
+    """判断RGB精定位多孔观测是否已足够稳定，可以停止继续补帧。"""
+    for observations in observations_by_hole.values():
+        valid = [item for item in observations if item.error is None and item.ellipse is not None]
+        if len(valid) < int(min_valid):
+            return False
+        if _center_scatter_p95(valid) > float(max_scatter_p95_px):
+            return False
+    return True
+
+
 def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
                           chosen: dict[str, Any], cfg: TwoStageConfig, run_dir: Path,
                           name: str,
@@ -1246,7 +1303,17 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
     for _ in range(cfg.coarse_settle_frames):
         get_aligned_frame_bundle(pipeline, align, chain)
     for attempt in range(cfg.coarse_frames * cfg.coarse_max_attempt_multiplier):
-        if len([item for item in observations if item.error is None]) >= cfg.coarse_frames:
+        valid_count = len([item for item in observations if item.error is None and item.plane is not None])
+        if (
+            valid_count >= cfg.coarse_frames
+            or (
+                valid_count >= cfg.min_coarse_valid
+                and _coarse_burst_stable(
+                    {1: observations}, cfg.min_coarse_valid,
+                    cfg.max_coarse_center_scatter_p95_px,
+                )
+            )
+        ):
             break
         bundle = get_aligned_frame_bundle(pipeline, align, chain)
         if bundle is None or bundle.intrinsics is None:
@@ -1292,7 +1359,17 @@ def _capture_fine_burst(pipeline: Any, model: Any, confidence: float, chosen: di
     latest_detection = latest_ellipse = None
     anchor = None
     for attempt in range(cfg.fine_frames * 3):
-        if len([item for item in observations if item.error is None]) >= cfg.fine_frames:
+        valid_count = len([item for item in observations if item.error is None and item.ellipse is not None])
+        if (
+            valid_count >= cfg.fine_frames
+            or (
+                valid_count >= cfg.fine_stable_min_frames
+                and _fine_burst_stable(
+                    {1: observations}, cfg.fine_stable_min_frames,
+                    cfg.fine_stable_center_scatter_p95_px,
+                )
+            )
+        ):
             break
         bundle = get_rgb_frame_bundle(pipeline)
         if bundle is None or bundle.intrinsics is None:
@@ -1581,6 +1658,8 @@ def _plan_hole_tcp_pose_fixed_rz(
 def _capture_multi_coarse_burst(
     pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
     selected_holes: list[dict[str, Any]], cfg: TwoStageConfig, run_dir: Path,
+    target_valid_frames: int | None = None,
+    min_valid_frames: int | None = None,
 ) -> tuple[dict[int, list[Observation]], Any, np.ndarray]:
     """在粗定位位逐孔提取YOLO框环带点云，并对每个孔独立融合局部平面。"""
     if not selected_holes:
@@ -1596,12 +1675,19 @@ def _capture_multi_coarse_burst(
     for _ in range(cfg.coarse_settle_frames):
         get_aligned_frame_bundle(pipeline, align, chain)
 
-    target_valid_frames = int(cfg.coarse_frames)
+    target_valid_frames = int(
+        cfg.preliminary_coarse_frames if target_valid_frames is None else target_valid_frames
+    )
+    min_valid_frames = int(
+        cfg.min_preliminary_coarse_valid if min_valid_frames is None else min_valid_frames
+    )
     max_attempts = max(target_valid_frames * int(cfg.coarse_max_attempt_multiplier), target_valid_frames)
     for attempt in range(max_attempts):
         if all(
-            len([item for item in values if item.error is None]) >= target_valid_frames
+            len([item for item in values if item.error is None and item.plane is not None]) >= target_valid_frames
             for values in observations.values()
+        ) or _coarse_burst_stable(
+            observations, min_valid_frames, cfg.max_coarse_center_scatter_p95_px,
         ):
             break
         bundle = get_aligned_frame_bundle(pipeline, align, chain)
@@ -1681,10 +1767,11 @@ def _capture_multi_coarse_burst(
 def _apply_coarse_geometry_to_hole(
     hole: dict[str, Any], observations: list[Observation],
     T_base_camera: np.ndarray, cfg: TwoStageConfig,
+    min_valid_frames: int | None = None,
 ) -> dict[str, Any]:
     """将某个孔在当前居中相机位采集的结果写回该孔记录。"""
     hole_id = int(hole["hole_id"])
-    summary = _fuse_coarse(observations, cfg)
+    summary = _fuse_coarse(observations, cfg, min_valid_frames=min_valid_frames)
     R_base_camera = np.asarray(T_base_camera, dtype=np.float64)[:3, :3]
     t_base_camera = np.asarray(T_base_camera, dtype=np.float64)[:3, 3]
     camera_origin = t_base_camera.copy()
@@ -1787,11 +1874,14 @@ def _select_coarse_holes_with_depth(
 
     observations, intrinsics, latest_color = _capture_multi_coarse_burst(
         pipeline, align, chain, model, confidence, holes, cfg, run_dir,
+        target_valid_frames=cfg.preliminary_coarse_frames,
+        min_valid_frames=cfg.min_preliminary_coarse_valid,
     )
     for hole in holes:
         hole_id = int(hole["hole_id"])
         _apply_coarse_geometry_to_hole(
             hole, observations[hole_id], T_base_camera, cfg,
+            min_valid_frames=cfg.min_preliminary_coarse_valid,
         )
     return holes, observations, intrinsics, latest_color
 
@@ -1965,7 +2055,17 @@ def _capture_multi_fine_burst(
     target_valid_frames = cfg.fine_frames + cfg.multi_fine_extra_frames
     max_attempts = target_valid_frames * 4
     for attempt in range(max_attempts):
-        if all(len([item for item in values if item.error is None]) >= target_valid_frames for values in observations.values()):
+        if (
+            all(
+                len([item for item in values if item.error is None and item.ellipse is not None])
+                >= target_valid_frames
+                for values in observations.values()
+            )
+            or _fine_burst_stable(
+                observations, cfg.fine_stable_min_frames,
+                cfg.fine_stable_center_scatter_p95_px,
+            )
+        ):
             break
         bundle = get_rgb_frame_bundle(pipeline)
         if bundle is None or bundle.intrinsics is None:
@@ -2110,10 +2210,14 @@ def _hole_surface_pose(
     return transform
 
 
-def _fuse_coarse(observations: list[Observation], cfg: TwoStageConfig) -> dict[str, Any]:
+def _fuse_coarse(
+    observations: list[Observation], cfg: TwoStageConfig,
+    min_valid_frames: int | None = None,
+) -> dict[str, Any]:
     valid = [item for item in observations if item.error is None and item.plane is not None]
-    if len(valid) < cfg.min_coarse_valid:
-        raise RuntimeError(f"粗定位有效帧不足：{len(valid)}/{cfg.min_coarse_valid}")
+    required = cfg.min_coarse_valid if min_valid_frames is None else int(min_valid_frames)
+    if len(valid) < required:
+        raise RuntimeError(f"粗定位有效帧不足：{len(valid)}/{required}")
     centers = np.asarray([item.center_px for item in valid], dtype=np.float64)
     plane_points = _fuse_vectors([item.plane.point_camera_mm for item in valid], "coarse plane points")
     normals = _fuse_normals([item.plane.normal_camera for item in valid])
@@ -2271,9 +2375,29 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
     cfg = TwoStageConfig(
         coarse_height_mm=float(args.coarse_height_mm), fine_height_mm=float(args.fine_height_mm),
         coarse_frames=int(args.coarse_frames), fine_frames=int(args.fine_frames),
+        preliminary_coarse_frames=int(args.preliminary_coarse_frames),
+        multi_fine_extra_frames=int(args.fine_extra_frames),
     )
     if cfg.fine_height_mm >= cfg.coarse_height_mm:
         raise ValueError("精定位高度必须小于粗定位高度")
+    if cfg.coarse_frames < cfg.min_coarse_valid:
+        raise ValueError(
+            f"粗定位最大帧数必须不少于最小有效帧数：{cfg.coarse_frames} < {cfg.min_coarse_valid}"
+        )
+    if cfg.preliminary_coarse_frames < cfg.min_preliminary_coarse_valid:
+        raise ValueError(
+            "三孔共享粗定位帧数必须不少于其最小有效帧数："
+            f"{cfg.preliminary_coarse_frames} < {cfg.min_preliminary_coarse_valid}"
+        )
+    if cfg.fine_frames < cfg.fine_stable_min_frames:
+        raise ValueError(
+            f"精定位最大帧数必须不少于稳定门帧数：{cfg.fine_frames} < {cfg.fine_stable_min_frames}"
+        )
+    if cfg.fine_frames + cfg.multi_fine_extra_frames < cfg.min_fine_valid:
+        raise ValueError(
+            "精定位最大总帧数必须不少于最小有效帧数："
+            f"{cfg.fine_frames + cfg.multi_fine_extra_frames} < {cfg.min_fine_valid}"
+        )
     run_dir = RUNS_DIR / f"two-stage-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
     report: dict[str, Any] = {
@@ -2984,8 +3108,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="两阶段模式的孔面RGB-Z粗定位高度，默认340")
     p.add_argument("--fine-height-mm", type=float, default=260.0,
                    help="两阶段模式的孔面RGB-Z精定位高度，默认260")
-    p.add_argument("--coarse-frames", type=int, default=15, help="两阶段粗定位有效RGB-D帧数")
-    p.add_argument("--fine-frames", type=int, default=30, help="两阶段精定位有效RGB帧数")
+    p.add_argument("--coarse-frames", type=int, default=10, help="两阶段最终粗定位最大有效RGB-D帧数")
+    p.add_argument("--fine-frames", type=int, default=20, help="两阶段精定位最大有效RGB帧数")
+    p.add_argument("--preliminary-coarse-frames", type=int, default=6,
+                   help="三孔共享粗定位导航最大有效帧数；每孔最终居中采集仍单独执行")
+    p.add_argument("--fine-extra-frames", type=int, default=4,
+                   help="精定位稳定门未通过时的补采帧数")
     p.add_argument("--hole-count", type=int, choices=(1, 3), default=1,
                    help="两阶段输出孔数量；3表示一次粗/精定位同时推算三个孔")
     p.add_argument("--move-final-xy", dest="move_final_xy", action="store_true", default=True,
