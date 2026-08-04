@@ -3,8 +3,8 @@
 """工作台中的两阶段孔定位页面。
 
 定位计算继续复用 ``run_yolo_eye_in_hand_optimized.py``，但以后台子进程运行：
-Tk 主线程不会被相机、YOLO 或机器人运动等待阻塞。大幅运动的 ``m`` 确认改由
-本页面的“确认当前运动”按钮发送；小幅闭环仍由原流程自动执行。
+Tk 主线程不会被相机、YOLO 或机器人运动等待阻塞。流程仅在开始检测下一个已选孔时暂停，
+由本页面的“开始检测下一个孔”按钮发送继续指令，其余运动自动执行。
 """
 
 from __future__ import annotations
@@ -48,10 +48,11 @@ class HoleLocalizationPanel(ttk.Frame):
         self.fine_height_var = tk.StringVar(value="260")
         self.coarse_frames_var = tk.StringVar(value="15")
         self.fine_frames_var = tk.StringVar(value="30")
-        # 默认三孔：界面会要求逐个点击三个孔，第一孔作为粗定位参考。
-        self.hole_count_var = tk.StringVar(value="3")
-        self.speed_var = tk.StringVar(value="0.03")
-        self.acc_var = tk.StringVar(value="0.10")
+        # 初始孔数由相机窗口中的点击数量决定，按 Enter 结束选择。
+        self.speed_var = tk.StringVar(value="0.08")
+        self.acc_var = tk.StringVar(value="0.25")
+        self.transit_speed_var = tk.StringVar(value="0.15")
+        self.transit_acc_var = tk.StringVar(value="0.45")
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=True)
         self.final_xy_var = tk.BooleanVar(value=True)
@@ -79,15 +80,25 @@ class HoleLocalizationPanel(ttk.Frame):
             ("精定位高度 mm", self.fine_height_var, 8),
             ("粗定位帧", self.coarse_frames_var, 6),
             ("精定位帧", self.fine_frames_var, 6),
-            ("输出孔数", self.hole_count_var, 6),
-            ("速度 m/s", self.speed_var, 7),
+            ("精确速度 m/s", self.speed_var, 7),
             ("加速度 m/s²", self.acc_var, 7),
         ]):
             ttk.Label(fields, text=label).grid(row=0, column=col * 2, sticky="w", padx=(0, 3))
             ttk.Entry(fields, textvariable=var, width=width).grid(row=0, column=col * 2 + 1, sticky="w", padx=(0, 10))
 
+        transit_fields = ttk.Frame(config)
+        transit_fields.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        for col, (label, var, width) in enumerate([
+            ("安全过渡速度 m/s", self.transit_speed_var, 7),
+            ("安全过渡加速度 m/s²", self.transit_acc_var, 7),
+        ]):
+            ttk.Label(transit_fields, text=label).grid(row=0, column=col * 2, sticky="w", padx=(0, 3))
+            ttk.Entry(transit_fields, textvariable=var, width=width).grid(
+                row=0, column=col * 2 + 1, sticky="w", padx=(0, 10),
+            )
+
         switches = ttk.Frame(config)
-        switches.grid(row=3, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        switches.grid(row=4, column=0, columnspan=5, sticky="w", pady=(7, 0))
         ttk.Checkbutton(switches, text="真实运动（未勾选时仅预览）", variable=self.execute_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="允许当前实验手眼结果", variable=self.experimental_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="精定位后执行 TCP XY → 基坐标 Z → +Y 0.2 mm", variable=self.final_xy_var).pack(side=tk.LEFT)
@@ -96,9 +107,9 @@ class HoleLocalizationPanel(ttk.Frame):
         action.pack(fill=tk.X, pady=(8, 0))
         self.start_btn = ttk.Button(action, text="开始两阶段定位", command=self.start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.confirm_btn = ttk.Button(action, text="确认当前运动", command=self.confirm_motion, state=tk.DISABLED)
+        self.confirm_btn = ttk.Button(action, text="开始检测下一个孔", command=self.confirm_motion, state=tk.DISABLED)
         self.confirm_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.cancel_btn = ttk.Button(action, text="取消待确认运动", command=self.cancel_pending_motion, state=tk.DISABLED)
+        self.cancel_btn = ttk.Button(action, text="停止流程", command=self.cancel_pending_motion, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(action, text="打开结果目录", command=self.open_results_dir).pack(side=tk.LEFT)
         ttk.Label(action, textvariable=self.status_var).pack(side=tk.LEFT, padx=(16, 0))
@@ -107,9 +118,9 @@ class HoleLocalizationPanel(ttk.Frame):
         notice.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(
             notice,
-            text=("1. 点击开始后，若使用真实运动，请在本页收到“待确认运动”后再点击确认。"
-                  "  2. 相机选孔暂使用弹出的画面：点击目标孔后按 Enter。"
-                  "  3. 小幅闭环修正自动执行；运动期间如需急停，请使用机械臂示教器。"),
+            text=("1. 相机初始画面中选择所有目标孔后按 Enter。"
+                  "  2. 每个孔完成后，仅在开始检测下一个已选孔时点击继续。"
+                  "  3. 其余运动自动执行；如需急停，请使用机械臂示教器。"),
             justify=tk.LEFT,
             wraplength=1150,
         ).pack(anchor="w")
@@ -153,6 +164,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 "fine_frames": int(self.fine_frames_var.get()),
                 "speed": float(self.speed_var.get()),
                 "acc": float(self.acc_var.get()),
+                "transit_speed": float(self.transit_speed_var.get()),
+                "transit_acc": float(self.transit_acc_var.get()),
             }
         except ValueError as exc:
             raise ValueError("定位参数必须是有效数字") from exc
@@ -177,8 +190,9 @@ class HoleLocalizationPanel(ttk.Frame):
             "--fine-height-mm", str(values["fine_height"]),
             "--coarse-frames", str(values["coarse_frames"]),
             "--fine-frames", str(values["fine_frames"]),
-            "--hole-count", str(int(self.hole_count_var.get())),
             "--speed-m-s", str(values["speed"]), "--acc-m-s2", str(values["acc"]),
+            "--transit-speed-m-s", str(values["transit_speed"]),
+            "--transit-acc-m-s2", str(values["transit_acc"]),
             "--robot-ip", str(connection["ip"]), "--robot-port", str(connection["port"]),
             "--robot-user", str(connection["user"]), "--robot-password", str(connection["password"]),
             "--robot-timeout-ms", str(connection["timeout_ms"]),
@@ -199,7 +213,7 @@ class HoleLocalizationPanel(ttk.Frame):
             return
         if self.execute_var.get() and not messagebox.askyesno(
             "确认真实运动",
-            "将执行回原点及两阶段定位。大幅运动会在本页等待你的确认。\n\n确认开始吗？",
+            "将执行回原点及两阶段定位。除开始检测下一个已选孔外，运动会自动执行。\n\n确认开始吗？",
             parent=self,
         ):
             return
@@ -235,7 +249,7 @@ class HoleLocalizationPanel(ttk.Frame):
             assert process.stdout is not None
             for line in process.stdout:
                 self.log_queue.put(("log", line))
-                if "[MOTION_CONFIRM_REQUIRED]" in line:
+                if "[MOTION_CONFIRM_REQUIRED]" in line or "[NEXT_HOLE_CONFIRM_REQUIRED]" in line:
                     self.log_queue.put(("confirm", line.strip()))
             code = process.wait()
             self.log_queue.put(("finished", code))
@@ -255,7 +269,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.waiting_confirmation = False
         self.confirm_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
-        self.motion_var.set("已确认，等待机器人完成当前动作…")
+        self.motion_var.set("已确认，开始检测下一个孔…")
 
     def cancel_pending_motion(self) -> None:
         if not self.waiting_confirmation or self.process is None or self.process.poll() is not None:
@@ -283,7 +297,7 @@ class HoleLocalizationPanel(ttk.Frame):
                     self.waiting_confirmation = True
                     self.confirm_btn.configure(state=tk.NORMAL)
                     self.cancel_btn.configure(state=tk.NORMAL)
-                    self.motion_var.set("待确认运动：请核对日志中的当前位置和目标位置，然后点击“确认当前运动”。")
+                    self.motion_var.set("等待开始下一个孔：请点击“开始检测下一个孔”继续。")
                 elif kind == "finished":
                     self._finished(int(payload))
                 elif kind == "worker_error":
@@ -319,16 +333,32 @@ class HoleLocalizationPanel(ttk.Frame):
             final = report.get("final_result", {})
             holes = final.get("holes")
             if isinstance(holes, list) and holes:
+                deferred_count = int(final.get("deferred_count", 0) or 0)
+                completed_count = int(final.get("completed_count", len(holes) - deferred_count) or 0)
+                if deferred_count:
+                    self.status_var.set(
+                        f"定位完成，但有 {deferred_count} 个孔延期，成功 {completed_count} 个"
+                    )
                 lines = [
                     f"报告：{reports[0].parent}",
-                    f"三孔共享精拍 TCP：{self._format_vector(final.get('shared_fine_tcp_pose_m_rad'))}",
+                    f"顺序处理孔数：{final.get('hole_count', len(holes))}    "
+                    f"成功：{completed_count}    延期：{deferred_count}    "
+                    f"最终 TCP：{self._format_vector(final.get('final_tcp_pose_m_rad'))}",
                 ]
                 for item in holes:
+                    quality_status = item.get("fine_quality_status", "strict")
+                    status_text = (
+                        f"状态={item.get('status', 'completed')}/{quality_status} "
+                        if item.get("status") != "completed" or quality_status != "strict"
+                        else ""
+                    )
                     lines.append(
-                        f"孔 {item.get('hole_id', '-')}：中心={self._format_vector(item.get('hole_center_base_mm'))} "
+                        f"孔 {item.get('hole_id', '-')}：{status_text}"
+                        f"中心={self._format_vector(item.get('hole_center_base_mm'))} "
                         f"法向={self._format_vector(item.get('plane_normal_toward_camera_base'))} "
                         f"姿态={self._format_vector(item.get('hole_pose_m_rad'))} "
-                        f"孔径={item.get('matched_diameter_mm', '-') } mm"
+                        f"孔径={item.get('matched_diameter_mm', '-') } mm "
+                        f"跟踪={item.get('tracking_identity', '-')}"
                     )
                 self.result_var.set("\n".join(lines))
                 return
