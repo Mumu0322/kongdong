@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""工作台中的两阶段孔定位页面。
+"""工作台中的两阶段孔定位和视野偏移测试页面。
 
-定位计算继续复用 ``run_yolo_eye_in_hand_optimized.py``，但以后台子进程运行：
+定位计算继续复用两个独立诊断入口，但都以后台子进程运行：
 Tk 主线程不会被相机、YOLO 或机器人运动等待阻塞。流程仅在开始检测下一个已选孔时暂停，
 由本页面的“开始检测下一个孔”按钮发送继续指令，其余运动自动执行。
 """
@@ -24,21 +24,24 @@ from typing import Any, Callable
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 LOCALIZATION_SCRIPT = PROJECT_DIR / "run_yolo_eye_in_hand_optimized.py"
+OFFSET_TEST_SCRIPT = PROJECT_DIR / "run_coarse_to_fine_offset_test.py"
 DEFAULT_MODEL = Path(r"C:\MM\models\small_silu.pt")
 DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
 RUNS_DIR = PROJECT_DIR.parent / "data" / "hole_localization_runs"
 
 
 class HoleLocalizationPanel(ttk.Frame):
-    """两阶段 YOLO 孔定位 GUI；连接参数从工作台顶栏实时读取。"""
+    """两阶段 YOLO 孔定位和单孔视野偏移测试 GUI。"""
 
     def __init__(self, master: tk.Misc, connection_provider: Callable[[], dict[str, Any]]) -> None:
         super().__init__(master, padding=10)
         self.connection_provider = connection_provider
         self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
+        self.process_mode = "two_stage"
         self.run_started_at = 0.0
         self.waiting_confirmation = False
+        self.confirmation_kind = ""
         self._poll_id: str | None = None
 
         self.model_var = tk.StringVar(value=str(DEFAULT_MODEL))
@@ -55,9 +58,12 @@ class HoleLocalizationPanel(ttk.Frame):
         self.transit_acc_var = tk.StringVar(value="0.45")
         self.approach_speed_var = tk.StringVar(value="0.12")
         self.approach_acc_var = tk.StringVar(value="0.35")
+        self.offset_radii_var = tk.StringVar(value="0 5 10 15 20")
+        self.offset_angles_var = tk.StringVar(value="0 45 90 135 180 225 270 315")
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=True)
         self.final_xy_var = tk.BooleanVar(value=True)
+        self.include_final_motion_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="待开始：默认仅预览，不会下发机器人运动")
         self.motion_var = tk.StringVar(value="无待确认运动")
         self.result_var = tk.StringVar(value="尚无本次结果")
@@ -110,18 +116,44 @@ class HoleLocalizationPanel(ttk.Frame):
                 row=0, column=col * 2 + 1, sticky="w", padx=(0, 10),
             )
 
+        offset_fields = ttk.Frame(config)
+        offset_fields.grid(row=5, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        for col, (label, var, width) in enumerate([
+            ("偏移测试半径 mm", self.offset_radii_var, 24),
+            ("偏移测试方向 °", self.offset_angles_var, 38),
+        ]):
+            ttk.Label(offset_fields, text=label).grid(
+                row=0, column=col * 2, sticky="w", padx=(0, 3),
+            )
+            ttk.Entry(offset_fields, textvariable=var, width=width).grid(
+                row=0, column=col * 2 + 1, sticky="w", padx=(0, 14),
+            )
+
         switches = ttk.Frame(config)
-        switches.grid(row=5, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        switches.grid(row=6, column=0, columnspan=5, sticky="w", pady=(7, 0))
         ttk.Checkbutton(switches, text="真实运动（未勾选时仅预览）", variable=self.execute_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="允许当前实验手眼结果", variable=self.experimental_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="精定位后执行 TCP XY → 基坐标 Z → +Y 0.2 mm", variable=self.final_xy_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            switches, text="偏移测试执行最终 XY → Z → +Y 0.2 mm（实机）",
+            variable=self.include_final_motion_var,
+        ).pack(side=tk.LEFT, padx=(16, 0))
 
         action = ttk.LabelFrame(self, text="运行控制", padding=8)
         action.pack(fill=tk.X, pady=(8, 0))
         self.start_btn = ttk.Button(action, text="开始两阶段定位", command=self.start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.offset_start_btn = ttk.Button(
+            action, text="偏移容忍度测试（单孔）", command=self.start_offset_test,
+        )
+        self.offset_start_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.confirm_btn = ttk.Button(action, text="开始检测下一个孔", command=self.confirm_motion, state=tk.DISABLED)
         self.confirm_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.mark_error_btn = ttk.Button(
+            action, text="标记当前点有误差并继续",
+            command=self.mark_current_point_error, state=tk.DISABLED,
+        )
+        self.mark_error_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.cancel_btn = ttk.Button(action, text="停止流程", command=self.cancel_pending_motion, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(action, text="打开结果目录", command=self.open_results_dir).pack(side=tk.LEFT)
@@ -185,20 +217,31 @@ class HoleLocalizationPanel(ttk.Frame):
         except ValueError as exc:
             raise ValueError("定位参数必须是有效数字") from exc
 
-    def _build_command(self) -> list[str]:
-        if not LOCALIZATION_SCRIPT.is_file():
-            raise FileNotFoundError(f"找不到定位脚本：{LOCALIZATION_SCRIPT}")
+    @staticmethod
+    def _float_list(value: str, label: str) -> list[float]:
+        try:
+            values = [float(item) for item in value.replace(",", " ").split()]
+        except ValueError as exc:
+            raise ValueError(f"{label}必须是空格或逗号分隔的数字") from exc
+        if not values:
+            raise ValueError(f"{label}不能为空")
+        return values
+
+    def _build_command(self, mode: str = "two_stage") -> list[str]:
+        script = LOCALIZATION_SCRIPT if mode == "two_stage" else OFFSET_TEST_SCRIPT
+        if not script.is_file():
+            raise FileNotFoundError(f"找不到定位脚本：{script}")
         model = Path(self.model_var.get().strip())
         handeye = Path(self.handeye_var.get().strip())
-        if not model.is_file():
+        if (mode != "offset" or self.execute_var.get()) and not model.is_file():
             raise FileNotFoundError(f"YOLO 模型不存在：{model}")
-        if not handeye.is_file():
+        if (mode != "offset" or self.execute_var.get()) and not handeye.is_file():
             raise FileNotFoundError(f"手眼结果不存在：{handeye}")
         values = self._numbers()
         connection = self.connection_provider()
         command = [
             # 无缓冲输出，确保 GUI 能在机器人开始运动前看到确认事件。
-            sys.executable, "-u", str(LOCALIZATION_SCRIPT),
+            sys.executable, "-u", str(script),
             "--model", str(model), "--handeye", str(handeye),
             "--confidence", str(values["confidence"]),
             "--coarse-height-mm", str(values["coarse_height"]),
@@ -215,31 +258,73 @@ class HoleLocalizationPanel(ttk.Frame):
             "--robot-timeout-ms", str(connection["timeout_ms"]),
         ]
         command.append("--execute" if self.execute_var.get() else "--no-execute")
-        command.append("--allow-experimental-handeye" if self.experimental_var.get() else "--require-validated-handeye")
-        command.append("--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy")
+        command.append(
+            "--allow-experimental-handeye"
+            if self.experimental_var.get() else "--require-validated-handeye"
+        )
+        if mode == "offset":
+            if self.include_final_motion_var.get() and not self.execute_var.get():
+                raise ValueError("偏移测试的最终XY/Z/Y动作必须勾选“真实运动”")
+            command.extend([
+                "--radii-mm",
+                *[str(value) for value in self._float_list(self.offset_radii_var.get(), "偏移测试半径")],
+                "--angles-deg",
+                *[str(value) for value in self._float_list(self.offset_angles_var.get(), "偏移测试方向")],
+            ])
+            if self.execute_var.get():
+                command.append("--start-confirmed")
+            if self.include_final_motion_var.get():
+                command.append("--include-final-motion")
+        else:
+            command.append("--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy")
         return command
 
     def start(self) -> None:
+        self._start_process("two_stage")
+
+    def start_offset_test(self) -> None:
+        self._start_process("offset")
+
+    def _start_process(self, mode: str) -> None:
         if self.process is not None and self.process.poll() is None:
             messagebox.showwarning("定位进行中", "当前定位流程尚未结束。", parent=self)
             return
         try:
-            command = self._build_command()
+            command = self._build_command(mode)
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc), parent=self)
             return
+        offset_confirmation = (
+            "将执行最终XY、降Z、基坐标Y+0.2 mm，并在每个采样点完成后安全回升并返回中心。"
+            if self.include_final_motion_var.get() else
+            "不会执行最终XY、最终Z或基坐标Y+0.2 mm动作。"
+        )
         if self.execute_var.get() and not messagebox.askyesno(
             "确认真实运动",
-            "将执行回原点及两阶段定位。除开始检测下一个已选孔外，运动会自动执行。\n\n确认开始吗？",
+            (
+                "将执行回原点、单孔粗定位、下降和横向偏移采集。"
+                f"{offset_confirmation}\n"
+                "请在相机窗口中只选择一个孔，之后测试会自动运行。\n\n确认开始吗？"
+                if mode == "offset" else
+                "将执行回原点及两阶段定位。除开始检测下一个已选孔外，运动会自动执行。\n\n确认开始吗？"
+            ),
             parent=self,
         ):
             return
+        self.process_mode = mode
         self._clear_log()
-        self.result_var.set("本次定位进行中…")
-        self.status_var.set("正在启动定位进程…")
+        self.result_var.set(
+            "偏移容忍度测试进行中…" if mode == "offset" else "本次定位进行中…"
+        )
+        self.status_var.set(
+            "正在启动偏移测试进程…" if mode == "offset" else "正在启动定位进程…"
+        )
         self.motion_var.set("无待确认运动")
         self.waiting_confirmation = False
+        self.confirmation_kind = ""
+        self.confirm_btn.configure(text="开始检测下一个孔")
         self.confirm_btn.configure(state=tk.DISABLED)
+        self.mark_error_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
         try:
             self.process = subprocess.Popen(
@@ -259,6 +344,7 @@ class HoleLocalizationPanel(ttk.Frame):
             return
         self.run_started_at = time.time()
         self.start_btn.configure(state=tk.DISABLED)
+        self.offset_start_btn.configure(state=tk.DISABLED)
         threading.Thread(target=self._read_process_output, args=(self.process,), daemon=True).start()
 
     def _read_process_output(self, process: subprocess.Popen[str]) -> None:
@@ -266,8 +352,17 @@ class HoleLocalizationPanel(ttk.Frame):
             assert process.stdout is not None
             for line in process.stdout:
                 self.log_queue.put(("log", line))
-                if "[MOTION_CONFIRM_REQUIRED]" in line or "[NEXT_HOLE_CONFIRM_REQUIRED]" in line:
+                if (
+                    "[MOTION_CONFIRM_REQUIRED]" in line
+                    or "[NEXT_HOLE_CONFIRM_REQUIRED]" in line
+                ):
                     self.log_queue.put(("confirm", line.strip()))
+                elif "[OFFSET_TEST_CONFIRM_REQUIRED]" in line:
+                    self.log_queue.put(("offset_start_confirm", line.strip()))
+                elif "[OFFSET_NEXT_CONFIRM_REQUIRED]" in line:
+                    self.log_queue.put(("offset_next_confirm", line.strip()))
+                elif "[OFFSET_TARGET_CONFIRM_REQUIRED]" in line:
+                    self.log_queue.put(("offset_target_confirm", line.strip()))
             code = process.wait()
             self.log_queue.put(("finished", code))
         except Exception as exc:
@@ -284,9 +379,41 @@ class HoleLocalizationPanel(ttk.Frame):
             messagebox.showerror("确认发送失败", str(exc), parent=self)
             return
         self.waiting_confirmation = False
-        self.confirm_btn.configure(state=tk.DISABLED)
+        confirmation_kind = self.confirmation_kind
+        self.confirmation_kind = ""
+        self.confirm_btn.configure(state=tk.DISABLED, text="开始检测下一个孔")
+        self.mark_error_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
-        self.motion_var.set("已确认，开始检测下一个孔…")
+        if confirmation_kind == "offset_start":
+            self.motion_var.set("已确认，开始偏移测试…")
+        elif confirmation_kind == "offset_next":
+            self.motion_var.set("已确认，开始下一个偏移点…")
+        elif confirmation_kind == "offset_target":
+            self.motion_var.set("已确认，回升并继续偏移测试…")
+        else:
+            self.motion_var.set("已确认，开始检测下一个孔…")
+
+    def mark_current_point_error(self) -> None:
+        if (
+            not self.waiting_confirmation
+            or self.confirmation_kind != "offset_target"
+            or self.process is None
+            or self.process.poll() is not None
+        ):
+            return
+        try:
+            assert self.process.stdin is not None
+            self.process.stdin.write("e\n")
+            self.process.stdin.flush()
+        except OSError as exc:
+            messagebox.showerror("误差标记发送失败", str(exc), parent=self)
+            return
+        self.waiting_confirmation = False
+        self.confirmation_kind = ""
+        self.confirm_btn.configure(state=tk.DISABLED, text="开始检测下一个孔")
+        self.mark_error_btn.configure(state=tk.DISABLED)
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self.motion_var.set("已标记当前点有误差，回升后继续偏移测试…")
 
     def cancel_pending_motion(self) -> None:
         if not self.waiting_confirmation or self.process is None or self.process.poll() is not None:
@@ -299,8 +426,11 @@ class HoleLocalizationPanel(ttk.Frame):
             messagebox.showerror("取消发送失败", str(exc), parent=self)
             return
         self.waiting_confirmation = False
+        self.confirmation_kind = ""
         self.confirm_btn.configure(state=tk.DISABLED)
+        self.mark_error_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
+        self.confirm_btn.configure(text="开始检测下一个孔")
         self.motion_var.set("已取消待确认运动，流程将安全结束。")
 
     def _poll_queue(self) -> None:
@@ -309,12 +439,39 @@ class HoleLocalizationPanel(ttk.Frame):
                 kind, payload = self.log_queue.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
-                    self.status_var.set("定位流程运行中…")
+                    self.status_var.set(
+                        "偏移容忍度测试运行中…"
+                        if self.process_mode == "offset" else "定位流程运行中…"
+                    )
                 elif kind == "confirm":
                     self.waiting_confirmation = True
+                    self.confirmation_kind = "hole"
                     self.confirm_btn.configure(state=tk.NORMAL)
+                    self.mark_error_btn.configure(state=tk.DISABLED)
                     self.cancel_btn.configure(state=tk.NORMAL)
+                    self.confirm_btn.configure(text="开始检测下一个孔")
                     self.motion_var.set("等待开始下一个孔：请点击“开始检测下一个孔”继续。")
+                elif kind == "offset_start_confirm":
+                    self.waiting_confirmation = True
+                    self.confirmation_kind = "offset_start"
+                    self.confirm_btn.configure(state=tk.NORMAL, text="开始偏移测试")
+                    self.mark_error_btn.configure(state=tk.DISABLED)
+                    self.cancel_btn.configure(state=tk.NORMAL)
+                    self.motion_var.set("等待开始偏移测试：请点击“开始偏移测试”继续。")
+                elif kind == "offset_next_confirm":
+                    self.waiting_confirmation = True
+                    self.confirmation_kind = "offset_next"
+                    self.confirm_btn.configure(state=tk.NORMAL, text="开始下一个偏移点")
+                    self.mark_error_btn.configure(state=tk.DISABLED)
+                    self.cancel_btn.configure(state=tk.NORMAL)
+                    self.motion_var.set("当前偏移点已完成：请点击“开始下一个偏移点”继续。")
+                elif kind == "offset_target_confirm":
+                    self.waiting_confirmation = True
+                    self.confirmation_kind = "offset_target"
+                    self.confirm_btn.configure(state=tk.NORMAL, text="确认并继续")
+                    self.mark_error_btn.configure(state=tk.NORMAL)
+                    self.cancel_btn.configure(state=tk.NORMAL)
+                    self.motion_var.set("已到达最终目标点：请确认后回升并继续。")
                 elif kind == "finished":
                     self._finished(int(payload))
                 elif kind == "worker_error":
@@ -325,18 +482,71 @@ class HoleLocalizationPanel(ttk.Frame):
 
     def _finished(self, code: int) -> None:
         self.waiting_confirmation = False
+        self.confirmation_kind = ""
         self.confirm_btn.configure(state=tk.DISABLED)
+        self.mark_error_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
+        self.confirm_btn.configure(text="开始检测下一个孔")
         self.start_btn.configure(state=tk.NORMAL)
+        self.offset_start_btn.configure(state=tk.NORMAL)
         self.process = None
         if code == 0:
-            self.status_var.set("定位完成")
+            self.status_var.set("偏移测试完成" if self.process_mode == "offset" else "定位完成")
             self._show_latest_result()
         else:
             self.status_var.set(f"定位结束，退出码={code}")
             self.result_var.set("本次定位未通过质量门或被取消；请查看运行日志和结果目录。")
 
     def _show_latest_result(self) -> None:
+        if self.process_mode == "offset":
+            reports = sorted(
+                (
+                    path for path in RUNS_DIR.glob("coarse-to-fine-offset-*/report.json")
+                    if path.stat().st_mtime >= self.run_started_at - 2.0
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if not reports:
+                self.result_var.set("偏移测试完成，但未找到本次 JSON 报告。")
+                return
+            try:
+                report = json.loads(reports[0].read_text(encoding="utf-8"))
+                summary = report.get("summary", {})
+                lines = [
+                    f"报告：{reports[0].parent}\n"
+                    f"采样点：{report.get('sample_count', len(report.get('plan', [])))}    "
+                    f"最大支持半径：{summary.get('max_supported_radius_mm', '-')} mm    "
+                    f"严格通过半径：{summary.get('max_strict_radius_mm', '-')} mm",
+                    "绿色=当前精定位质量门通过；橙色=仅严格门未通过但降级通过；红色=失败",
+                ]
+                manual_error_ids = summary.get("manual_error_sample_ids", [])
+                if manual_error_ids:
+                    lines.append(
+                        "人工标记有误差的点："
+                        + ", ".join(str(item) for item in manual_error_ids)
+                    )
+                motion_summary = report.get("final_motion_summary", {})
+                if motion_summary.get("enabled"):
+                    step_labels = {
+                        "final_xy": "最终XY",
+                        "final_z": "最终Z",
+                        "final_y_plus_0_2": "最终+Y 0.2 mm",
+                    }
+                    lines.append("最终动作到位误差（实际TCP−规划TCP）：")
+                    for step_name, label in step_labels.items():
+                        step = motion_summary.get("steps", {}).get(step_name, {})
+                        max_error = step.get("max_translation_error_mm")
+                        mean_error = step.get("mean_translation_error_mm")
+                        if max_error is not None:
+                            lines.append(
+                                f"{label}：最大 {float(max_error):.3f} mm，"
+                                f"平均 {float(mean_error):.3f} mm"
+                            )
+                self.result_var.set("\n".join(lines))
+            except Exception as exc:
+                self.result_var.set(f"读取偏移测试报告失败：{exc}")
+            return
         reports = sorted(
             (path for path in RUNS_DIR.glob("two-stage-*/report.json") if path.stat().st_mtime >= self.run_started_at - 2.0),
             key=lambda path: path.stat().st_mtime,

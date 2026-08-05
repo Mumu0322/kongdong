@@ -111,6 +111,9 @@ E7预先留出和JSON输出正常：
 # 默认：工作台
 python run_workbench.py
 
+# 工作台“孔洞定位”页面还提供“偏移容忍度测试（单孔）”按钮，
+# 可直接设置半径/方向并运行下面的偏移测试，不需要单独打开命令行。
+
 # 只要手眼标定
 python run_handeye.py
 python run_handeye.py --opencv-ui   # OpenCV窗口：h诊断、v E7验证、d归档最后样本
@@ -134,7 +137,27 @@ python run_charuco_height_error_experiment.py --height-only --execute-motion
 
 # 命令行查看机械臂信息
 python run_robot_info.py --ip 192.168.50.200 --port 30004
+
+# 粗定位后精定位的视野偏移容忍度测试（默认只生成计划，不运动）
+python run_coarse_to_fine_offset_test.py --no-execute
+
+# 实机测试：只选择一个孔；不执行最终XY、最终Z和基坐标Y+0.2 mm
+python run_coarse_to_fine_offset_test.py --execute --allow-experimental-handeye
+
+# 实机测试：额外执行正式流程的最终XY、降Z、基坐标Y+0.2 mm，到达每个目标点后等待确认
+python run_coarse_to_fine_offset_test.py --execute --allow-experimental-handeye --include-final-motion
 ```
+
+`run_coarse_to_fine_offset_test.py` 按默认的 0/5/10/15/20 mm 五个半径，
+每个非零半径按 45° 间隔采 8 个方向，共 33 个位置。每个位置都从精定位中心
+重新出发，固定姿态和RZ，只做相机横向偏移，然后运行当前RGB精定位质量门。测试
+结果写入 `C:\MM\aubo_tools\data\hole_localization_runs\coarse-to-fine-offset-*`，
+包括 `report.json`、`offset_samples.csv` 和极坐标图。只有同一半径的所有方向都通过，
+该半径才会被汇总为支持半径。默认不执行最终插入动作；勾选/指定
+`--include-final-motion` 后，会按正式顺序执行最终XY、降Z、基坐标Y+0.2 mm，
+到达最终目标点后等待人工确认；确认或取消后都会先回升，再返回精定位中心。
+GUI 目标点暂停时提供“确认并继续”和“标记当前点有误差并继续”两个选项；
+标记结果会写入报告并在极坐标图中以紫色显示，不会再次询问该点。
 
 视野实验固定使用板中心在RGB相机坐标系中的 `T_rgb_board[2,3]` 作为高度：
 300/320/340/360 mm，步进20 mm。程序只自动修改TCP的Z，不发送XY运动；每个高度由
