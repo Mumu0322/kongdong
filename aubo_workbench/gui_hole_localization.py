@@ -53,6 +53,8 @@ class HoleLocalizationPanel(ttk.Frame):
         self.acc_var = tk.StringVar(value="0.25")
         self.transit_speed_var = tk.StringVar(value="0.15")
         self.transit_acc_var = tk.StringVar(value="0.45")
+        self.approach_speed_var = tk.StringVar(value="0.12")
+        self.approach_acc_var = tk.StringVar(value="0.35")
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=True)
         self.final_xy_var = tk.BooleanVar(value=True)
@@ -97,8 +99,19 @@ class HoleLocalizationPanel(ttk.Frame):
                 row=0, column=col * 2 + 1, sticky="w", padx=(0, 10),
             )
 
+        approach_fields = ttk.Frame(config)
+        approach_fields.grid(row=4, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        for col, (label, var, width) in enumerate([
+            ("非接触接近速度 m/s", self.approach_speed_var, 7),
+            ("非接触接近加速度 m/s²", self.approach_acc_var, 7),
+        ]):
+            ttk.Label(approach_fields, text=label).grid(row=0, column=col * 2, sticky="w", padx=(0, 3))
+            ttk.Entry(approach_fields, textvariable=var, width=width).grid(
+                row=0, column=col * 2 + 1, sticky="w", padx=(0, 10),
+            )
+
         switches = ttk.Frame(config)
-        switches.grid(row=4, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        switches.grid(row=5, column=0, columnspan=5, sticky="w", pady=(7, 0))
         ttk.Checkbutton(switches, text="真实运动（未勾选时仅预览）", variable=self.execute_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="允许当前实验手眼结果", variable=self.experimental_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="精定位后执行 TCP XY → 基坐标 Z → +Y 0.2 mm", variable=self.final_xy_var).pack(side=tk.LEFT)
@@ -166,6 +179,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 "acc": float(self.acc_var.get()),
                 "transit_speed": float(self.transit_speed_var.get()),
                 "transit_acc": float(self.transit_acc_var.get()),
+                "approach_speed": float(self.approach_speed_var.get()),
+                "approach_acc": float(self.approach_acc_var.get()),
             }
         except ValueError as exc:
             raise ValueError("定位参数必须是有效数字") from exc
@@ -193,6 +208,8 @@ class HoleLocalizationPanel(ttk.Frame):
             "--speed-m-s", str(values["speed"]), "--acc-m-s2", str(values["acc"]),
             "--transit-speed-m-s", str(values["transit_speed"]),
             "--transit-acc-m-s2", str(values["transit_acc"]),
+            "--approach-speed-m-s", str(values["approach_speed"]),
+            "--approach-acc-m-s2", str(values["approach_acc"]),
             "--robot-ip", str(connection["ip"]), "--robot-port", str(connection["port"]),
             "--robot-user", str(connection["user"]), "--robot-password", str(connection["password"]),
             "--robot-timeout-ms", str(connection["timeout_ms"]),

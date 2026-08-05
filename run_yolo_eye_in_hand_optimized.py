@@ -20,7 +20,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -209,14 +209,14 @@ class TwoStageConfig:
     fine_degraded_max_center_scatter_p95_px: float = 0.6
     max_ellipse_residual_px: float = 0.9
     # 多孔镀膜表面边缘常有高光，椭圆残差会显著高于单孔测试；
-    # 圆心散布仍由 max_fine_center_scatter_p95_px 严格约束。
+    # YOLO中心散布仍由 max_fine_center_scatter_p95_px 严格约束。
     coarse_max_ellipse_residual_px: float = 2.5
     multi_fine_max_ellipse_residual_px: float = 2.5
     # 三孔中靠近视野边缘的孔可能只看到局部圆弧；只要弧段拟合
     # 稳定，允许用较低覆盖度参与圆心融合。
     multi_fine_min_ellipse_coverage_deg: float = 45.0
-    # 镀膜三孔的边缘高光会造成亚像素到约1像素的椭圆中心跳变。
-    # 单孔精定位仍使用 0.35 px；三孔批量输出单独保留可审计门槛。
+    # 镀膜和反光会造成YOLO框中心在帧间抖动；单孔精定位仍使用
+    # 0.35 px，三孔批量输出单独保留可审计门槛。
     multi_fine_max_center_scatter_p95_px: float = 1.0
     # 为反光离群帧预留补采量；原始帧全部写入CSV，最终只融合稳定内点。
     # 只在稳定门未通过时补采；默认最多补4帧，而不是固定补12帧。
@@ -234,7 +234,7 @@ class TwoStageConfig:
     # 该门限明显小于相邻孔间距，避免密集孔阵列中锁到邻孔。
     fine_pointcloud_anchor_tolerance_px: float = 30.0
     # 反光会让严格椭圆残差门（0.9 px）间歇性失败；只有在点云投影锚点
-    # 已锁定目标且拟合仍满足较宽的几何门时，才允许使用YOLO框中心备用。
+    # 已锁定目标且拟合仍满足较宽的几何门时，才允许该帧继续使用YOLO中心。
     fine_yolo_fallback_max_ellipse_residual_px: float = 2.5
     fine_yolo_fallback_min_ellipse_coverage_deg: float = 45.0
     enable_tilt_center_correction: bool = True
@@ -1225,6 +1225,13 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
     if motion_profile == "transit":
         speed_m_s = float(getattr(args, "transit_speed_m_s", args.speed_m_s))
         acc_m_s2 = float(getattr(args, "transit_acc_m_s2", args.acc_m_s2))
+    elif motion_profile == "approach":
+        speed_m_s = float(getattr(
+            args, "approach_speed_m_s", getattr(args, "transit_speed_m_s", args.speed_m_s),
+        ))
+        acc_m_s2 = float(getattr(
+            args, "approach_acc_m_s2", getattr(args, "transit_acc_m_s2", args.acc_m_s2),
+        ))
     elif motion_profile == "precision":
         speed_m_s = float(args.speed_m_s)
         acc_m_s2 = float(args.acc_m_s2)
@@ -1258,87 +1265,6 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
     return actual
 
 
-def _run_three_hole_placement_sequence(
-    holes: list[dict[str, Any]], current_tcp: np.ndarray, args: Any,
-    motion_session: Any, pose_session: Any,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """逐孔安放：上行只动Z再动XY；下行先XY再仅动Z。"""
-    if len(holes) != 3:
-        raise ValueError(f"逐孔安放要求恰好3孔，当前={len(holes)}")
-    targets = [pose_session.pose_sdk_to_transform_mm(
-        item.get("tcp_target_pose_m_rad", item["hole_pose_m_rad"])
-    ) for item in holes]
-    print("\n[三孔逐孔安放] 目标为各孔的TCP安放点；移动规则：上行先Z、下行先XY后Z。")
-    for item, target in zip(holes, targets):
-        print(f"  孔{int(item['hole_id'])}: TCP XYZ(mm)={np.round(target[:3, 3], 3).tolist()}")
-    command = _request_motion_confirmation(
-        "开始三孔逐孔安放",
-        "输入 m 开始自动安放序列；到每个孔位后将再次暂停确认：",
-    )
-    if command != "m":
-        raise RuntimeError("用户取消三孔逐孔安放")
-
-    records: list[dict[str, Any]] = []
-    actual = np.asarray(current_tcp, dtype=np.float64).copy()
-    for order, (item, target) in enumerate(zip(holes, targets), start=1):
-        hole_id = int(item["hole_id"])
-        safe_z = max(float(actual[2, 3]), float(target[2, 3])) + THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM
-
-        # 1) 离开当前低位：只抬基坐标Z，TCP姿态和XY不动。
-        lift = actual.copy()
-        lift[2, 3] = safe_z
-        if abs(float(lift[2, 3] - actual[2, 3])) > 0.2:
-            actual = _confirm_and_move_line(
-                f"孔{hole_id}安放前抬升（先Z）", actual, lift, args, motion_session, pose_session,
-                "仅修改基坐标Z；保持当前XY与姿态", require_confirmation=False,
-            )
-
-        # 2) 高位横移并转到下一孔的法向姿态。
-        pre_place = target.copy()
-        pre_place[2, 3] = safe_z
-        actual = _confirm_and_move_line(
-            f"孔{hole_id}安放前定位（高位XY）", actual, pre_place, args, motion_session, pose_session,
-            "安全高度平移XY并调整TCP垂直该孔面；不下降", require_confirmation=False,
-        )
-
-        # 3) 到位安放：只沿基坐标Z下降，XY和目标姿态锁定。
-        z_delta_mm = float(target[2, 3] - actual[2, 3])
-        actual = _confirm_and_move_line(
-            f"孔{hole_id}安放（后Z）", actual, target, args, motion_session, pose_session,
-            "仅修改基坐标Z；XY与TCP垂直孔面的姿态锁定",
-            require_confirmation=bool(abs(z_delta_mm) > 30.0),
-        )
-        # 保留原单孔流程的末端基坐标Y正方向0.2 mm微调；它发生在最终Z到位之后。
-        y_trim = actual.copy()
-        y_trim[1, 3] += FINAL_BASE_Y_AFTER_Z_MM
-        actual = _confirm_and_move_line(
-            f"孔{hole_id}安放后Y+{FINAL_BASE_Y_AFTER_Z_MM:.1f} mm微调",
-            actual, y_trim, args, motion_session, pose_session,
-            "仅修改基坐标Y；最终Z、X和TCP姿态保持不变", require_confirmation=False,
-        )
-        records.append({
-            "order": order,
-            "hole_id": hole_id,
-            "safe_z_mm": safe_z,
-            "placement_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(actual),
-            "final_base_y_trim_mm": FINAL_BASE_Y_AFTER_Z_MM,
-            "status": "arrived_waiting_confirmation",
-        })
-        command = _request_motion_confirmation(
-            f"孔{hole_id}安放点已到达",
-            "已完成该孔安放后输入 m 前往下一孔；其他任意键停止并保持当前位置：",
-        )
-        if command != "m":
-            raise RuntimeError(f"用户在孔{hole_id}安放点停止流程")
-        records[-1]["status"] = "placement_confirmed"
-
-    return actual, {
-        "mode": "sequential_place_each_hole",
-        "safe_z_margin_mm": THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM,
-        "order": [int(item["hole_id"]) for item in holes],
-        "records": records,
-        "final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(actual),
-    }
 
 
 def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_session: Any) -> np.ndarray:
@@ -1384,39 +1310,6 @@ def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_sessi
     return actual
 
 
-def _capture_initial_selection(pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-                               run_dir: Path, max_plane_rmse_mm: float
-                               ) -> tuple[Any, dict[str, Any], np.ndarray, PlaneEstimate, Any]:
-    bundle = None
-    for _ in range(10):
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is not None and bundle.intrinsics is not None:
-            break
-    if bundle is None or bundle.intrinsics is None:
-        raise RuntimeError("无法获得带RGB内参的初始 RGB-D 帧")
-    detections = detect(model, bundle.color_bgr, confidence)
-    if not detections:
-        raise RuntimeError("原点画面中 YOLO 未检测到孔")
-    selected_indices = choose_boxes(bundle.color_bgr, detections, count=1)
-    if selected_indices is None:
-        raise RuntimeError("未选择目标孔")
-    chosen = detections[selected_indices[0]]
-    ellipse = fit_hole_ellipse(bundle.color_bgr, chosen, bundle.intrinsics)
-    radius = max(chosen["box"][2] - chosen["box"][0], chosen["box"][3] - chosen["box"][1]) / 2.0
-    ring_center = tuple(ellipse["center_px_distorted"] if ellipse is not None else chosen["center"])
-    ray_center = np.asarray(ellipse["center_px"] if ellipse is not None else chosen["center"], dtype=np.float64)
-    point, info = hole_camera_point(
-        ring_center, bundle.xyz_map_mm, bundle.intrinsics, radius,
-        ray_center_xy=ray_center, ray_center_is_undistorted=ellipse is not None,
-    )
-    plane = _plane_estimate_from_info(info, "initial plane normal")
-    cv2.imwrite(str(run_dir / "01_home_selected.png"), _overlay(bundle.color_bgr, chosen, ellipse, "home selected hole"))
-    if plane.rmse_mm > float(max_plane_rmse_mm):
-        raise RuntimeError(
-            f"初始孔面深度拟合RMSE过大：{plane.rmse_mm:.3f} mm "
-            f"> {float(max_plane_rmse_mm):.3f} mm"
-        )
-    return bundle, chosen, np.asarray(point, dtype=np.float64), plane, bundle.intrinsics
 
 
 def _capture_initial_multi_hole_selection(
@@ -1741,20 +1634,18 @@ def _capture_fine_burst(
             latest_center_source = "rejected_ellipse_quality"
             continue
 
-        if strict_ellipse_ok:
-            center = np.asarray(ellipse["center_px"], dtype=np.float64)
-            center_source = "ellipse"
-            quality_note = None
-        else:
-            # YOLO中心属于原始畸变像素域；下游pixel_to_base_plane要求去畸变域，
-            # 因此备用中心必须先用当前RGB内参去畸变，不能直接混用两个坐标域。
-            center = undistort_pixels(
-                bundle.intrinsics, detection_center.reshape(1, 2), pixel_output=True,
-            )[0]
-            center_source = "yolo_fallback"
-            quality_note = (
-                "strict_ellipse_rejected;accepted_by_pointcloud_anchor_and_relaxed_ellipse"
-            )
+        # 精定位中心统一来自 YOLO 检测框；椭圆拟合只负责质量门和诊断，
+        # 不再把 ellipse["center_px"] 混入中心融合，避免两种中心在帧间跳变。
+        # YOLO 中心属于原始畸变像素域；下游 pixel_to_base_plane 要求去畸变域，
+        # 因此统一先用当前 RGB 内参转换到去畸变像素坐标。
+        center = undistort_pixels(
+            bundle.intrinsics, detection_center.reshape(1, 2), pixel_output=True,
+        )[0]
+        center_source = "yolo"
+        quality_note = (
+            None if strict_ellipse_ok
+            else "strict_ellipse_rejected;accepted_by_pointcloud_anchor_and_relaxed_ellipse"
+        )
         observations.append(Observation(
             name, attempt, center, ellipse,
             timestamp_ns=bundle.host_timestamp_ns,
@@ -1823,7 +1714,7 @@ def _capture_fine_with_recovery(
             rows.extend(_observation_rows(observations))
             _record_hole_tracking_event(
                 hole, fine_name, expected_anchor_px, observations,
-                fine_intrinsics, "undistorted_pixel_ellipse_or_yolo_center",
+                fine_intrinsics, "undistorted_pixel_yolo_center",
             )
             last_observations = observations
             last_intrinsics = fine_intrinsics
@@ -2226,114 +2117,6 @@ def _plan_hole_tcp_pose_fixed_rz(
     return target, info
 
 
-def _capture_multi_coarse_burst(
-    pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-    selected_holes: list[dict[str, Any]], cfg: TwoStageConfig, run_dir: Path,
-    target_valid_frames: int | None = None,
-    min_valid_frames: int | None = None,
-) -> tuple[dict[int, list[Observation]], Any, np.ndarray]:
-    """在粗定位位逐孔提取YOLO框环带点云，并对每个孔独立融合局部平面。"""
-    if not selected_holes:
-        raise RuntimeError("没有粗定位位手选输出孔")
-    observations = {int(item["hole_id"]): [] for item in selected_holes}
-    anchors = {
-        int(item["hole_id"]): np.asarray(item["tracking_anchor_px"], dtype=np.float64)
-        for item in selected_holes
-    }
-    reference_class = int(selected_holes[0]["class_id"])
-    latest_bundle = None
-    latest_pairs: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-    for _ in range(cfg.coarse_settle_frames):
-        get_aligned_frame_bundle(pipeline, align, chain)
-
-    target_valid_frames = int(
-        cfg.preliminary_coarse_frames if target_valid_frames is None else target_valid_frames
-    )
-    min_valid_frames = int(
-        cfg.min_preliminary_coarse_valid if min_valid_frames is None else min_valid_frames
-    )
-    max_attempts = max(target_valid_frames * int(cfg.coarse_max_attempt_multiplier), target_valid_frames)
-    for attempt in range(max_attempts):
-        if all(
-            len([item for item in values if item.error is None and item.plane is not None]) >= target_valid_frames
-            for values in observations.values()
-        ) or _coarse_burst_stable(
-            observations, min_valid_frames, cfg.max_coarse_center_scatter_p95_px,
-        ):
-            break
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is None or bundle.intrinsics is None:
-            continue
-        latest_bundle = bundle
-        detections = [
-            item for item in detect(model, bundle.color_bgr, confidence)
-            if int(item.get("class_id", -1)) == reference_class
-        ]
-        unused = set(range(len(detections)))
-        pairs: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-        for hole in selected_holes:
-            hole_id = int(hole["hole_id"])
-            anchor = anchors[hole_id]
-            if not unused:
-                observations[hole_id].append(Observation(
-                    f"coarse_hole_{hole_id}", attempt, anchor,
-                    timestamp_ns=bundle.host_timestamp_ns, error="selected_hole_missing",
-                ))
-                continue
-            candidate_index = min(
-                unused,
-                key=lambda index: float(np.linalg.norm(
-                    np.asarray(detections[index]["center"], dtype=np.float64) - anchor
-                )),
-            )
-            detection = detections[candidate_index]
-            distance = float(np.linalg.norm(np.asarray(detection["center"], dtype=np.float64) - anchor))
-            if distance > cfg.multi_coarse_tracking_tolerance_px:
-                observations[hole_id].append(Observation(
-                    f"coarse_hole_{hole_id}", attempt, anchor,
-                    timestamp_ns=bundle.host_timestamp_ns, error="selected_hole_tracking_distance",
-                ))
-                continue
-            unused.remove(candidate_index)
-            center = np.asarray(detection["center"], dtype=np.float64)
-            radius = max(
-                float(detection["box"][2] - detection["box"][0]),
-                float(detection["box"][3] - detection["box"][1]),
-            ) / 2.0
-            try:
-                _, info = hole_camera_point(
-                    tuple(center), bundle.xyz_map_mm, bundle.intrinsics, radius,
-                    ray_center_xy=center, ray_center_is_undistorted=False,
-                )
-                plane = _plane_estimate_from_info(info, f"coarse hole {hole_id} plane normal")
-                valid = plane.rmse_mm <= cfg.max_plane_rmse_mm
-                observations[hole_id].append(Observation(
-                    f"coarse_hole_{hole_id}", attempt, center, plane=plane,
-                    timestamp_ns=bundle.host_timestamp_ns,
-                    error=None if valid else "plane_quality",
-                ))
-                pairs.append((detection, None))
-            except Exception as exc:
-                observations[hole_id].append(Observation(
-                    f"coarse_hole_{hole_id}", attempt, center,
-                    timestamp_ns=bundle.host_timestamp_ns, error=f"plane_error:{exc}",
-                ))
-        latest_pairs = pairs
-
-    if latest_bundle is None:
-        raise RuntimeError("三孔粗定位点云采集期间未获得RGB-D帧")
-    required_valid = int(min_valid_frames)
-    for hole_id, values in observations.items():
-        valid_count = len([item for item in values if item.error is None and item.plane is not None])
-        if valid_count < required_valid:
-            raise RuntimeError(
-                f"孔{hole_id}粗定位局部点云有效帧不足：{valid_count}/{required_valid}"
-            )
-    cv2.imwrite(
-        str(run_dir / "03_coarse_multi_pointcloud_overlay.png"),
-        _overlay_multi(latest_bundle.color_bgr, latest_pairs, "coarse YOLO annular pointcloud"),
-    )
-    return observations, latest_bundle.intrinsics, latest_bundle.color_bgr
 
 
 def _apply_coarse_geometry_to_hole(
@@ -2384,427 +2167,12 @@ def _apply_coarse_geometry_to_hole(
     return summary
 
 
-def _select_coarse_holes_with_depth(
-    pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-    cfg: TwoStageConfig, run_dir: Path, T_base_camera: np.ndarray,
-    reference_class_id: int, count: int = 3,
-    initial_selected_holes: list[dict[str, Any]] | None = None,
-    reference_point_base_mm: np.ndarray | None = None,
-) -> tuple[list[dict[str, Any]], dict[int, list[Observation]], Any, np.ndarray]:
-    """粗定位位关联三孔，并为每孔建立独立的局部点云几何结果。
-
-    三孔模式优先使用初始画面三维点投影到当前视图的结果自动关联；
-    若预测距离过大，再退回当前画面人工选择，避免错误跨孔关联。
-    """
-    bundle = None
-    for _ in range(10):
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is not None and bundle.intrinsics is not None:
-            break
-    if bundle is None or bundle.intrinsics is None:
-        raise RuntimeError("粗定位位无法获得带RGB-D内参的三孔选择帧")
-    detections = [
-        item for item in detect(model, bundle.color_bgr, confidence)
-        if int(item.get("class_id", -1)) == int(reference_class_id)
-    ]
-    if len(detections) < count:
-        raise RuntimeError(f"粗定位位仅检测到 {len(detections)} 个孔，不能选择 {count} 个")
-    principal = np.array([float(bundle.intrinsics.cx), float(bundle.intrinsics.cy)], dtype=np.float64)
-    reference_index = min(
-        range(len(detections)),
-        key=lambda index: float(np.linalg.norm(np.asarray(detections[index]["center"]) - principal)),
-    )
-    reference_distance = float(np.linalg.norm(
-        np.asarray(detections[reference_index]["center"], dtype=np.float64) - principal
-    ))
-    selection: tuple[list[int], dict[int, list[float]]] | None = None
-    selection_mode = "manual_current_coarse_view"
-    expected_centers: dict[int, np.ndarray] = {}
-    auto_selection_error: str | None = None
-
-    if initial_selected_holes is not None:
-        if len(initial_selected_holes) < count:
-            auto_selection_error = (
-                f"初始三孔记录只有 {len(initial_selected_holes)} 个，当前需要 {count} 个"
-            )
-        else:
-            try:
-                for hole in initial_selected_holes[:count]:
-                    hole_id = int(hole["hole_id"])
-                    if hole_id == 1 and reference_point_base_mm is not None:
-                        point_base = np.asarray(reference_point_base_mm, dtype=np.float64).reshape(3)
-                    else:
-                        point_base = np.asarray(
-                            hole["initial_center_base_mm"], dtype=np.float64,
-                        ).reshape(3)
-                    expected_centers[hole_id] = _project_base_point_to_pixel(
-                        point_base, T_base_camera, bundle.intrinsics,
-                    )
-                unused = set(range(len(detections)))
-                selected_indices: list[int] = []
-                selection_clicks: dict[int, list[float]] = {}
-                for hole in initial_selected_holes[:count]:
-                    hole_id = int(hole["hole_id"])
-                    if not unused:
-                        raise RuntimeError("当前视图没有足够的未关联YOLO检测框")
-                    expected = expected_centers[hole_id]
-                    candidate_index = min(
-                        unused,
-                        key=lambda index: float(np.linalg.norm(
-                            np.asarray(detections[index]["center"], dtype=np.float64) - expected
-                        )),
-                    )
-                    distance = float(np.linalg.norm(
-                        np.asarray(detections[candidate_index]["center"], dtype=np.float64) - expected
-                    ))
-                    if distance > cfg.multi_coarse_tracking_tolerance_px:
-                        raise RuntimeError(
-                            f"孔{hole_id}预测位置与当前YOLO中心相差 {distance:.1f}px"
-                        )
-                    unused.remove(candidate_index)
-                    selected_indices.append(candidate_index)
-                    selection_clicks[candidate_index] = list(map(
-                        float, detections[candidate_index]["center"]
-                    ))
-                selection = (selected_indices, selection_clicks)
-                reference_index = selected_indices[0]
-                reference_distance = float(np.linalg.norm(
-                    np.asarray(detections[reference_index]["center"], dtype=np.float64) - principal
-                ))
-                selection_mode = "initial_three_hole_projection"
-                print(
-                    "[COARSE_SELECT] 复用初始三孔选择；按初始三维点投影自动关联当前YOLO检测",
-                    flush=True,
-                )
-            except Exception as exc:
-                auto_selection_error = str(exc)
-
-    if selection is None:
-        if auto_selection_error:
-            print(f"[COARSE_SELECT] 初始三孔自动关联失败，退回当前画面人工选择：{auto_selection_error}", flush=True)
-            expected_centers = {}
-        if reference_distance > cfg.coarse_reference_lock_tolerance_px:
-            raise RuntimeError(
-                f"粗定位位未能锁定参考孔：距RGB主点 {reference_distance:.1f}px "
-                f"> {cfg.coarse_reference_lock_tolerance_px:.1f}px"
-            )
-        selection = choose_boxes(
-            bundle.color_bgr, detections, count=count,
-            preselected_indices=[reference_index], locked_indices=[reference_index], return_clicks=True,
-        )
-    if selection is None:
-        raise RuntimeError("用户取消粗定位位三孔选择")
-    selected_indices, selection_clicks = selection
-    holes: list[dict[str, Any]] = []
-    for hole_id, detection_index in enumerate(selected_indices, start=1):
-        detection = detections[detection_index]
-        selection_click = np.asarray(selection_clicks[detection_index], dtype=np.float64)
-        box_width = float(detection["box"][2] - detection["box"][0])
-        box_height = float(detection["box"][3] - detection["box"][1])
-        holes.append({
-            "hole_id": hole_id,
-            "class_id": int(detection["class_id"]),
-            "initial_center_px": list(map(float, detection["center"])),
-            "initial_box": list(map(float, detection["box"])),
-            "coarse_selection_click_px": selection_click.tolist(),
-            # 身份关联使用YOLO框中心，点击只作为选择证据，不让锚点漂移。
-            "tracking_anchor_px": list(map(float, detection["center"])),
-            "tracking_roi_size_px": [box_width, box_height],
-            "coarse_selection_detection_center_px": list(map(float, detection["center"])),
-            "coarse_reference_auto_locked": bool(hole_id == 1),
-            "coarse_reference_distance_to_principal_px": reference_distance if hole_id == 1 else None,
-            "coarse_selection_mode": selection_mode,
-            "coarse_selection_expected_center_px": (
-                expected_centers.get(hole_id).tolist()
-                if hole_id in expected_centers else None
-            ),
-            "pointcloud_segmentation": "yolo_box_annular_depth_ring",
-        })
-
-    observations, intrinsics, latest_color = _capture_multi_coarse_burst(
-        pipeline, align, chain, model, confidence, holes, cfg, run_dir,
-        target_valid_frames=cfg.preliminary_coarse_frames,
-        min_valid_frames=cfg.min_preliminary_coarse_valid,
-    )
-    for hole in holes:
-        hole_id = int(hole["hole_id"])
-        _apply_coarse_geometry_to_hole(
-            hole, observations[hole_id], T_base_camera, cfg,
-            min_valid_frames=cfg.min_preliminary_coarse_valid,
-        )
-    return holes, observations, intrinsics, latest_color
 
 
-def _prepare_fine_holes_from_coarse(
-    pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-    cfg: TwoStageConfig, run_dir: Path, coarse_holes: list[dict[str, Any]],
-    T_base_camera_fine: np.ndarray, reference_class_id: int,
-) -> list[dict[str, Any]]:
-    """把粗定位三维中心投影到精定位位，自动锁定每个孔的RGB跟踪身份。"""
-    bundle = None
-    for _ in range(10):
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is not None and bundle.intrinsics is not None:
-            break
-    if bundle is None or bundle.intrinsics is None:
-        raise RuntimeError("精定位位无法获得三孔自动关联帧")
-    detections = [
-        item for item in detect(model, bundle.color_bgr, confidence)
-        if int(item.get("class_id", -1)) == int(reference_class_id)
-    ]
-    predicted_centers: dict[int, np.ndarray] = {}
-    for hole in coarse_holes:
-        predicted_centers[int(hole["hole_id"])] = _project_base_point_to_pixel(
-            np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
-            T_base_camera_fine, bundle.intrinsics,
-        )
-    matched = _match_selected_holes_at_fine(
-        detections, coarse_holes, bundle.intrinsics,
-        predicted_centers_px=predicted_centers,
-        max_match_distance_px=cfg.multi_fine_match_tolerance_px,
-    )
-    missing = [hole_id for hole_id, detection in matched.items() if detection is None]
-    if missing:
-        raise RuntimeError(
-            "精定位位无法根据粗定位三维中心锁定孔："
-            f"missing_hole_ids={missing}, detections={len(detections)}"
-        )
-
-    fine_holes: list[dict[str, Any]] = []
-    overlays: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-    for source in sorted(coarse_holes, key=lambda item: int(item["hole_id"])):
-        hole = dict(source)
-        hole_id = int(hole["hole_id"])
-        detection = matched[hole_id]
-        assert detection is not None
-        anchor = np.asarray(detection["center"], dtype=np.float64)
-        hole.update({
-            "tracking_anchor_px": anchor.tolist(),
-            "fine_predicted_center_px": predicted_centers[hole_id].tolist(),
-            "fine_selection_detection_center_px": list(map(float, detection["center"])),
-            "fine_selection_association_distance_px": float(np.linalg.norm(
-                anchor - predicted_centers[hole_id]
-            )),
-            "fine_selection_mode": "coarse_pointcloud_projection_auto_match",
-            "depth_plane_source": "coarse_per_hole_local_plane",
-        })
-        fine_holes.append(hole)
-        overlays.append((detection, None))
-    cv2.imwrite(
-        str(run_dir / "04_fine_selected_depth.png"),
-        _overlay_multi(bundle.color_bgr, overlays, "fine auto match from coarse pointcloud"),
-    )
-    return fine_holes
 
 
-def _select_fine_holes_with_depth(
-    pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
-    cfg: TwoStageConfig, run_dir: Path, T_base_camera: np.ndarray,
-    reference_class_id: int, count: int = 3,
-) -> list[dict[str, Any]]:
-    """精拍位仅锁定三孔身份；深度平面严格沿用粗定位阶段的冻结结果。"""
-    bundle = None
-    for _ in range(10):
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is not None and bundle.intrinsics is not None:
-            break
-    if bundle is None or bundle.intrinsics is None:
-        raise RuntimeError("精拍位无法获得带RGB-D内参的选择帧")
-    detections = [
-        item for item in detect(model, bundle.color_bgr, confidence)
-        if int(item.get("class_id", -1)) == int(reference_class_id)
-    ]
-    if len(detections) < count:
-        raise RuntimeError(f"精拍位仅检测到 {len(detections)} 个孔，不能选择 {count} 个")
-    principal = np.array([float(bundle.intrinsics.cx), float(bundle.intrinsics.cy)], dtype=np.float64)
-    reference_index = min(
-        range(len(detections)),
-        key=lambda index: float(np.linalg.norm(np.asarray(detections[index]["center"]) - principal)),
-    )
-    reference_distance = float(np.linalg.norm(np.asarray(detections[reference_index]["center"]) - principal))
-    if reference_distance > cfg.coarse_reference_lock_tolerance_px:
-        raise RuntimeError(
-            f"精拍位未能自动锁定粗定位参考孔：距RGB主点 {reference_distance:.1f}px "
-            f"> {cfg.coarse_reference_lock_tolerance_px:.1f}px"
-        )
-    selection = choose_boxes(
-        bundle.color_bgr, detections, count=count,
-        preselected_indices=[reference_index], locked_indices=[reference_index], return_clicks=True,
-    )
-    if selection is None:
-        raise RuntimeError("用户取消精拍位三孔选择")
-    selected_indices, selection_clicks = selection
-    selected = [detections[index] for index in selected_indices]
-    class_id = int(reference_class_id)
-
-    holes: list[dict[str, Any]] = []
-    overlays: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-    for index, (detection_index, detection) in enumerate(zip(selected_indices, selected), start=1):
-        selection_anchor = np.asarray(selection_clicks[detection_index], dtype=np.float64)
-        # 在密集孔阵列中，检测框可能跨到邻孔；精拍身份由用户点击决定。
-        fit_detection = _detection_roi_at(detection, selection_anchor)
-        ellipse = fit_hole_ellipse(
-            bundle.color_bgr, fit_detection, bundle.intrinsics, expected_center_px=selection_anchor,
-        )
-        # 选择时只有单帧，镀膜表面反光会造成偶发轮廓缺失。不能用这一帧
-        # 直接否定人工选孔；最终仍由30帧精拍中至少24个可靠圆心和P95门决定。
-        selection_ellipse_ok = _ellipse_ok(
-            ellipse, cfg,
-            min_coverage_deg=cfg.multi_fine_min_ellipse_coverage_deg,
-            max_residual_px=cfg.multi_fine_max_ellipse_residual_px,
-        )
-        ray_center = np.asarray(
-            ellipse["center_px"] if ellipse is not None
-            else undistort_pixels(bundle.intrinsics, selection_anchor.reshape(1, 2), pixel_output=True)[0],
-            dtype=np.float64,
-        )
-        holes.append({
-            "hole_id": index,
-            "class_id": class_id,
-            # 后续RGB帧相机与工件均静止，锚点必须固定为精确圆心对应的原始像素，
-            # 不能跟随每帧YOLO框逐步漂移到相邻孔。
-            "tracking_anchor_px": list(ellipse["center_px_distorted"] if ellipse is not None else selection_anchor),
-            "fine_selection_click_px": selection_anchor.tolist(),
-            "fine_selection_ellipse_ok": bool(selection_ellipse_ok),
-            "tracking_roi_size_px": [
-                float(detection["box"][2] - detection["box"][0]),
-                float(detection["box"][3] - detection["box"][1]),
-            ],
-            "fine_selection_center_px": ray_center.tolist(),
-            "fine_selection_detection_center_px": list(detection["center"]),
-            "fine_selection_detection_to_ellipse_px": (
-                float(ellipse["detection_center_offset_px"]) if ellipse is not None else None
-            ),
-            "depth_plane_source": "coarse_frozen_plane",
-            "coarse_reference_auto_locked": bool(index == 1),
-            "coarse_reference_distance_to_principal_px": reference_distance if index == 1 else None,
-        })
-        # 显示原始 YOLO 检测框，使橙框中心与最终中心来源一致。
-        overlays.append((detection, ellipse))
-    cv2.imwrite(str(run_dir / "04_fine_selected_depth.png"),
-                _overlay_multi(bundle.color_bgr, overlays, "fine selected RGB-D"))
-    return holes
 
 
-def _capture_multi_fine_burst(
-    pipeline: Any, model: Any, confidence: float, selected_holes: list[dict[str, Any]],
-    cfg: TwoStageConfig, run_dir: Path,
-    T_base_camera: np.ndarray | None = None,
-) -> tuple[dict[int, list[Observation]], Any, np.ndarray]:
-    """RGB精拍仅在精拍位手选孔的小ROI内跟踪，禁止跨孔关联。"""
-    if not selected_holes:
-        raise RuntimeError("没有精拍位手选输出孔")
-    observations = {int(item["hole_id"]): [] for item in selected_holes}
-    # 精拍期间TCP不再运动，使用人工确认时的固定锚点进行身份关联。严禁将锚点
-    # 更新为当帧YOLO结果，避免密集阵列中逐帧“爬”到相邻孔。
-    anchors = {int(item["hole_id"]): np.asarray(item["tracking_anchor_px"], dtype=np.float64) for item in selected_holes}
-    latest_bundle = None
-    latest_pairs: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-    reference_class = int(selected_holes[0]["class_id"])
-    target_valid_frames = cfg.fine_frames + cfg.multi_fine_extra_frames
-    max_attempts = target_valid_frames * 4
-    for attempt in range(max_attempts):
-        if (
-            all(
-                len([item for item in values if item.error is None and item.ellipse is not None])
-                >= target_valid_frames
-                for values in observations.values()
-            )
-            or _fine_burst_stable(
-                observations, cfg.fine_stable_min_frames,
-                cfg.fine_stable_center_scatter_p95_px,
-            )
-        ):
-            break
-        bundle = get_rgb_frame_bundle(pipeline)
-        if bundle is None or bundle.intrinsics is None:
-            continue
-        latest_bundle = bundle
-        detections = [item for item in detect(model, bundle.color_bgr, confidence)
-                      if int(item.get("class_id", -1)) == reference_class]
-        # 先仅用YOLO框中心做近邻匹配；确定身份后，椭圆拟合必须使用固定的
-        # 手选锚点，不能让每个检测框独立决定“ROI内哪个孔才是目标”。
-        unused = set(range(len(detections)))
-        pairs_for_overlay: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-        for hole in selected_holes:
-            hole_id = int(hole["hole_id"])
-            if not unused:
-                observations[hole_id].append(Observation(
-                    f"fine_hole_{hole_id}", attempt, anchors[hole_id], timestamp_ns=bundle.host_timestamp_ns,
-                    error="selected_hole_missing",
-                ))
-                continue
-            candidate_index = min(
-                unused,
-                key=lambda index: float(np.linalg.norm(np.asarray(detections[index]["center"]) - anchors[hole_id])),
-            )
-            detection = detections[candidate_index]
-            distance = float(np.linalg.norm(np.asarray(detection["center"]) - anchors[hole_id]))
-            if distance > cfg.multi_fine_tracking_tolerance_px:
-                observations[hole_id].append(Observation(
-                    f"fine_hole_{hole_id}", attempt, anchors[hole_id], timestamp_ns=bundle.host_timestamp_ns,
-                    error="selected_hole_missing",
-                ))
-                continue
-            unused.remove(candidate_index)
-            fit_detection = _detection_roi_at(
-                detection, anchors[hole_id], size_px=hole.get("tracking_roi_size_px"),
-            )
-            ellipse = fit_hole_ellipse(
-                bundle.color_bgr, fit_detection, bundle.intrinsics, expected_center_px=anchors[hole_id],
-            )
-            valid = bool(
-                ellipse
-                and float(ellipse["residual_px"]) <= cfg.multi_fine_max_ellipse_residual_px
-                and float(ellipse["coverage_deg"]) >= cfg.multi_fine_min_ellipse_coverage_deg
-            )
-            # 最终精定位中心使用橙色 YOLO 检测框中心；绿色椭圆仅作质量检查。
-            center_raw = np.asarray(detection["center"] if valid else anchors[hole_id], dtype=np.float64)
-            center = undistort_pixels(
-                bundle.intrinsics, center_raw.reshape(1, 2), pixel_output=True,
-            )[0]
-            # 记录孔号，避免某一帧漏检时叠加图中的顺序与孔号错位。
-            overlay_detection = dict(detection)
-            overlay_detection["_hole_id"] = hole_id
-            pairs_for_overlay.append((overlay_detection, ellipse))
-            observations[hole_id].append(Observation(
-                f"fine_hole_{hole_id}", attempt, center, ellipse, timestamp_ns=bundle.host_timestamp_ns,
-                error=None if valid else "ellipse_quality",
-            ))
-        latest_pairs = pairs_for_overlay
-    if latest_bundle is None:
-        raise RuntimeError("多孔精定位期间未获得RGB帧")
-
-    # 将粗阶段点云几何中心投影回精拍RGB图，供叠加图比较。
-    # coarse_center_base_mm 的定义是：粗阶段YOLO中心射线与融合点云局部平面的交点。
-    pointcloud_centers_px: dict[int, np.ndarray] = {}
-    pointcloud_medians_px: dict[int, np.ndarray] = {}
-    if T_base_camera is not None:
-        for hole in selected_holes:
-            hole_id = int(hole["hole_id"])
-            for target_key, target_map in (
-                ("coarse_center_base_mm", pointcloud_centers_px),
-                ("coarse_plane_point_base_mm", pointcloud_medians_px),
-            ):
-                point_base = hole.get(target_key)
-                if point_base is None:
-                    continue
-                try:
-                    target_map[hole_id] = _project_base_point_to_pixel(
-                        np.asarray(point_base, dtype=np.float64),
-                        np.asarray(T_base_camera, dtype=np.float64),
-                        latest_bundle.intrinsics,
-                    )
-                except (TypeError, ValueError, np.linalg.LinAlgError, cv2.error):
-                    # 可视化失败不影响定位主流程。
-                    continue
-    cv2.imwrite(str(run_dir / "05_fine_multi_overlay.png"),
-                _overlay_multi(
-                    latest_bundle.color_bgr, latest_pairs, "fine RGB multi-hole",
-                    pointcloud_centers_px=pointcloud_centers_px,
-                    pointcloud_medians_px=pointcloud_medians_px,
-                ))
-    return observations, latest_bundle.intrinsics, latest_bundle.color_bgr
 
 
 def _ray_sphere_intersection_base(
@@ -2948,18 +2316,14 @@ def _fuse_fine(observations: list[Observation], cfg: TwoStageConfig,
             f"原始有效帧={len(raw_valid)}，原始P95={summary['center_scatter_p95_px_raw']:.3f}px，"
             f"严格门槛={scatter_gate:.3f}px"
         )
-    center_source_counts: dict[str, int] = {}
-    for item in valid:
-        source = str(item.center_source or "").strip()
-        if not source or source == "unknown":
-            source = "ellipse" if item.ellipse is not None else "unknown"
-        center_source_counts[source] = center_source_counts.get(source, 0) + 1
-    if set(center_source_counts) == {"ellipse"}:
-        center_source = "ellipse"
-    elif set(center_source_counts) == {"yolo_fallback"}:
-        center_source = "yolo_fallback"
-    else:
-        center_source = "ellipse_and_yolo_fallback"
+    # 当前精定位的有效中心全部按 YOLO 来源统计。兼容旧观测记录中的
+    # ellipse / yolo_fallback 标签，但不再让它们改变实际中心来源。
+    center_source_counts = {"yolo": len(valid)}
+    relaxed_yolo_frames = sum(
+        "strict_ellipse_rejected" in str(item.quality_note or "") for item in valid
+    )
+    strict_ellipse_frames = len(valid) - relaxed_yolo_frames
+    center_source = "yolo"
     summary.update({
         "valid_frames": len(valid), "rejected_outlier_frames": len(raw_valid) - len(valid),
         "outlier_rule": "choose lower P95 of raw and MAD-filtered sets; strict gate unchanged",
@@ -2975,8 +2339,12 @@ def _fuse_fine(observations: list[Observation], cfg: TwoStageConfig,
         "axes_px_median": np.median(np.asarray([item.ellipse["axes_px"] for item in valid]), axis=0),
         "center_source": center_source,
         "center_source_counts": center_source_counts,
-        "strict_ellipse_frames": int(center_source_counts.get("ellipse", 0)),
-        "yolo_fallback_frames": int(center_source_counts.get("yolo_fallback", 0)),
+        "yolo_frames": len(valid),
+        "strict_ellipse_frames": int(strict_ellipse_frames),
+        "yolo_relaxed_ellipse_frames": int(relaxed_yolo_frames),
+        # 保留旧字段，便于已有报告解析器读取；它表示放宽椭圆质量门后
+        # 仍采用 YOLO 中心的帧数，不表示中心来自椭圆。
+        "yolo_fallback_frames": int(relaxed_yolo_frames),
     })
     if summary["center_scatter_p95_px"] > scatter_gate:
         raise RuntimeError(
@@ -3020,21 +2388,6 @@ def _write_report(run_dir: Path, report: dict[str, Any], rows: list[dict[str, An
     (run_dir / "report.json").write_text(json.dumps(_jsonable(report), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _stage_table(report: dict[str, Any]) -> str:
-    stages = report.get("stages", {})
-    lines = ["阶段              有效帧/总帧    中心散布P95       平面RMSE/最终高度"]
-    for key, label in (("coarse", "340mm 粗定位"), ("coarse_validation", "粗定位校正确认"), ("fine", "260mm RGB精定位")):
-        item = stages.get(key)
-        if not item:
-            continue
-        valid = item.get("valid_frames", "-")
-        total = item.get("total_frames", "-")
-        scatter = item.get("center_scatter_p95_px", "-")
-        right = item.get("plane_rmse_median_mm", item.get("estimated_height_mm", "-"))
-        scatter_text = f"{scatter:.3f}px" if isinstance(scatter, (float, int)) else "-"
-        right_text = f"{right:.3f}mm" if isinstance(right, (float, int)) else "-"
-        lines.append(f"{label:<16} {valid}/{total:<10} {scatter_text:<16} {right_text}")
-    return "\n".join(lines)
 
 
 def _record_hole_tracking_event(
@@ -3131,14 +2484,6 @@ def _run_sequential_hole_workflow(
         "confirmation_policy": "only_before_starting_next_selected_hole",
         "camera_pipeline_policy": "reuse_single_rgbd_pipeline_for_coarse_and_rgb_fine",
     }
-
-    def stop_runtime_pipeline(key: str) -> None:
-        pipeline = runtime.get(key)
-        if pipeline is not None:
-            try:
-                pipeline.stop()
-            finally:
-                runtime[key] = None
 
     def ensure_rgbd_pipeline() -> tuple[Any, Any, Any]:
         if runtime.get("rgbd_pipeline") is None:
@@ -3286,6 +2631,7 @@ def _run_sequential_hole_workflow(
                     f"center offset={center_offset:.2f}px, normal error={normal_error:.3f}deg；"
                     f"camera_axis_error={float(correction_geometry['camera_axis_error_deg']):.5f}deg",
                     require_confirmation=False,
+                    motion_profile="approach",
                 )
         hole["coarse_captures"] = coarse_captures
         if final_center_offset > cfg.center_tolerance_px or final_normal_error > cfg.normal_tolerance_deg:
@@ -3329,6 +2675,7 @@ def _run_sequential_hole_workflow(
                     actual_tcp, z_target, args, motion_session, pose_session,
                     f"当前孔估计高度={estimated_height:.2f} mm；XY、姿态和RZ锁定",
                     require_confirmation=False,
+                    motion_profile="approach",
                 )
         _, current_tcp = _require_safe_snapshot(pose_session)
         estimated_height = camera_height_to_plane_mm(
@@ -3508,6 +2855,7 @@ def _run_sequential_hole_workflow(
                     current_tcp, xy_target, args, motion_session, pose_session,
                     f"保持孔{hole_id}精拍Z与姿态；{compensation}",
                     require_confirmation=False,
+                    motion_profile="precision",
                 )
             final_xy_motion = {
                 "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(xy_target),
@@ -3535,6 +2883,7 @@ def _run_sequential_hole_workflow(
                     current_tcp, z_target, args, motion_session, pose_session,
                     f"保持最终XY与姿态；目标TCP基坐标Z={z_target[2, 3]:.3f} mm",
                     require_confirmation=False,
+                    motion_profile="precision",
                 )
             final_z_motion = {
                 "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(z_target),
@@ -3554,6 +2903,7 @@ def _run_sequential_hole_workflow(
                     current_tcp, y_trim_target, args, motion_session, pose_session,
                     f"保持X、Z与姿态；基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm",
                     require_confirmation=False,
+                    motion_profile="precision",
                 )
             final_y_trim_motion = {
                 "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(y_trim_target),
@@ -3595,7 +2945,7 @@ def _run_sequential_hole_workflow(
             "pointcloud_segmentation": hole["pointcloud_segmentation"],
             "fine_plane_intersection_mm": naive_final_point_base,
             "fine_xy_source": (
-                "pointcloud_anchor_locked_ellipse_or_yolo_fallback_on_coarse_local_plane"
+                "pointcloud_anchor_locked_yolo_center_on_coarse_local_plane"
             ),
             "fine_z_source": "coarse_per_hole_center_z",
             "tilt_center_correction": tilt_correction,
@@ -3711,6 +3061,8 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
     precision_acc_m_s2 = float(args.acc_m_s2)
     transit_speed_m_s = float(getattr(args, "transit_speed_m_s", precision_speed_m_s))
     transit_acc_m_s2 = float(getattr(args, "transit_acc_m_s2", precision_acc_m_s2))
+    approach_speed_m_s = float(getattr(args, "approach_speed_m_s", 0.12))
+    approach_acc_m_s2 = float(getattr(args, "approach_acc_m_s2", 0.35))
     if precision_speed_m_s <= 0.0 or precision_acc_m_s2 <= 0.0:
         raise ValueError(
             f"精确运动速度和加速度必须大于0：speed={precision_speed_m_s}, "
@@ -3720,6 +3072,11 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
         raise ValueError(
             f"安全过渡速度和加速度必须大于0：speed={transit_speed_m_s}, "
             f"acc={transit_acc_m_s2}"
+        )
+    if approach_speed_m_s <= 0.0 or approach_acc_m_s2 <= 0.0:
+        raise ValueError(
+            f"非接触接近速度和加速度必须大于0：speed={approach_speed_m_s}, "
+            f"acc={approach_acc_m_s2}"
         )
     if cfg.fine_settle_discard_frames < 0:
         raise ValueError("精定位预热丢弃帧数不能小于0")
@@ -3758,12 +3115,17 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             "precision": {
                 "speed_m_s": precision_speed_m_s,
                 "acc_m_s2": precision_acc_m_s2,
-                "used_for": "coarse_correction_height_correction_final_xy_final_z_final_y_trim",
+                "used_for": "final_xy_final_z_final_y_trim",
             },
             "transit": {
                 "speed_m_s": transit_speed_m_s,
                 "acc_m_s2": transit_acc_m_s2,
                 "used_for": "coarse_pose_navigation_between_selected_holes",
+            },
+            "approach": {
+                "speed_m_s": approach_speed_m_s,
+                "acc_m_s2": approach_acc_m_s2,
+                "used_for": "coarse_correction_and_noncontact_descent_to_fine_height",
             },
         },
         "final_xy_compensation": (
@@ -3782,9 +3144,9 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
     timing = TimingRecorder()
     timing.attach_report(report)
     rows: list[dict[str, Any]] = []
-    rgbd_pipeline = rgb_pipeline = align = chain = None
+    rgbd_pipeline = align = chain = None
     pipeline_runtime: dict[str, Any] = {
-        "rgbd_pipeline": None, "rgb_pipeline": None, "align": None, "chain": None,
+        "rgbd_pipeline": None, "align": None, "chain": None,
     }
     pose_session = motion_session = None
     try:
@@ -3920,9 +3282,7 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             stopped_pipeline_ids: set[int] = set()
             for pipeline in (
                 rgbd_pipeline,
-                rgb_pipeline,
                 pipeline_runtime.get("rgbd_pipeline"),
-                pipeline_runtime.get("rgb_pipeline"),
             ):
                 if pipeline is None or id(pipeline) in stopped_pipeline_ids:
                     continue
@@ -3971,6 +3331,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="孔间安全过渡及粗定位导航速度(m/s)，默认0.15")
     p.add_argument("--transit-acc-m-s2", type=float, default=0.45,
                    help="孔间安全过渡及粗定位导航加速度(m/s²)，默认0.45")
+    p.add_argument("--approach-speed-m-s", type=float, default=0.12,
+                   help="粗定位校正及非接触下降速度(m/s)，默认0.12")
+    p.add_argument("--approach-acc-m-s2", type=float, default=0.35,
+                   help="粗定位校正及非接触下降加速度(m/s²)，默认0.35")
     p.add_argument("--offset-mm", type=float, default=0.0, help="沿机器人基坐标 Z 方向的安全偏置")
     p.add_argument("--two-stage-hole-localization", dest="two_stage_hole_localization", action="store_true",
                    default=DEFAULT_TWO_STAGE_HOLE_LOCALIZATION,
