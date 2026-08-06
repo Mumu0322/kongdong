@@ -59,7 +59,6 @@ TEST_HEIGHT_MM = 260.0
 MULTIVIEW_TAG = "pose_01"
 SHOW_MULTIVIEW_HISTORY = True
 KNOWN_HOLE_DIAMETER_MM = 70.0
-HOLE_DIAMETER_CANDIDATES_MM = (65.0, 70.0, 75.0)
 USE_FIRST_VIEW_AS_REFERENCE_PLANE = True
 
 # 自动多视角：选定孔后不再需要人工移动。每次非参考位姿采集后都会自动回到参考 TCP，
@@ -625,10 +624,6 @@ def estimate_circle_diameter_from_rgb_depth_mm(axes_px: np.ndarray, intrinsics: 
         float(depth_z_mm) * axes[1] / float(intrinsics.fy),
     ])
     return float(np.median(estimates))
-
-
-def nearest_hole_diameter_candidate(diameter_mm: float) -> float:
-    return float(min(HOLE_DIAMETER_CANDIDATES_MM, key=lambda candidate: abs(candidate - diameter_mm)))
 
 
 def run_multiview(locator: Any) -> dict[str, Any]:

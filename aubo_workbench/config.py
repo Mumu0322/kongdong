@@ -80,112 +80,6 @@ class CameraConfig:
 
 
 @dataclass
-class HoleVisionConfig:
-    """镀膜伞孔 RGB 亚像素检测与局部平面拟合门槛。"""
-
-    # v5 方案明确为三种固定型号，而不是 65–75 mm 连续变化的单一型号。
-    # min/max 只保留为“自动诊断模式”的粗筛包络；生产流程必须显式指定型号。
-    supported_hole_diameters_mm: tuple[float, ...] = (65.0, 70.0, 75.0)
-    hole_diameter_min_mm: float = 65.0
-    hole_diameter_max_mm: float = 75.0
-    hole_model_crosscheck_tolerance_mm: float = 2.0
-
-    gaussian_kernel: int = 5
-    canny_low: int = 45
-    canny_high: int = 135
-    min_edge_points: int = 18
-    min_axis_px: float = 10.0
-    max_axis_px: float = 1000.0
-    max_axis_ratio: float = 3.0
-    ransac_iterations: int = 240
-    ransac_residual_px: float = 0.80
-    max_fit_rmse_px: float = 0.65
-    min_inlier_ratio: float = 0.68
-    min_angular_coverage_deg: float = 240.0
-    expected_diameter_tolerance_ratio: float = 0.18
-
-    # 沿 YOLO 先验半径采样灰度剖面，以暗区/亮区稳健中位数的 50% 强度交点定位孔沿。
-    # 该方法避免 Otsu 阈值在相邻像素间跳变，也避免只取最大梯度时切到内/外双边缘。
-    photometric_angle_count: int = 360
-    photometric_radial_step_px: float = 0.125
-    photometric_search_half_width_ratio: float = 0.16
-    photometric_level_gap_inner_ratio: float = 0.08
-    photometric_level_gap_outer_ratio: float = 0.22
-    photometric_min_contrast: float = 8.0
-    photometric_min_crossing_gradient: float = 0.8
-    photometric_recenter_iterations: int = 3
-    photometric_recenter_convergence_px: float = 0.01
-    # 至少有这些相反方向孔沿对时，才允许用椭圆二次型反推采样中心偏移。
-    photometric_opposed_pair_min_count: int = 36
-    photometric_opposed_center_max_correction_px: float = 3.0
-
-    # 深度只用于孔周围环带平面，不使用孔中心单像素深度。
-    # 孔外窄环带：旧1.10–1.55在伞架外缘孔会同时覆盖相邻孔、外轮廓和较大曲率范围。
-    # 新范围保留约4 px边缘隔离，同时把有效带宽控制在约8–12 px（当前90–125 px孔径）。
-    plane_ring_inner_scale: float = 1.08
-    plane_ring_outer_scale: float = 1.28
-    plane_other_hole_exclusion_scale: float = 1.05
-    plane_exclusion_min_confidence: float = 0.70
-    plane_min_points: int = 80
-    plane_ransac_iterations: int = 240
-    plane_ransac_tol_mm: float = 1.0
-    plane_max_rmse_mm: float = 0.80
-    plane_min_inlier_ratio: float = 0.40
-    # 仅用于发现“最近表面”的候选，不是放行门；最终仍必须通过上面的0.40。
-    plane_front_candidate_min_ratio: float = 0.35
-    local_surface_model: str = "quadratic_inverse_depth_tangent"
-    surface_max_abs_gradient_mm_per_px: float = 1.0
-    surface_max_abs_curvature_mm_per_px2: float = 0.02
-    surface_layer_separation_mm: float = 3.0
-    surface_layer_min_hypotheses: int = 3
-    surface_layer_relative_consensus: float = 0.90
-    physical_scale_min_frames: int = 20
-    physical_scale_min_pass_ratio: float = 0.90
-
-    # v5 E0.2 静态快测要求 200 帧；E1 正式重复性要求 500–1000 帧。
-    # 物理指标只有在提供 mm/px 或局部平面 Jacobian 后才判定。
-    repeatability_min_frames: int = 200
-    repeatability_min_pass_ratio: float = 0.90
-    repeatability_max_p95_mm: float = 0.05
-    e1_min_frames: int = 500
-    e1_min_pass_ratio: float = 0.995
-
-    # 生产定位输出采用非重叠稳健批次；200 帧 E0 至少形成 20 个独立 10 帧批次。
-    fusion_burst_frames: int = 10
-    fusion_min_valid_frames_per_burst: int = 7
-    fusion_min_bursts: int = 20
-    fusion_min_pass_ratio: float = 0.90
-    fusion_max_p95_mm: float = 0.05
-    fusion_outlier_floor_px: float = 0.50
-
-    # 深度噪声明显高于RGB孔心：500帧选型集上5/10/15/20/25帧窗口的Z P95分别为
-    # 0.524/0.386/0.288/0.231/0.240 mm。生产默认取20帧以保留余量，2D仍用上面的10帧。
-    # 这里只能验证固定场景重复性；E3/E4绝对精度仍需量块/位移计和精密倾角台真值。
-    surface_pose_fusion_burst_frames: int = 20
-    surface_pose_fusion_min_valid_frames_per_burst: int = 14
-    surface_pose_fusion_min_bursts: int = 20
-    surface_pose_fusion_min_pass_ratio: float = 0.90
-    surface_pose_fusion_outlier_floor_mm: float = 1.0
-    surface_pose_fusion_outlier_mad_scale: float = 3.5
-    surface_pose_min_valid_frame_ratio: float = 0.90
-    surface_pose_fused_max_z_p95_mm: float = 0.30
-    surface_pose_fused_max_normal_p95_deg: float = 0.30
-
-    # v5 正式端到端指标；0.20 mm 作为内部放行裕量，不冒充最终验收口径。
-    final_xy_radial_p95_mm: float = 0.25
-    engineering_release_xy_radial_p95_mm: float = 0.20
-
-    # E0 画面/深度可用性门槛，用于先区分成像问题与检测算法问题。
-    diagnostic_min_brightness: float = 35.0
-    diagnostic_max_brightness: float = 225.0
-    diagnostic_min_contrast: float = 12.0
-    diagnostic_min_sharpness: float = 20.0
-    diagnostic_max_underexposed_ratio: float = 0.40
-    diagnostic_max_overexposed_ratio: float = 0.40
-    diagnostic_min_valid_depth_ratio: float = 0.05
-
-
-@dataclass
 class RobotConfig:
     # 默认自动读取 AUBO 当前 TCP 位姿。只读，不写 TCP，不控制运动。
     robot_pose_read_enable: bool = True
@@ -213,33 +107,8 @@ class RobotCameraIntegrationConfig:
     """自动入孔所需权威证据文件位置；不使用可手工翻转的解锁布尔值。"""
 
     production_camera_serial: str = "CP4B85P001L"
-    dome_model_path: str = r"C:\MM\aubo_tools\data\dome_hole_model.json"
     handeye_validation_evidence_path: str = (
         r"C:\MM\aubo_tools\data\e7_handeye_validation_current.json"
-    )
-    tcp_payload_validation_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\e8_tcp_payload_validation_current.json"
-    )
-    part_clearance_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\part_clearance_validation_current.json"
-    )
-    v5_validation_bundle_path: str = (
-        r"C:\MM\aubo_tools\data\v5_validation_evidence_current.json"
-    )
-    physical_integration_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\physical_integration_validation_current.json"
-    )
-    motion_authorization_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\automatic_motion_authorization_current.json"
-    )
-    # 可选：camera_depth / cad_fixture / external_sensor / coarse_depth_with_compliance。
-    # 当前跨孔位证据已否决camera_depth作为全局精密高度源，因此默认保持未配置。
-    insertion_height_source: str = "unconfigured"
-    insertion_height_validation_evidence: str = (
-        r"C:\MM\aubo_tools\data\insertion_height_validation_current.json"
-    )
-    camera_depth_cross_position_gate_path: str = (
-        r"C:\MM\aubo_tools\data\hole_diagnostics\surface_pose_cross_position_gate_20260716.json"
     )
 
 
@@ -383,7 +252,6 @@ class AutoCaptureConfig:
 # 全局单例：整个应用共享同一份配置对象，GUI 表单/命令行都是直接改这些字段。
 BOARD_CFG = BoardConfig()
 CAMERA_CFG = CameraConfig()
-HOLE_VISION_CFG = HoleVisionConfig()
 ROBOT_CFG = RobotConfig()
 ROBOT_CAMERA_INTEGRATION_CFG = RobotCameraIntegrationConfig()
 SOLVE_CFG = SolveConfig()
@@ -393,6 +261,3 @@ CONFLICT_DIAG_CFG = ConflictDiagnosisConfig()
 AUTO_CAPTURE_CFG = AutoCaptureConfig()
 
 ESC_KEY = 27
-MODE_NAMES = {1: "joint", 2: "base", 3: "world", 4: "tool", 5: "user"}
-JOINT_LABELS = ("J1", "J2", "J3", "J4", "J5", "J6")
-CARTESIAN_LABELS = ("X", "Y", "Z", "A", "B", "C")

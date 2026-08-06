@@ -8,9 +8,8 @@ from run_yolo_eye_in_hand_optimized import (
     _fuse_fine,
     build_parser,
     fit_sphere,
-    _match_selected_holes_at_fine,
-    _ray_sphere_intersection_base,
-    _hole_surface_pose,
+    apply_final_point_base_offsets,
+    final_point_offsets_for_mode,
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
     plan_final_tcp_xy,
@@ -18,51 +17,15 @@ from run_yolo_eye_in_hand_optimized import (
 
 
 class FinalXyPlanningTests(unittest.TestCase):
-    def test_manual_three_hole_matching_uses_reference_and_relative_geometry(self):
-        class Intrinsics:
-            cx = 640.0
-            cy = 400.0
+    def test_final_point_offsets_are_applied_before_motion_planning(self):
+        point = np.array([631.0, -110.7, 56.7])
+        target = apply_final_point_base_offsets(point)
+        np.testing.assert_allclose(target, np.array([695.0, -110.7, 106.7]))
+        np.testing.assert_allclose(point, np.array([631.0, -110.7, 56.7]))
 
-        tracked = [
-            {"hole_id": 1, "initial_center_px": [556.0, 387.0], "initial_box": [496.0, 327.0, 616.0, 447.0]},
-            {"hole_id": 2, "initial_center_px": [422.0, 353.0], "initial_box": [362.0, 293.0, 482.0, 413.0]},
-            {"hole_id": 3, "initial_center_px": [683.0, 340.0], "initial_box": [623.0, 280.0, 743.0, 400.0]},
-        ]
-        def detection(center):
-            x, y = center
-            return {"center": [x, y], "box": [x - 75.0, y - 75.0, x + 75.0, y + 75.0]}
-        reference = detection((650.0, 400.0))
-        left_selected = detection((482.5, 357.5))
-        right_selected = detection((808.75, 341.25))
-        decoy = detection((320.0, 278.0))
-        matches = _match_selected_holes_at_fine(
-            [reference, left_selected, right_selected, decoy], tracked, Intrinsics(),
-        )
-        self.assertIs(matches[1], reference)
-        self.assertIs(matches[2], left_selected)
-        self.assertIs(matches[3], right_selected)
-
-    def test_three_hole_parser_and_sphere_ray_intersection(self):
-        args = build_parser().parse_args(["--hole-count", "3"])
-        self.assertEqual(args.hole_count, 3)
-
-        class Intrinsics:
-            fx = 1000.0
-            fy = 1000.0
-            cx = 320.0
-            cy = 240.0
-            distortion = ()
-
-        point, normal, mode = _ray_sphere_intersection_base(
-            np.array([320.0, 240.0]), Intrinsics(), np.eye(4),
-            np.array([0.0, 0.0, 1000.0]), 100.0,
-        )
-        np.testing.assert_allclose(point, np.array([0.0, 0.0, 900.0]), atol=1e-6)
-        np.testing.assert_allclose(normal, np.array([0.0, 0.0, -1.0]), atol=1e-6)
-        self.assertEqual(mode, "sphere")
-        pose = _hole_surface_pose(point, normal, np.array([1.0, 0.0, 0.0]))
-        np.testing.assert_allclose(pose[:3, 3], point, atol=1e-6)
-        np.testing.assert_allclose(pose[:3, 2], normal, atol=1e-6)
+    def test_final_point_mode_offsets(self):
+        self.assertEqual(final_point_offsets_for_mode("gripper"), (64.0, 50.0))
+        self.assertEqual(final_point_offsets_for_mode("normal"), (0.0, 0.0))
 
     def test_final_xy_motion_is_enabled_by_default(self):
         args = build_parser().parse_args([])
@@ -77,11 +40,8 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertEqual(TwoStageConfig().max_plane_rmse_mm, 3.5)
         self.assertEqual(TwoStageConfig().coarse_frames, 10)
         self.assertEqual(TwoStageConfig().fine_frames, 20)
-        self.assertEqual(TwoStageConfig().preliminary_coarse_frames, 6)
-        self.assertEqual(TwoStageConfig().multi_fine_extra_frames, 4)
         self.assertEqual(TwoStageConfig().coarse_settle_frames, 5)
         self.assertEqual(TwoStageConfig().coarse_max_attempt_multiplier, 4)
-        self.assertEqual(TwoStageConfig().min_coarse_ellipse_coverage_deg, 120.0)
 
     def test_default_charuco_model_preserves_z_and_orientation(self):
         tcp = np.eye(4)

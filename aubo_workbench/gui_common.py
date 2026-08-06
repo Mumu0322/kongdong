@@ -4,14 +4,14 @@
 
 from __future__ import annotations
 
-import queue
+from queue import Queue
 from typing import Any
 
 
 class GuiLogWriter:
     """实现 write/flush，可以整体赋值给 sys.stdout/sys.stderr，把打印导入 Tk 队列。"""
 
-    def __init__(self, log_queue: "queue.Queue[str]", original: Any | None = None) -> None:
+    def __init__(self, log_queue: Queue[str], original: Any | None = None) -> None:
         self.log_queue = log_queue
         self.original = original
 

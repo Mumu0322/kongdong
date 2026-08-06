@@ -41,7 +41,7 @@ from aubo_workbench.config import (
     ROBOT_CFG,
     ROBOT_CAMERA_INTEGRATION_CFG,
 )
-from aubo_workbench.io_utils import atomic_write_json, matrix_to_list, timestamp_str
+from aubo_workbench.io_utils import atomic_write_json, timestamp_str
 from aubo_workbench.motion_control import (
     AuboMotionSession,
     sdk_ok,
@@ -2153,13 +2153,6 @@ class HeightErrorExperiment:
                 )
                 # 3x3视野实验期间固定当前机械高度。PnP Z随XY位置的变化正是
                 # 待测量的视野误差，因此只记录，不在九个网格点之间闭环调高。
-                current_z = target_height
-                if False:  # 保留旧提示结构，但网格内部明确禁止视觉闭环调高。
-                    print(
-                        f"[HEIGHT-CHECK] 手动XY后PnP Z={current_z:.3f} mm，"
-                        "超出高度容差，先仅修正TCP Z。"
-                    )
-                    self.reach_height(target_height)
                 self.capture_field_position(
                     target_height, position_index, name, target_uv,
                 )

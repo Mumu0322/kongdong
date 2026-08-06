@@ -48,11 +48,6 @@ def invert_transform(T: np.ndarray) -> np.ndarray:
     return Ti
 
 
-def transform_points(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
-    return (T[:3, :3] @ pts.T).T + T[:3, 3]
-
-
 def transform_to_pose6_rzryrx(T: np.ndarray) -> tuple[float, float, float, float, float, float]:
     """仅用于输出近似 [x, y, z, rz, ry, rx]，运行时应使用 4x4 矩阵。"""
     R = np.asarray(T[:3, :3], dtype=np.float64)

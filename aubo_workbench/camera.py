@@ -210,23 +210,6 @@ def print_device_info() -> bool:
     return True
 
 
-def get_connected_camera_serials() -> list[str]:
-    """只读查询当前 Orbbec 设备序列号；查询失败时由调用方执行硬锁定。"""
-    if _ORBBEC_IMPORT_ERROR is not None:
-        raise RuntimeError(f"未能导入 pyorbbecsdk: {_ORBBEC_IMPORT_ERROR}")
-    try:
-        ctx = Context()
-        dev_list = ctx.query_devices()
-        serials: list[str] = []
-        for index in range(dev_list.get_count()):
-            serial = str(dev_list[index].get_device_info().get_serial_number()).strip()
-            if serial:
-                serials.append(serial)
-        return serials
-    except Exception as exc:
-        raise RuntimeError(format_orbbec_error_hint(exc)) from exc
-
-
 def get_depth_profile(pipeline: "Pipeline"):
     depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
     depth_profile = depth_profiles.get_default_video_stream_profile()

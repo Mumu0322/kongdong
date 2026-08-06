@@ -80,69 +80,6 @@ def pose_bracket_report(
     }
 
 
-def capture_current_sample(
-    pose_result: BoardPoseResult,
-    color_bgr: np.ndarray,
-    depth_mm: np.ndarray,
-    overlay_bgr: np.ndarray,
-    next_index: int,
-    samples: list[CalibSample],
-    source: str = "manual",
-) -> tuple[CalibSample | None, int]:
-    """单帧直接采集（不做 5 帧筛选），保留给需要手动一次性采集的场景使用。"""
-    target_transform = (
-        pose_result.T_rgb_board
-        if pose_result.calibration_frame == "rgb_camera"
-        else pose_result.T_pointcloud_board
-    )
-    if not pose_result.ok or target_transform is None:
-        print(f"[WARN] 当前 ChArUco 板位姿不可用，未采集。status={pose_result.status}")
-        return None, next_index
-    T_base_tool, robot_snapshot, pose_status = get_capture_pose_transform()
-    if T_base_tool is None:
-        print(f"[WARN] 当前机器人 TCP 位姿不可用，未采集。pose_status={pose_status}")
-        return None, next_index
-
-    ts = timestamp_str()
-    view = board_view_metadata(pose_result, color_bgr.shape)
-    capture_quality = evaluate_image_quality(color_bgr, pose_result)
-    sample = CalibSample(
-        index=next_index, timestamp=ts, T_base_tool=T_base_tool,
-        T_pointcloud_board=pose_result.T_pointcloud_board,
-        robot_snapshot=robot_snapshot or {"pose_status": pose_status},
-        board_status=pose_result.status, charuco_count=pose_result.charuco_count,
-        valid_3d_count=pose_result.valid_3d_count, corner_rmse_mm=pose_result.corner_rmse_mm,
-        corner_max_error_mm=pose_result.corner_max_error_mm, plane_rmse_mm=pose_result.plane_rmse_mm,
-        plane_inlier_count=pose_result.plane_inlier_count, board_mask_point_count=pose_result.board_mask_point_count,
-        capture_quality=asdict(capture_quality),
-        calibration_frame=pose_result.calibration_frame,
-        T_rgb_board=pose_result.T_rgb_board,
-        rgb_pnp_inlier_count=pose_result.rgb_pnp_inlier_count,
-        rgb_reprojection_rmse_px=pose_result.rgb_reprojection_rmse_px,
-        rgb_reprojection_max_px=pose_result.rgb_reprojection_max_px,
-        board_center_uv=view["board_center_uv"], image_size_wh=view["image_size_wh"],
-        view_region=view["view_region"],
-    )
-    sample = save_sample(sample, color_bgr, overlay_bgr, depth_mm)
-    samples.append(sample)
-    quality_text = (
-        f"rgb_reproj={sample.rgb_reprojection_rmse_px:.4f}px"
-        if sample.calibration_frame == "rgb_camera"
-        else f"corner_rmse={sample.corner_rmse_mm:.4f}mm, plane_rmse={sample.plane_rmse_mm:.4f}mm"
-    )
-    print(
-        f"[CAPTURE-{source.upper()}] 样本 {sample.index} OK | {quality_text} | "
-        f"robot={pose_status} | samples={len(samples)}"
-    )
-    next_index += 1
-    if len(samples) >= SOLVE_CFG.min_samples_for_solve:
-        print(
-            f"[INFO] 样本数已满足诊断求解条件，可按 h；"
-            f"E7正式验证仍需至少{E7_HAND_EYE_CFG.minimum_total_poses}组及完整证据。"
-        )
-    return sample, next_index
-
-
 def snapshot_pose_array(robot_snapshot: dict[str, Any] | None) -> np.ndarray | None:
     values = (robot_snapshot or {}).get("pose_values")
     if not isinstance(values, (list, tuple)) or len(values) < 6:

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import socket
 import sys
 import threading
 import time
@@ -162,19 +161,6 @@ def read_float(var: tk.StringVar, name: str, min_value: float | None = None) -> 
     if min_value is not None and value < min_value:
         raise ValueError(f"{name} 不能小于 {min_value}")
     return value
-
-
-def network_precheck(ip: str, port: int, timeout_s: float = 1.0) -> tuple[bool, str]:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout_s)
-    try:
-        sock.connect((ip, port))
-        local_ip, local_port = sock.getsockname()
-        return True, f"端口可达，本机出口 {local_ip}:{local_port}"
-    except OSError as exc:
-        return False, f"无法连接 {ip}:{port}，系统错误：{exc}"
-    finally:
-        sock.close()
 
 
 @dataclass
@@ -548,21 +534,6 @@ class AuboMotionPanel(ttk.Frame):
         else:
             self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    def _top_entry(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        col: int,
-        label: str,
-        var: tk.StringVar,
-        width: int,
-        show: str | None = None,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
-        ttk.Entry(parent, textvariable=var, width=width, show=show).grid(
-            row=row, column=col + 1, sticky="ew", padx=(0, 12), pady=2
-        )
-
     def _build_status(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="当前状态", padding=8)
         box.pack(fill=X, pady=(0, 8))
@@ -719,70 +690,6 @@ class AuboMotionPanel(ttk.Frame):
         if self.home_point is None:
             return "未设置"
         return f"{self.home_point.name} {self.home_point.created_at}".strip()
-
-    def network_diagnostic(self) -> None:
-        try:
-            ip, port, *_ = self.read_connection_inputs()
-        except Exception as exc:
-            messagebox.showerror("连接参数错误", str(exc))
-            return
-        ok, message = network_precheck(ip, port)
-        self.log(message)
-        (messagebox.showinfo if ok else messagebox.showerror)("网络诊断", message)
-
-    def scan_aubo_port_async(self) -> None:
-        try:
-            ip, port, *_ = self.read_connection_inputs()
-            parts = ip.split(".")
-            if len(parts) != 4:
-                raise ValueError(f"IP 格式不正确：{ip}")
-            prefix = ".".join(parts[:3]) + "."
-        except Exception as exc:
-            messagebox.showerror("连接参数错误", str(exc))
-            return
-        self.log(f"扫描 {prefix}0/24 的 TCP {port} ...")
-
-        def work() -> None:
-            found = self.scan_tcp_port(prefix, port)
-            self.after(0, lambda: self.scan_aubo_port_done(prefix, port, found))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    @staticmethod
-    def scan_tcp_port(prefix: str, port: int) -> list[str]:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        def check(host: str) -> str | None:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.25)
-            try:
-                sock.connect((host, port))
-                return host
-            except OSError:
-                return None
-            finally:
-                sock.close()
-
-        found: list[str] = []
-        with ThreadPoolExecutor(max_workers=80) as executor:
-            futures = [executor.submit(check, prefix + str(i)) for i in range(1, 255)]
-            for future in as_completed(futures):
-                host = future.result()
-                if host:
-                    found.append(host)
-        return sorted(found, key=lambda text: int(text.rsplit(".", 1)[1]))
-
-    def scan_aubo_port_done(self, prefix: str, port: int, found: list[str]) -> None:
-        if not found:
-            self.log(f"扫描完成：{prefix}0/24 没有发现 TCP {port}。")
-            messagebox.showwarning("扫描完成", f"{prefix}0/24 没有发现 TCP {port}。")
-            return
-        self.log("扫描完成：" + ", ".join(f"{host}:{port}" for host in found))
-        if len(found) == 1:
-            self.ip_var.set(found[0])
-            messagebox.showinfo("扫描完成", f"发现一个 AUBO 端口，已填入 IP：{found[0]}")
-        else:
-            messagebox.showinfo("扫描完成", "发现多个开放端口：\n" + "\n".join(found))
 
     def read_connection_inputs(self) -> tuple[str, int, str, str, int]:
         ip = self.ip_var.get().strip()

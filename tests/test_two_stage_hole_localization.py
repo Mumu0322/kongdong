@@ -22,16 +22,6 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.R_down = np.diag([1.0, -1.0, -1.0])
         self.intrinsics = CameraIntrinsics(1280, 720, 800.0, 800.0, 640.0, 360.0, ())
 
-    def test_plan_centered_pose_is_normal_to_hole_plane(self) -> None:
-        reference = make_transform(np.eye(3), np.zeros(3))
-        target = module.plan_centered_tcp_pose(
-            np.array([10.0, 20.0, 500.0]), np.array([0.0, 0.0, -1.0]),
-            reference, self.T_tcp_camera, 340.0,
-        )
-        self.assertTrue(np.allclose(target[:3, 3], [10.0, 20.0, 160.0]))
-        self.assertTrue(np.allclose(target[:3, 2], [0.0, 0.0, 1.0]))
-        self.assertAlmostEqual(np.linalg.det(target[:3, :3]), 1.0, places=8)
-
     def test_base_z_target_changes_only_base_z(self) -> None:
         current = make_transform(self.R_down, np.array([0.0, 0.0, 340.0]))
         target, measured = module.base_z_target_for_camera_height(
@@ -337,6 +327,8 @@ class TwoStageGeometryTests(unittest.TestCase):
         parser = module.build_parser()
         self.assertTrue(parser.parse_args([]).allow_experimental_handeye)
         self.assertFalse(parser.parse_args(["--require-validated-handeye"]).allow_experimental_handeye)
+        self.assertEqual(parser.parse_args([]).final_target_mode, "gripper")
+        self.assertEqual(parser.parse_args(["--final-target-mode", "normal"]).final_target_mode, "normal")
         self.assertIsNone(parser.parse_args([]).tcp_xy_offset_mm)
         self.assertEqual(tuple(parser.parse_args(["--tcp-xy-offset-mm", "0", "0"]).tcp_xy_offset_mm), (0.0, 0.0))
         self.assertAlmostEqual(parser.parse_args([]).speed_m_s, 0.08)

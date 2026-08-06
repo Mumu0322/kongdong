@@ -57,7 +57,7 @@ class AutomaticMultiViewPlanTests(unittest.TestCase):
         )
         self.assertAlmostEqual(estimated, expected_range)
 
-    def test_rgb_depth_diameter_identifies_65_mm_candidate(self):
+    def test_rgb_depth_diameter_estimates_65_mm(self):
         depth_mm = 434.0
         diameter_mm = 65.0
         diameter_px = _Intrinsics.fx * diameter_mm / depth_mm
@@ -65,7 +65,6 @@ class AutomaticMultiViewPlanTests(unittest.TestCase):
             np.array([diameter_px, diameter_px]), _Intrinsics(), depth_mm,
         )
         self.assertAlmostEqual(estimated, diameter_mm)
-        self.assertEqual(diagnostic.nearest_hole_diameter_candidate(estimated), 65.0)
 
     def test_multiview_summary_ignores_skipped_view_values(self):
         records = [

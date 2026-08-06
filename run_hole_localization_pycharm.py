@@ -5,8 +5,8 @@
 与 run_yolo_eye_in_hand_optimized.py 放在同一目录。
 修改下方配置后直接 Run，不需要填写命令行。
 
-默认 EXECUTE_MOTION=False，只生成运动预览。
-即使打开运动，主脚本仍会逐步要求输入 m 确认。
+默认关闭真实运动，只生成运动预览。
+启用真实运动前还必须显式确认工作空间安全。
 """
 
 from __future__ import annotations
@@ -30,8 +30,6 @@ COARSE_HEIGHT_MM = 340.0
 FINE_HEIGHT_MM = 260.0
 COARSE_FRAMES = 15
 FINE_FRAMES = 30
-# 默认三孔定位：窗口中需要依次点击三个孔。
-HOLE_COUNT = 3
 YOLO_CONFIDENCE = 0.35
 
 # 运动配置。默认关闭。
@@ -45,9 +43,9 @@ I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE = False
 SPEED_M_S = 0.02
 ACC_M_S2 = 0.06
 
-# 临时诊断偏置，正常应保持0,0。
+# 临时诊断偏置；None 表示使用正式 ChArUco XY 模型。
 # 工具尖端不等于TCP时，应标定T_tcp_tool，不应长期依赖这里。
-TCP_XY_OFFSET_MM = (0.0, 0.0)
+TCP_XY_OFFSET_MM: tuple[float, float] | None = None
 
 
 # ============================================================================
@@ -74,34 +72,34 @@ def build_arguments() -> list[str]:
         "--confidence", str(YOLO_CONFIDENCE),
         "--speed-m-s", str(SPEED_M_S),
         "--acc-m-s2", str(ACC_M_S2),
-        "--tcp-xy-offset-mm", str(TCP_XY_OFFSET_MM[0]), str(TCP_XY_OFFSET_MM[1]),
+        "--two-stage-hole-localization" if TWO_STAGE_MODE else "--single-stage",
+        "--execute" if EXECUTE_MOTION else "--no-execute",
+        "--allow-experimental-handeye"
+        if ALLOW_EXPERIMENTAL_HANDEYE else "--require-validated-handeye",
+        "--move-final-xy" if MOVE_FINAL_XY else "--no-move-final-xy",
     ]
+
+    if TCP_XY_OFFSET_MM is not None:
+        args.extend([
+            "--tcp-xy-offset-mm", str(TCP_XY_OFFSET_MM[0]), str(TCP_XY_OFFSET_MM[1]),
+        ])
 
     if TWO_STAGE_MODE:
         args.extend([
-            "--two-stage-hole-localization",
             "--coarse-height-mm", str(COARSE_HEIGHT_MM),
             "--fine-height-mm", str(FINE_HEIGHT_MM),
             "--coarse-frames", str(COARSE_FRAMES),
             "--fine-frames", str(FINE_FRAMES),
-            "--hole-count", str(HOLE_COUNT),
         ])
 
-    if EXECUTE_MOTION:
-        if not I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE:
-            raise RuntimeError(
-                "EXECUTE_MOTION=True，但尚未将 "
-                "I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE 设为 True"
-            )
-        args.append("--execute")
+    if EXECUTE_MOTION and not I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE:
+        raise RuntimeError(
+            "EXECUTE_MOTION=True，但尚未将 "
+            "I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE 设为 True"
+        )
 
-    if ALLOW_EXPERIMENTAL_HANDEYE:
-        args.append("--allow-experimental-handeye")
-
-    if MOVE_FINAL_XY:
-        if not EXECUTE_MOTION:
-            raise RuntimeError("MOVE_FINAL_XY=True 时必须同时启用 EXECUTE_MOTION")
-        args.append("--move-final-xy")
+    if MOVE_FINAL_XY and not EXECUTE_MOTION:
+        raise RuntimeError("MOVE_FINAL_XY=True 时必须同时启用 EXECUTE_MOTION")
 
     return args
 

@@ -15,7 +15,6 @@ import csv
 import json
 import math
 import sys
-import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -627,8 +626,6 @@ def _make_cfg(args: Any) -> Any:
         fine_height_mm=float(args.fine_height_mm),
         coarse_frames=int(args.coarse_frames),
         fine_frames=int(args.fine_frames),
-        preliminary_coarse_frames=int(args.preliminary_coarse_frames),
-        multi_fine_extra_frames=int(args.fine_extra_frames),
         fine_settle_discard_frames=int(args.fine_settle_discard_frames),
         fine_retry_count=int(args.fine_retries),
     )

@@ -518,17 +518,6 @@ class TcpTeachPanel(ttk.Frame):
         self.set_connection_ui(True)
         self.log(f"连接成功: {robot_name}")
 
-    def network_diagnostic(self) -> None:
-        try:
-            ip = self.ip_var.get().strip()
-            port = int(self.port_var.get().strip())
-        except ValueError:
-            messagebox.showerror("网络诊断", "端口必须是数字")
-            return
-        ok, message = self.session.network_precheck(ip, port)
-        self.log(("网络诊断通过: " if ok else "网络诊断失败: ") + message.replace("\n", " "))
-        (messagebox.showinfo if ok else messagebox.showerror)("网络诊断", message)
-
     def start_polling(self) -> None:
         if self.poll_after_id is None:
             self.poll_after_id = self.after(1000, self.poll_robot)

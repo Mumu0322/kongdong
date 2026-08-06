@@ -51,14 +51,6 @@ def _at_most(value, maximum: float) -> bool:
     return math.isfinite(numeric) and 0.0 <= numeric <= float(maximum)
 
 
-def _positive(value) -> bool:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(numeric) and numeric > 0.0
-
-
 def _string(data: dict, key: str) -> bool:
     return bool(str(data.get(key) or "").strip())
 
@@ -75,17 +67,6 @@ def _int_list(value) -> list[int] | None:
 
 def _sha256(value) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "").strip()))
-
-
-def _same_transform(left, right) -> bool:
-    try:
-        return all(
-            math.isclose(float(left[row][column]), float(right[row][column]), rel_tol=0.0, abs_tol=1e-9)
-            for row in range(4)
-            for column in range(4)
-        )
-    except (IndexError, TypeError, ValueError):
-        return False
 
 
 def _pose_coverage_valid(report, pose_count: int) -> bool:
@@ -273,59 +254,4 @@ def assess_handeye_cross_validation(
     return _evidence_result(
         checks, "handeye_cross_validation_not_ready", path, error,
         "求解器内部残差或毫米级一致性不能替代固定板20%独立姿态交叉验证。",
-    )
-
-
-def assess_tcp_payload_validation(
-    payload: dict | None = None,
-    cfg: RobotCameraIntegrationConfig | None = None,
-) -> dict:
-    cfg = cfg or ROBOT_CAMERA_INTEGRATION_CFG
-    path = Path(cfg.tcp_payload_validation_evidence_path).resolve()
-    error = None
-    if payload is None:
-        payload, error = _read_json(path)
-    data = payload or {}
-    cog = data.get("payload_center_of_gravity_mm")
-    try:
-        cog_numbers = [float(item) for item in cog]
-    except (TypeError, ValueError):
-        cog_numbers = []
-    cog_valid = len(cog_numbers) == 3 and all(
-        math.isfinite(item) and abs(item) <= 10000.0 for item in cog_numbers
-    )
-    eccentricity_ok = (
-        _at_most(data.get("grip_eccentricity_p95_mm"), 0.05)
-        or data.get("grip_eccentricity_compensated_and_revalidated") is True
-    )
-    checks = {
-        "evidence_available": payload is not None,
-        "record_type_valid": data.get("record_type") == "e8_tcp_payload_validation",
-        "not_template": data.get("template_only") is False,
-        "marked_validated": data.get("validated") is True,
-        "robot_identified": _string(data, "robot_id"),
-        "tool_identified": _string(data, "tool_id"),
-        "calibration_identified": _string(data, "calibration_id"),
-        "independent_verifier_identified": _string(data, "verified_by"),
-        "raw_data_integrity_recorded": _string(data, "raw_data_sha256"),
-        "minimum_30_repeatability_trials": _at_least(
-            data.get("robot_repeatability_trial_count"), 30,
-        ),
-        "robot_repeatability_within_0_05_mm": _at_most(
-            data.get("robot_repeatability_p95_mm"), 0.05,
-        ),
-        "tcp_residual_within_0_05_mm": _at_most(
-            data.get("tcp_residual_rms_mm"), 0.05,
-        ),
-        "minimum_3_approach_directions": _at_least(
-            data.get("approach_direction_count"), 3,
-        ),
-        "payload_mass_measured": _positive(data.get("payload_mass_kg")),
-        "payload_center_of_gravity_recorded": cog_valid,
-        "payload_applied_to_robot": data.get("payload_applied_to_robot") is True,
-        "grip_eccentricity_controlled": eccentricity_ok,
-    }
-    return _evidence_result(
-        checks, "tcp_payload_validation_not_ready", path, error,
-        "空载标称重复定位不能替代相机支架、吸嘴和等效镜片实际负载下的E8量测。",
     )

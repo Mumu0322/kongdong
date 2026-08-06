@@ -121,7 +121,7 @@ def xyz_rpy_pose(T: np.ndarray) -> dict[str, Any]:
 def target_pose_with_fixed_rz(T_base_measured: np.ndarray, fixed_rz_rad: float) -> dict[str, Any]:
     """保持测量 XYZ/Rx/Ry，仅将基坐标目标姿态的 Rz 锁定为给定弧度值。"""
     measured = xyz_rpy_pose(T_base_measured)
-    rx, ry, _measured_rz = [float(v) for v in measured["rpy_rad_zyx"]]
+    rx, ry, _ = [float(v) for v in measured["rpy_rad_zyx"]]
     rz = float(fixed_rz_rad)
     if not math.isfinite(rz):
         raise ValueError("fixed_rz_rad 必须是有限数值")
@@ -490,8 +490,6 @@ def run_live(args: argparse.Namespace) -> int:
 
     pipeline = None
     records: list[dict[str, Any]] = []
-    latest_result = None
-    latest_bundle = None
     mouse_click: list[tuple[int, int] | None] = [None]
     board, dictionary = create_charuco_board()
     selected_id = int(args.corner_id) if args.corner_id is not None else _default_corner_id(board)
@@ -521,7 +519,6 @@ def run_live(args: argparse.Namespace) -> int:
             if bundle is None:
                 continue
             result = estimate_rgb_board_pose(bundle.color_bgr, bundle.intrinsics, board, dictionary)
-            latest_result, latest_bundle = result, bundle
             if mouse_click[0] is not None:
                 chosen = nearest_detected_corner(
                     mouse_click[0], result.used_corner_ids, result.image_points,

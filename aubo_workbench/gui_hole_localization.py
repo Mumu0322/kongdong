@@ -63,6 +63,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=True)
         self.final_xy_var = tk.BooleanVar(value=True)
+        self.final_target_mode_var = tk.StringVar(value="机械爪模式")
         self.include_final_motion_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="待开始：默认仅预览，不会下发机器人运动")
         self.motion_var = tk.StringVar(value="无待确认运动")
@@ -131,6 +132,14 @@ class HoleLocalizationPanel(ttk.Frame):
 
         switches = ttk.Frame(config)
         switches.grid(row=6, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        ttk.Label(switches, text="最终点模式").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            switches,
+            textvariable=self.final_target_mode_var,
+            values=("机械爪模式", "平常模式"),
+            state="readonly",
+            width=13,
+        ).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="真实运动（未勾选时仅预览）", variable=self.execute_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="允许当前实验手眼结果", variable=self.experimental_var).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(switches, text="精定位后执行 TCP XY → 基坐标 Z → +Y 0.2 mm", variable=self.final_xy_var).pack(side=tk.LEFT)
@@ -276,6 +285,13 @@ class HoleLocalizationPanel(ttk.Frame):
             if self.include_final_motion_var.get():
                 command.append("--include-final-motion")
         else:
+            final_mode = {
+                "机械爪模式": "gripper",
+                "平常模式": "normal",
+            }.get(self.final_target_mode_var.get())
+            if final_mode is None:
+                raise ValueError("最终点模式必须选择“机械爪模式”或“平常模式”")
+            command.extend(["--final-target-mode", final_mode])
             command.append("--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy")
         return command
 

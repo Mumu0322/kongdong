@@ -36,8 +36,8 @@ from aubo_workbench.charuco_point_experiment import (
     load_handeye_experiment_result,
     nearest_detected_corner,
 )
-from aubo_workbench.config import BOARD_CFG, ROBOT_CFG
-from aubo_workbench.geometry import average_transforms, make_transform
+from aubo_workbench.config import ROBOT_CFG
+from aubo_workbench.geometry import average_transforms
 from aubo_workbench.motion_control import AuboMotionSession, sdk_ok
 from aubo_workbench.robot import AuboPoseSession
 

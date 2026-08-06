@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from .config import BOARD_CFG, CAMERA_CFG
-from .drawing import draw_text_panel, draw_unicode_text
+from .drawing import draw_text_panel
 from .geometry import make_transform
 from .camera import CameraIntrinsics
 

@@ -66,45 +66,6 @@ def build_ui_lines(quality: ImageQualityResult, sample_count: int) -> dict[str, 
     return {"status": status, "metrics": metrics, "reasons": reasons, "advice": advice}
 
 
-def draw_quality_dashboard(
-    img: np.ndarray, quality: ImageQualityResult, burst_saved_count: int,
-    auto_enabled: bool, cooldown_left_s: float, sample_count: int,
-) -> None:
-    """轻量叠加版看板，用于保存到磁盘的样本预览图。"""
-    del auto_enabled, cooldown_left_s
-    h, w = img.shape[:2]
-    panel_w = min(760, w - 24)
-    panel_h = 132
-    x0 = 12
-    y0 = max(12, h - panel_h - 14)
-
-    panel = img.copy()
-    cv2.rectangle(panel, (x0, y0), (x0 + panel_w, y0 + panel_h), (20, 24, 28), -1)
-    cv2.addWeighted(panel, 0.68, img, 0.32, 0, dst=img)
-    cv2.rectangle(img, (x0, y0), (x0 + panel_w, y0 + panel_h), (90, 96, 105), 1)
-
-    status_color = quality_status_color(quality)
-    draw_unicode_text(img, f"质量 {quality.score:5.1f}/100 | {quality.label} | 样本 {sample_count}", (x0 + 14, y0 + 30), status_color, 22, 1)
-    draw_unicode_text(
-        img, f"采集进度 {burst_saved_count}/{AUTO_CAPTURE_CFG.manual_burst_frames} | c 采集 | h 诊断 | v E7验证 | q 退出",
-        (x0 + 14, y0 + 58), (255, 255, 255), 17, 1,
-    )
-
-    bx, by, bar_w, bar_h = x0 + 16, y0 + 90, 112, 13
-    draw_metric_bar(img, bx, by, bar_w, bar_h, "角点数", f"{quality.charuco_count}",
-                     score_at_least(quality.charuco_count, AUTO_CAPTURE_CFG.min_charuco_corners, BOARD_CFG.min_charuco_corners))
-    if quality.calibration_frame == "rgb_camera":
-        draw_metric_bar(img, bx + 240, by, bar_w, bar_h, "PnP内点", f"{quality.rgb_pnp_inlier_count}",
-                         score_at_least(quality.rgb_pnp_inlier_count, AUTO_CAPTURE_CFG.min_rgb_pnp_inliers, BOARD_CFG.min_charuco_corners))
-        draw_metric_bar(img, bx + 480, by, bar_w, bar_h, "重投影", f"{quality.rgb_reprojection_rmse_px:.2f}px",
-                         score_at_most(quality.rgb_reprojection_rmse_px, AUTO_CAPTURE_CFG.max_rgb_reprojection_rmse_px, AUTO_CAPTURE_CFG.max_rgb_reprojection_rmse_px * 2.5))
-    else:
-        draw_metric_bar(img, bx + 240, by, bar_w, bar_h, "有效3D", f"{quality.valid_3d_count}",
-                         score_at_least(quality.valid_3d_count, AUTO_CAPTURE_CFG.min_valid_3d_corners, BOARD_CFG.min_valid_3d_corners))
-        draw_metric_bar(img, bx + 480, by, bar_w, bar_h, "平面", f"{quality.plane_rmse_mm:.2f}mm",
-                         score_at_most(quality.plane_rmse_mm, AUTO_CAPTURE_CFG.max_plane_rmse_mm, BOARD_CFG.max_plane_rmse_mm))
-
-
 def draw_side_panel(
     canvas: np.ndarray, x: int, y: int, w: int, h: int,
     quality: ImageQualityResult, sample_count: int, burst_count: int,
