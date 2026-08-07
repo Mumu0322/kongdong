@@ -1,0 +1,26 @@
+{
+  "record_type": "e8_tcp_payload_validation",
+  "template_only": true,
+  "validated": false,
+  "do_not_use_for_motion": true,
+  "robot_id": "",
+  "tool_id": "",
+  "calibration_id": "",
+  "verified_by": "",
+  "raw_data_sha256": "",
+  "robot_repeatability_trial_count": 0,
+  "robot_repeatability_p95_mm": null,
+  "tcp_residual_rms_mm": null,
+  "approach_direction_count": 0,
+  "payload_mass_kg": null,
+  "payload_center_of_gravity_mm": null,
+  "payload_applied_to_robot": false,
+  "grip_eccentricity_p95_mm": null,
+  "grip_eccentricity_compensated_and_revalidated": false,
+  "limits": {
+    "minimum_repeatability_trials": 30,
+    "maximum_robot_repeatability_p95_mm": 0.05,
+    "maximum_tcp_residual_rms_mm": 0.05,
+    "minimum_approach_directions": 3
+  }
+}

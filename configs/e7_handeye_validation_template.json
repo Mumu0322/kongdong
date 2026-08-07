@@ -1,0 +1,51 @@
+{
+  "record_type": "e7_handeye_cross_validation",
+  "template_only": true,
+  "validated": false,
+  "do_not_use_for_motion": true,
+  "production_eligible": false,
+  "camera_serial": "CP4B85P001L",
+  "robot_id": "",
+  "camera_mount_id": "",
+  "calibration_id": "",
+  "verified_by": "",
+  "raw_data_sha256": "",
+  "raw_data_manifest": {
+    "algorithm": "sha256",
+    "raw_data_sha256": "",
+    "files": [],
+    "missing_files": [],
+    "complete": false
+  },
+  "fixed_board_during_validation": false,
+  "total_pose_count": 0,
+  "calibration_pose_count": 0,
+  "validation_pose_count": 0,
+  "split_assignment_before_fit": false,
+  "split_assignment_uses_measurement_residuals": null,
+  "validation_poses_excluded_from_fit": false,
+  "view_center_and_edges_covered": false,
+  "pose_source": "",
+  "calibration_sample_indices": [],
+  "validation_sample_indices": [],
+  "validation_pose_results": [],
+  "calibration_pose_coverage": null,
+  "validation_pose_coverage": null,
+  "calibration_frame": "rgb_camera",
+  "rgb_coordinate_convention": "opencv_optical_x_right_y_down_z_forward",
+  "T_tcp_rgb_camera": null,
+  "T_base_board_reference_from_calibration": null,
+  "validation_reference_source": "",
+  "validation_center_scatter_rms_mm": null,
+  "validation_center_scatter_p95_mm": null,
+  "solver": {
+    "measurement_source": "charuco_rgb_2d_corners_plus_intrinsics_solvepnp",
+    "depth_based_board_pose_used": false,
+    "rgb_pnp_board_pose_used": true
+  },
+  "limits": {
+    "minimum_total_poses": 30,
+    "minimum_validation_fraction": 0.2,
+    "maximum_validation_center_scatter_rms_mm": 0.1
+  }
+}
