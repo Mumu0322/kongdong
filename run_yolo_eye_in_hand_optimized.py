@@ -46,13 +46,32 @@ from aubo_workbench.config import (  # noqa: E402
     apply_robot_connection_overrides,
 )
 from aubo_workbench.io_utils import jsonable, write_dict_rows  # noqa: E402
+from aubo_workbench.fitting import fit_plane, fit_sphere  # noqa: E402
 from aubo_workbench.geometry import (  # noqa: E402
+    angle_between_deg,
     invert_transform,
     make_transform,
+    matrix_to_rpy_zyx,
     rotx,
     roty,
     rotz,
     transform_to_pose6_rzryrx,
+    transform_to_sdk_pose_m_rad,
+    unit_vector,
+)
+from aubo_workbench.optics import (  # noqa: E402
+    base_z_target_for_camera_height,
+    camera_height_to_plane_mm,
+    camera_matrix,
+    camera_ray,
+    camera_transform,
+    correct_projected_circle_center,
+    distortion_coeffs,
+    pixel_to_base_plane,
+    plane_basis,
+    project_undistorted_pixels,
+    ray_plane_intersection,
+    undistort_pixels,
 )
 from aubo_workbench.paths import (  # noqa: E402
     CAD_MODEL_PATH,
@@ -352,68 +371,6 @@ def detect(model: Any, image: np.ndarray, confidence: float) -> list[dict[str, A
     return output
 
 
-def fit_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
-    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    points = points[np.isfinite(points).all(axis=1)]
-    if len(points) < 12:
-        raise ValueError("孔周围有效深度点不足，无法拟合平面")
-    center = np.median(points, axis=0)
-    _, _, vh = np.linalg.svd(points - center, full_matrices=False)
-    normal = vh[-1]
-    if normal[2] > 0:
-        normal = -normal
-    residual = np.abs((points - center) @ normal)
-    keep = residual <= max(1.0, float(np.percentile(residual, 85)) * 2.5)
-    if keep.sum() >= 12:
-        inliers = points[keep]
-        center = np.mean(inliers, axis=0)
-        _, _, vh = np.linalg.svd(inliers - center, full_matrices=False)
-        normal = vh[-1]
-        if normal[2] > 0:
-            normal = -normal
-        # 用剔除外点后的最终平面重新计算残差；否则 rmse 对应的是第一轮
-        # (未剔除外点的) 平面，和实际返回的 normal/center 不一致，会让
-        # plane_rmse_mm 质量门形同虚设。
-        residual = np.abs((inliers - center) @ normal)
-    else:
-        residual = residual[keep]
-    return normal / np.linalg.norm(normal), float(np.sqrt(np.mean(residual ** 2)))
-
-
-def fit_sphere(points: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """鲁棒拟合未知半径球面，返回球心、半径和径向RMSE。"""
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    pts = pts[np.isfinite(pts).all(axis=1)]
-    if len(pts) < 20:
-        raise ValueError("球面拟合有效深度点不足")
-    origin = np.median(pts, axis=0)
-    active = np.ones(len(pts), dtype=bool)
-    center = radius = None
-    for _ in range(5):
-        work = pts[active]
-        q = work - origin
-        A = np.column_stack((2.0 * q, np.ones(len(q))))
-        b = np.sum(q * q, axis=1)
-        solution, *_ = np.linalg.lstsq(A, b, rcond=None)
-        center_local = solution[:3]
-        radius_sq = float(solution[3] + center_local @ center_local)
-        if not math.isfinite(radius_sq) or radius_sq <= 0.0:
-            raise ValueError("球面半径估计无效")
-        center = origin + center_local
-        radius = math.sqrt(radius_sq)
-        residual = np.abs(np.linalg.norm(pts - center, axis=1) - radius)
-        median = float(np.median(residual))
-        mad = float(np.median(np.abs(residual - median)))
-        threshold = max(2.0, median + 4.0 * 1.4826 * max(mad, 1e-6))
-        new_active = residual <= threshold
-        if new_active.sum() < 20 or np.array_equal(new_active, active):
-            active = new_active if new_active.sum() >= 20 else active
-            break
-        active = new_active
-    if center is None or radius is None:
-        raise ValueError("球面拟合失败")
-    final_residual = np.linalg.norm(pts[active] - center, axis=1) - radius
-    return center, float(radius), float(np.sqrt(np.mean(final_residual ** 2)))
 
 
 def hole_camera_point(
@@ -597,240 +554,15 @@ def _load_intrinsics(path: Path) -> Any:
                             tuple(data.get("distortion", [])))
 
 
-def _unit(vec: np.ndarray, label: str = "vector") -> np.ndarray:
-    vec = np.asarray(vec, dtype=np.float64).reshape(3)
-    length = float(np.linalg.norm(vec))
-    if not np.isfinite(length) or length < 1e-9:
-        raise ValueError(f"{label} 无法归一化")
-    return vec / length
-
-
-def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
-    return float(math.degrees(math.acos(np.clip(float(_unit(a) @ _unit(b)), -1.0, 1.0))))
-
-
-def _matrix_to_rpy_zyx(R: np.ndarray) -> np.ndarray:
-    """AUBO 使用的 [rx, ry, rz]（Rz @ Ry @ Rx）逆变换。"""
-    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-    sy = float(-R[2, 0])
-    ry = math.asin(float(np.clip(sy, -1.0, 1.0)))
-    cy = math.cos(ry)
-    if abs(cy) > 1e-7:
-        rx = math.atan2(float(R[2, 1]), float(R[2, 2]))
-        rz = math.atan2(float(R[1, 0]), float(R[0, 0]))
-    else:
-        rx = math.atan2(float(-R[1, 2]), float(R[1, 1]))
-        rz = 0.0
-    return np.array([rx, ry, rz], dtype=np.float64)
-
-
-def transform_to_sdk_pose_m_rad(T_base_tcp: np.ndarray) -> list[float]:
-    T_base_tcp = np.asarray(T_base_tcp, dtype=np.float64).reshape(4, 4)
-    return ((T_base_tcp[:3, 3] / 1000.0).tolist()
-            + _matrix_to_rpy_zyx(T_base_tcp[:3, :3]).tolist())
-
-
-def camera_transform(T_base_tcp: np.ndarray, T_tcp_camera: np.ndarray) -> np.ndarray:
-    return np.asarray(T_base_tcp, dtype=np.float64) @ np.asarray(T_tcp_camera, dtype=np.float64)
-
-
-def _camera_matrix(intrinsics: Any) -> np.ndarray:
-    return np.asarray(
-        [[intrinsics.fx, 0.0, intrinsics.cx],
-         [0.0, intrinsics.fy, intrinsics.cy],
-         [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-
-
-def _distortion(intrinsics: Any) -> np.ndarray:
-    values = np.asarray(getattr(intrinsics, "distortion", ()), dtype=np.float64).reshape(-1)
-    if values.size == 0 or not np.isfinite(values).all():
-        return np.zeros(0, dtype=np.float64)
-    return values
-
-
-def undistort_pixels(intrinsics: Any, points_px: np.ndarray, *, pixel_output: bool = True) -> np.ndarray:
-    """把原始畸变像素转换成去畸变像素或归一化坐标。"""
-    points = np.asarray(points_px, dtype=np.float64).reshape(-1, 1, 2)
-    distortion = _distortion(intrinsics)
-    if distortion.size == 0 or not np.any(np.abs(distortion) > 1e-12):
-        if pixel_output:
-            return points.reshape(-1, 2)
-        K = _camera_matrix(intrinsics)
-        flat = points.reshape(-1, 2)
-        return np.column_stack(((flat[:, 0] - K[0, 2]) / K[0, 0],
-                                (flat[:, 1] - K[1, 2]) / K[1, 1]))
-    P = _camera_matrix(intrinsics) if pixel_output else None
-    result = cv2.undistortPoints(points, _camera_matrix(intrinsics), distortion.reshape(1, -1), P=P)
-    return result.reshape(-1, 2)
-
-
-def camera_ray(intrinsics: Any, center_px: np.ndarray, *, already_undistorted: bool = False) -> np.ndarray:
-    u, v = np.asarray(center_px, dtype=np.float64).reshape(2)
-    if already_undistorted:
-        x = (u - intrinsics.cx) / intrinsics.fx
-        y = (v - intrinsics.cy) / intrinsics.fy
-    else:
-        x, y = undistort_pixels(intrinsics, np.asarray([[u, v]]), pixel_output=False)[0]
-    return _unit(np.array([x, y, 1.0], dtype=np.float64), "pixel ray")
-
-
-def ray_plane_intersection(ray_origin: np.ndarray, ray_direction: np.ndarray,
-                           plane_point: np.ndarray, plane_normal: np.ndarray) -> np.ndarray:
-    denom = float(np.asarray(plane_normal) @ np.asarray(ray_direction))
-    if abs(denom) < 1e-8:
-        raise ValueError("相机光线与孔面近乎平行")
-    scale = float(np.asarray(plane_normal) @ (np.asarray(plane_point) - np.asarray(ray_origin))) / denom
-    if not math.isfinite(scale) or scale <= 0.0:
-        raise ValueError("孔面位于相机光线反向，拒绝计算")
-    return np.asarray(ray_origin, dtype=np.float64) + scale * np.asarray(ray_direction, dtype=np.float64)
-
-
-def pixel_to_base_plane(center_px: np.ndarray, intrinsics: Any, T_base_tcp: np.ndarray,
-                        T_tcp_camera: np.ndarray, plane_point_base: np.ndarray,
-                        plane_normal_base: np.ndarray, *, center_is_undistorted: bool = False) -> np.ndarray:
-    T_base_camera = camera_transform(T_base_tcp, T_tcp_camera)
-    return ray_plane_intersection(
-        T_base_camera[:3, 3],
-        T_base_camera[:3, :3] @ camera_ray(
-            intrinsics, center_px, already_undistorted=center_is_undistorted,
-        ),
-        plane_point_base,
-        plane_normal_base,
-    )
-
-
-def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    n = _unit(normal, "circle plane normal")
-    hint = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    if abs(float(hint @ n)) > 0.9:
-        hint = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    axis_x = _unit(hint - n * float(hint @ n), "circle plane x")
-    axis_y = _unit(np.cross(n, axis_x), "circle plane y")
-    return axis_x, axis_y
-
-
-def _project_undistorted_pixels(points_camera_mm: np.ndarray, intrinsics: Any) -> np.ndarray:
-    points = np.asarray(points_camera_mm, dtype=np.float64).reshape(-1, 3)
-    if np.any(points[:, 2] <= 1e-6):
-        raise ValueError("圆轮廓投影中存在相机后方点")
-    return np.column_stack((
-        intrinsics.fx * points[:, 0] / points[:, 2] + intrinsics.cx,
-        intrinsics.fy * points[:, 1] / points[:, 2] + intrinsics.cy,
-    ))
-
-
-def correct_projected_circle_center(
-    observed_ellipse_center_px: np.ndarray,
-    intrinsics: Any,
-    T_base_tcp: np.ndarray,
-    T_tcp_camera: np.ndarray,
-    plane_point_base: np.ndarray,
-    plane_normal_base: np.ndarray,
-    diameter_mm: float,
-    *,
-    iterations: int = 4,
-    samples: int = 240,
-    max_correction_mm: float = 3.0,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """从投影椭圆中心反解真实圆心。
-
-    不使用小角度近似。每次迭代在当前候选圆心处生成已知半径的三维圆，
-    投影后拟合椭圆，计算“投影圆心→椭圆几何中心”的偏差并反向修正。
-    输入中心必须是去畸变像素坐标。
-    """
-    if not math.isfinite(diameter_mm) or diameter_mm <= 0.0:
-        raise ValueError("孔径必须是正数")
-    if samples < 24:
-        raise ValueError("tilt correction samples 不能小于24")
-
-    T_base_camera = camera_transform(T_base_tcp, T_tcp_camera)
-    R_base_camera = T_base_camera[:3, :3]
-    t_base_camera = T_base_camera[:3, 3]
-    R_camera_base = R_base_camera.T
-    plane_point_camera = R_camera_base @ (np.asarray(plane_point_base, dtype=np.float64) - t_base_camera)
-    plane_normal_camera = _unit(R_camera_base @ np.asarray(plane_normal_base, dtype=np.float64), "camera plane normal")
-
-    observed = np.asarray(observed_ellipse_center_px, dtype=np.float64).reshape(2)
-    candidate = ray_plane_intersection(
-        np.zeros(3, dtype=np.float64),
-        camera_ray(intrinsics, observed, already_undistorted=True),
-        plane_point_camera,
-        plane_normal_camera,
-    )
-    naive_camera = candidate.copy()
-    radius = float(diameter_mm) / 2.0
-    axis_x, axis_y = _plane_basis(plane_normal_camera)
-    theta = np.linspace(0.0, 2.0 * math.pi, int(samples), endpoint=False)
-    final_bias_px = np.zeros(2, dtype=np.float64)
-
-    for _ in range(max(1, int(iterations))):
-        circle = (
-            candidate[None, :]
-            + radius * np.cos(theta)[:, None] * axis_x[None, :]
-            + radius * np.sin(theta)[:, None] * axis_y[None, :]
-        )
-        projected = _project_undistorted_pixels(circle, intrinsics)
-        ellipse = cv2.fitEllipse(projected.astype(np.float32).reshape(-1, 1, 2))
-        projected_ellipse_center = np.asarray(ellipse[0], dtype=np.float64)
-        projected_circle_center = _project_undistorted_pixels(candidate.reshape(1, 3), intrinsics)[0]
-        final_bias_px = projected_ellipse_center - projected_circle_center
-        corrected_center_px = observed - final_bias_px
-        updated = ray_plane_intersection(
-            np.zeros(3, dtype=np.float64),
-            camera_ray(intrinsics, corrected_center_px, already_undistorted=True),
-            plane_point_camera,
-            plane_normal_camera,
-        )
-        if float(np.linalg.norm(updated - candidate)) < 1e-6:
-            candidate = updated
-            break
-        candidate = updated
-
-    correction_camera = candidate - naive_camera
-    correction_norm = float(np.linalg.norm(correction_camera))
-    if correction_norm > float(max_correction_mm):
-        raise RuntimeError(
-            f"倾斜圆心修正过大：{correction_norm:.3f} mm > {max_correction_mm:.3f} mm，"
-            "拒绝使用，需检查法向、孔径或轮廓"
-        )
-
-    naive_base = R_base_camera @ naive_camera + t_base_camera
-    corrected_base = R_base_camera @ candidate + t_base_camera
-    tilt_deg = float(math.degrees(math.acos(np.clip(abs(float(plane_normal_camera[2])), 0.0, 1.0))))
-    return corrected_base, {
-        "method": "iterative_projected_circle_center",
-        "diameter_mm": float(diameter_mm),
-        "tilt_deg": tilt_deg,
-        "ellipse_center_bias_px": final_bias_px.tolist(),
-        "correction_camera_mm": correction_camera.tolist(),
-        "correction_base_mm": (corrected_base - naive_base).tolist(),
-        "correction_norm_mm": correction_norm,
-        "naive_point_base_mm": naive_base.tolist(),
-        "corrected_point_base_mm": corrected_base.tolist(),
-        "iterations": int(iterations),
-        "samples": int(samples),
-    }
-
-
-def camera_height_to_plane_mm(T_base_tcp: np.ndarray, T_tcp_camera: np.ndarray,
-                              plane_point_base: np.ndarray) -> float:
-    T_base_camera = camera_transform(T_base_tcp, T_tcp_camera)
-    return float(T_base_camera[:3, 2] @ (np.asarray(plane_point_base) - T_base_camera[:3, 3]))
-
-
-def base_z_target_for_camera_height(T_base_tcp: np.ndarray, T_tcp_camera: np.ndarray,
-                                    plane_point_base: np.ndarray, target_height_mm: float) -> tuple[np.ndarray, float]:
-    """只改 TCP 基坐标 Z，使孔面在 RGB 坐标的估计 Z 达到目标高度。"""
-    current_height = camera_height_to_plane_mm(T_base_tcp, T_tcp_camera, plane_point_base)
-    z_axis_base_z = float(camera_transform(T_base_tcp, T_tcp_camera)[2, 2])
-    if abs(z_axis_base_z) < 0.15:
-        raise ValueError("相机光轴过于接近基坐标水平面，不能以基坐标 Z 控制高度")
-    delta_base_z = (current_height - target_height_mm) / z_axis_base_z
-    target = np.asarray(T_base_tcp, dtype=np.float64).copy()
-    target[2, 3] += delta_base_z
-    return target, current_height
+# 纯几何/光学层已抽到 aubo_workbench.geometry 与 aubo_workbench.optics。
+# 下划线别名保留给本文件内的既有调用点与 tests 的属性式访问。
+_unit = unit_vector
+_angle_deg = angle_between_deg
+_matrix_to_rpy_zyx = matrix_to_rpy_zyx
+_camera_matrix = camera_matrix
+_distortion = distortion_coeffs
+_plane_basis = plane_basis
+_project_undistorted_pixels = project_undistorted_pixels
 
 
 def plan_final_tcp_xy(T_base_tcp: np.ndarray, hole_center_base: np.ndarray,

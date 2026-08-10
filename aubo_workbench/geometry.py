@@ -16,6 +16,40 @@ def ensure_finite_array(values: np.ndarray, name: str) -> None:
         raise ValueError(f"{name} contains non-finite values")
 
 
+def unit_vector(vec: np.ndarray, label: str = "vector") -> np.ndarray:
+    vec = np.asarray(vec, dtype=np.float64).reshape(3)
+    length = float(np.linalg.norm(vec))
+    if not np.isfinite(length) or length < 1e-9:
+        raise ValueError(f"{label} 无法归一化")
+    return vec / length
+
+
+def angle_between_deg(a: np.ndarray, b: np.ndarray) -> float:
+    return float(math.degrees(math.acos(np.clip(float(unit_vector(a) @ unit_vector(b)), -1.0, 1.0))))
+
+
+def matrix_to_rpy_zyx(R: np.ndarray) -> np.ndarray:
+    """AUBO 使用的 [rx, ry, rz]（Rz @ Ry @ Rx）逆变换。"""
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    sy = float(-R[2, 0])
+    ry = math.asin(float(np.clip(sy, -1.0, 1.0)))
+    cy = math.cos(ry)
+    if abs(cy) > 1e-7:
+        rx = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        rz = math.atan2(float(R[1, 0]), float(R[0, 0]))
+    else:
+        rx = math.atan2(float(-R[1, 2]), float(R[1, 1]))
+        rz = 0.0
+    return np.array([rx, ry, rz], dtype=np.float64)
+
+
+def transform_to_sdk_pose_m_rad(T_base_tcp: np.ndarray) -> list[float]:
+    """4x4 齐次矩阵（mm）转 AUBO SDK 位姿 [x, y, z, rx, ry, rz]（m + rad）。"""
+    T_base_tcp = np.asarray(T_base_tcp, dtype=np.float64).reshape(4, 4)
+    return ((T_base_tcp[:3, 3] / 1000.0).tolist()
+            + matrix_to_rpy_zyx(T_base_tcp[:3, :3]).tolist())
+
+
 def rotx(rad: float) -> np.ndarray:
     c, s = math.cos(rad), math.sin(rad)
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
