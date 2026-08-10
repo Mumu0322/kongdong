@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>镀膜伞具孔位板 CAD 配准运动——阶段技术评审 DR V2.0</title>
+<style>
+        :root { color-scheme: light; }
+        body { margin: 0; background: #f4f6f9; color: #202124; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; line-height: 1.55; }
+        main { max-width: 980px; margin: 28px auto; padding: 42px 54px 60px; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.10); }
+        h1 { color: #0B2545; font-size: 30px; line-height: 1.25; margin: 0 0 4px; }
+        h2 { color: #2E74B5; font-size: 21px; margin: 30px 0 10px; border-bottom: 1px solid #d8e1ec; padding-bottom: 4px; }
+        h3 { color: #1F4D78; font-size: 17px; margin: 22px 0 7px; }
+        p { margin: 0 0 10px; }
+        blockquote { margin: 12px 0; padding: 10px 14px; background: #F4F6F9; border-left: 4px solid #7A5A00; color: #3f3f3f; }
+        code { font-family: Consolas, "Courier New", monospace; font-size: .92em; background: #f1f3f4; padding: 1px 4px; border-radius: 3px; }
+        pre { overflow-x: auto; padding: 12px 14px; background: #f7f8fa; border: 1px solid #e0e4ea; border-radius: 4px; font: 13px/1.5 Consolas, "Courier New", monospace; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 13px; table-layout: fixed; }
+        th, td { border: 1px solid #bfc7d1; padding: 7px 9px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+        th { background: #F2F4F7; font-weight: 700; }
+        li { margin: 0 0 6px; }
+        hr { border: 0; border-top: 1px solid #cfd6df; margin: 28px 0; }
+        .meta { color: #555; font-size: 13px; margin-bottom: 20px; }
+        .status { padding: 10px 14px; background: #edf4fb; border-left: 4px solid #2E74B5; font-weight: 600; }
+        @media print { body { background: #fff; } main { margin: 0; padding: 0; box-shadow: none; max-width: none; } h2 { break-after: avoid; } table, pre, blockquote { break-inside: avoid; } }
+        </style></head><body><main>
+<h1 class="status">镀膜伞具孔位板 CAD 配准运动</h1>
+<h2>阶段技术评审 DR</h2>
+<table><thead><tr>
+<th>项目</th>
+<th>内容</th>
+</tr></thead><tbody>
+<tr>
+<td>文档编号</td>
+<td>DR-EIH-20260810-002</td>
+</tr>
+<tr>
+<td>文档版本</td>
+<td>V2.0</td>
+</tr>
+<tr>
+<td>评审日期</td>
+<td>2026-08-10</td>
+</tr>
+<tr>
+<td>当前阶段</td>
+<td>CAD 配准替代点云粗定位后的运动联调</td>
+</tr>
+<tr>
+<td>评审结论</td>
+<td>工程实现与实验运行已完成；生产放行条件尚未满足</td>
+</tr>
+<tr>
+<td>评审人</td>
+<td>待填写</td>
+</tr>
+<tr>
+<td>负责人</td>
+<td>待填写</td>
+</tr>
+</tbody></table>
+<blockquote>本文是当前实现的阶段性 DR。原三孔、点云粗定位版本保留在 <code>DR_镀膜伞具三孔眼在手定位_阶段评审_V1.0.*</code>，作为历史记录，不再代表当前 CAD 运动流程的结论。</blockquote>
+<h2>0. 本次版本的评审结论</h2>
+<p>当前项目同时保留两条孔位定位路径。本 DR 重点评审 CAD 配准运动路径，但原来的多段位移/点云两阶段路径仍可通过开关选择，用于兼容、对照和回退。CAD 路径能够完成以下闭环：</p>
+<ol>
+<li>从 STEP 生成并加载 11 个顶面大孔的 CAD 中心、半径/直径、顶部高度和 <code>+Z</code> 法向。</li>
+<li>在每次真实运动开始前重新采集 RGB，并自动完成 CAD 与相机的孔位匹配；匹配不唯一时要求人工确认，不任意采用对称解。</li>
+<li>通过平面 PnP/IPPE、畸变投影、正深度和法向方向检查求出 <code>T_camera_cad</code>。</li>
+<li>回到选定孔组的共同视野位置，在约 340 mm 处一次性采集深度，用于共同高度修正；深度不再提供孔中心、孔号或法向。</li>
+<li>在约 260 mm 处对每个选定孔采集 RGB/YOLO 帧，CAD 锁定目标中心、法向和孔号，YOLO 只用于最终 XY 精修；保留现有 ChArUco TCP-XY 补偿。</li>
+<li>执行最终 Z、夹爪/工具偏置和基坐标 <code>+Y 0.3 mm</code> 逻辑，并将 CAD、YOLO、精定位和运动结果写入报告。</li>
+</ol>
+<p>原有非 CAD 路径仍能完成“初始选孔 → 340 mm 粗定位 → 点云中心/法向闭环 → 260 mm RGB 精定位 → 最终目标点”的多段位移流程；该路径不使用 CAD 孔号来确定孔位，而是保留原来的 YOLO 选孔、RGB-D 局部点云和平面几何计算。</p>
+<p>最新一次实验运行已经实际发出了机器人运动请求并完成 3 个选定孔的流程，但使用的是未通过生产质量门的手眼候选，报告状态为 <code>completed_experimental_handeye</code>。因此，本版本的结论是“功能链路已打通、实验运行通过；生产验收未通过”。</p>
+<h2>1. 评审范围与变更目标</h2>
+<h3>1.1 目标</h3>
+<p>本阶段的目标是让 CAD 路径替换原有点云粗定位在 CAD 模式下的职责，同时保留原路径：</p>
+<ul>
+<li>原方式：用点云拟合孔中心、平面和法向，再通过 340 mm 粗定位闭环寻找目标。</li>
+<li>当前 CAD 方式：用 CAD 孔模型与 RGB 图像配准得到 CAD 坐标系到相机坐标系的变换，再由 CAD 孔中心和法向直接规划目标位姿。</li>
+<li>保留方式：在非 CAD 模式下，继续用初始 YOLO 选孔和 RGB-D 局部点云确定孔中心、平面和法向，并沿用逐孔多段位移。</li>
+</ul>
+<p>在 CAD 模式下，点云不承担孔中心、法向和 CAD 孔号识别职责；深度只在选定孔组的共同视野位置采集，用于补偿当前工件相对 340 mm 参考高度的 Z 偏差。在非 CAD 两阶段模式下，点云仍然承担每个孔的粗中心、局部平面和法向计算。</p>
+<h3>1.2 两条路径的边界</h3>
+<table><thead><tr><th>项目</th><th>CAD 运动路径</th><th>原两阶段点云路径</th></tr></thead><tbody>
+<tr><td>模式开关</td><td><code>CAD_MOTION_MODE=True</code> 或 <code>--cad-motion</code></td><td><code>CAD_MOTION_MODE=False</code> 且 <code>TWO_STAGE_MODE=True</code>，或 <code>--two-stage-hole-localization</code></td></tr>
+<tr><td>孔位来源</td><td>CAD 11 孔模型与 RGB 配准</td><td>初始 YOLO 选孔与 RGB-D 点云几何</td></tr>
+<tr><td>340 mm</td><td>选定孔组共同视野，一次采集共享高度</td><td>每个孔分别到 340 mm，点云拟合并做粗定位闭环</td></tr>
+<tr><td>260 mm</td><td>CAD 规划目标位姿，RGB/YOLO 只修最终 XY</td><td>点云平面确定 Z，RGB/YOLO 求精定位中心</td></tr>
+<tr><td>法向来源</td><td>CAD 顶面 <code>+Z</code> 法向经位姿变换</td><td>340 mm 局部点云平面法向</td></tr>
+<tr><td>报告目录</td><td><code>data\cad_motion_runs\cad-motion-*</code></td><td><code>data\hole_localization_runs\two-stage-*</code></td></tr>
+</tbody></table>
+<p>当前 <code>run_hole_localization_pycharm.py</code> 默认设置 <code>CAD_MOTION_MODE=True</code>；主脚本参数默认仍为 <code>CAD_MOTION=False</code>、两阶段模式开启。因此直接运行主脚本或 GUI 旧流程时，旧的多段位移功能仍然会被调用，不能把它误判为删除。</p>
+<h3>1.3 本版本不包含的结论</h3>
+<ul>
+<li>未将当前实验手眼结果认定为生产级手眼标定。</li>
+<li>未完成全部 11 孔逐孔运动的现场重复性验收。</li>
+<li>未用一次实验运行证明夹爪插入、接触和取放动作的最终机械精度。</li>
+<li>未将旧两阶段点云路径的历史实验结果直接等同于当前 CAD 路径的生产验收结果。</li>
+</ul>
+<h2>2. 当前系统基线</h2>
+<h3>2.1 硬件和坐标约定</h3>
+<table><thead><tr>
+<th>项目</th>
+<th>当前基线</th>
+</tr></thead><tbody>
+<tr>
+<td>机器人</td>
+<td>AUBO i5H，使用现有 AUBO SDK</td>
+</tr>
+<tr>
+<td>相机</td>
+<td>Orbbec Gemini 435Le；CAD 配准阶段只读取 RGB，340 mm 高度采集阶段读取 RGB-D</td>
+</tr>
+<tr>
+<td>检测模型</td>
+<td>当前 GUI/运行配置中的 YOLO 模型，输出大孔检测框；第一阶段孔中心取框中心</td>
+</tr>
+<tr>
+<td>CAD 来源</td>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\孔位板_JXDZ26-KWB-001.STEP</code></td>
+</tr>
+<tr>
+<td>CAD 模型</td>
+<td><code>C:\MM\aubo_tools\data\cad_model\cad_hole_model.json</code></td>
+</tr>
+<tr>
+<td>CAD 单位</td>
+<td>mm</td>
+</tr>
+<tr>
+<td>CAD 顶面</td>
+<td><code>Z=6 mm</code></td>
+</tr>
+<tr>
+<td>CAD 顶面法向</td>
+<td><code>+Z</code></td>
+</tr>
+<tr>
+<td>相机坐标</td>
+<td>使用现有 RGB 内参和畸变参数进行投影/PnP</td>
+</tr>
+<tr>
+<td>工具坐标约定</td>
+<td>当前项目约定 <code>X</code> 正方向向前，<code>Y</code> 正方向向左；最终基坐标 <code>+Y 0.3 mm</code> 保留</td>
+</tr>
+</tbody></table>
+<p>CAD JSON 的当前模型版本为 <code>cad_hole_model_v1</code>，包含 11 个顶面大孔。正式运行前仍需要检查 STEP、JSON 和当前实物是否属于同一块孔位板。</p>
+<h3>2.2 主要入口</h3>
+<table><thead><tr>
+<th>入口</th>
+<th>用途</th>
+<th>当前状态</th>
+</tr></thead><tbody>
+<tr>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\run_workbench.py</code></td>
+<td>主 GUI，进入孔洞定位、CAD 预览、CAD 运动和夹爪控制</td>
+<td>当前推荐入口</td>
+</tr>
+<tr>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\run_cad_registration_preview.py</code></td>
+<td>CAD 配准预览、映射确认、5 帧质量统计和叠加图输出</td>
+<td>阶段 0，不应运动</td>
+</tr>
+<tr>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\run_yolo_eye_in_hand_optimized.py</code></td>
+<td>CAD 运动流程核心实现及原两阶段点云流程</td>
+<td>由 GUI/直接入口调用</td>
+</tr>
+<tr>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\run_hole_localization_pycharm.py</code></td>
+<td>直接运行配置入口</td>
+<td>默认只预览；真实运动和实验手眼仍需显式覆盖，使用前必须复核</td>
+</tr>
+<tr>
+<td><code>C:\MM\aubo_tools\aubo_workbench_project\aubo_workbench\gripper_control.py</code></td>
+<td>独立夹爪控制窗口</td>
+<td>已接入 GUI，不作为 CAD 注册放行条件</td>
+</tr>
+</tbody></table>
+<p>当前运行环境仍为 conda 的 <code>lip_env310</code> 环境。</p>
+<h2>3. 当前实现架构</h2>
+<h3>3.1 CAD 模型加载</h3>
+<p><code>cad_model.py</code> 支持从已有 JSON 恢复 <code>CadModel</code>，并校验孔数量、单位、顶面高度、法向以及必要字段。默认模型为 11 个顶面孔。模型中每个孔至少包含：</p>
+<ul>
+<li>CAD 孔号；</li>
+<li>CAD 三维中心；</li>
+<li>半径/直径；</li>
+<li>顶部高度；</li>
+<li>顶面法向。</li>
+</ul>
+<h3>3.2 CAD 到相机的配准</h3>
+<p><code>cad_registration.py</code> 完成以下工作：</p>
+<ol>
+<li>从 YOLO 检测结果读取孔框中心。</li>
+<li>在满足几何约束的前提下，为可见检测孔生成 CAD 候选匹配。</li>
+<li>检测到的候选不唯一时，进入人工确认或使用已保存映射；禁止在对称孔位之间任意选解。</li>
+<li>使用至少 4 个有效对应点进行平面 PnP/IPPE。</li>
+<li>使用 RGB 内参和畸变参数计算 <code>T_camera_cad</code>，并检查正深度、法向朝向和重投影质量。</li>
+<li>投影全部 11 个 CAD 孔，绘制 CAD 圆、孔号、YOLO 框、残差矢量和误差统计。</li>
+</ol>
+<p>预览入口采集 5 帧，要求至少 3 帧通过质量门，然后以有效帧的孔中心中位数重新求解。预览结果的 <code>motion_allowed</code> 固定为 <code>False</code>；即使配准质量通过，阶段 0 也只允许生成结果，不直接连接运动流程。</p>
+<h3>3.3 CAD 运动流程</h3>
+<p>真实运动路径在每次启动运动时都重新执行一次实时 CAD 配准，策略为 <code>fresh_live_auto_each_run</code>，不复用上一次报告里的旧位姿。流程如下：</p>
+<ol>
+<li>连接机器人并回到保存的原点/安全位置。</li>
+<li>在原点位置选择本次要处理的 CAD 孔组。</li>
+<li>根据所选孔的 CAD 中心和法向规划共同视野位置，使选定孔尽可能同时处于 RGB-D 视野中心附近。</li>
+<li>到共同视野位置采集一次深度。单孔时用单孔高度；选定 2～3 孔时用选定孔共享高度；选定不少于 4 孔时使用至少 4 个有效孔进行共享高度估计。这样不需要对每个孔重复 340 mm 深度采集。</li>
+<li>对每个选定孔移动到 CAD 计算的约 260 mm 精定位位姿。</li>
+<li>在 260 mm 位置丢弃稳定等待帧后采集 RGB/YOLO 帧，并用 CAD 投影附近的检测作为精定位候选。</li>
+<li>CAD 继续提供孔中心、法向、孔号和目标 Z；YOLO 只计算最终 XY 修正，并经过现有 ChArUco TCP-XY 补偿。</li>
+<li>执行最终 Z、工具/夹爪偏置和基坐标 <code>+Y 0.3 mm</code>，保存当前孔的目标位姿、实际 TCP、XY、Z 和 Y trim 记录。</li>
+<li>每个选定孔完成后由操作员确认是否继续下一个孔。</li>
+</ol>
+<h3>3.4 原有非 CAD 两阶段流程（仍可使用）</h3>
+<p>非 CAD 路径在代码中由 <code>run_two_stage_hole_localization()</code> 保留，GUI 中对应旧流程的“开始两阶段定位”。它的逐孔多段位移和孔位确定过程如下：</p>
+<ol>
+<li>在初始 RGB-D 画面中选择一个或多个孔，记录初始 YOLO 身份和点云三维投影。</li>
+<li>对当前孔先做安全抬升/横移，再下降到该孔约 340 mm 粗定位位。</li>
+<li>用 YOLO 框外环深度点拟合局部平面，计算 YOLO 中心射线与点云平面的交点、局部平面点和孔面法向。</li>
+<li>根据中心偏差、法向偏差执行最多两次粗定位闭环校正；每个孔的粗定位数据写入 <code>coarse_captures</code>。</li>
+<li>以当前孔的点云平面为基准，必要时分次只修正基坐标 Z，到达约 260 mm。</li>
+<li>260 mm 阶段只使用 RGB/YOLO 多帧精定位，检测身份锁定在粗定位点云投影锚点附近；最终中心由 RGB 中心与粗阶段平面求交得到。</li>
+<li>最终仍执行 ChArUco TCP-XY 修正、最终 Z、工具/夹爪偏置和基坐标 <code>+Y 0.3 mm</code>。</li>
+<li>当前孔完成后等待输入 <code>m</code>，再开始下一个孔；未通过精定位质量门的孔会记录为 deferred，不执行最终目标点动作。</li>
+</ol>
+<p>这条路径会保留 <code>pointcloud_center_base_mm</code>、<code>pointcloud_center_camera_mm</code>、<code>coarse_normal_toward_camera_base</code>、<code>coarse_plane_rmse_mm</code>、<code>coarse_captures</code> 和 <code>fine_z_source=coarse_per_hole_center_z</code> 等字段。它不是死代码，也不是 CAD 配准报告的组成部分。</p>
+<h3>3.5 GUI 与夹爪</h3>
+<p>主 GUI 目前已将 CAD 配准预览、CAD 目标预览、CAD 260 mm 真实运动、精定位可视化和结果目录操作放入孔洞定位页面。夹爪控制从主界面打开一个独立的非模态窗口，主 GUI 仍可继续操作；夹爪通信由 <code>JiaZhua\z_erg_20c.py</code> 驱动。夹爪窗口目前提供串口、从站、波特率、超时、重试、夹持速度/电流/位置和旋转速度/电流/角度参数。</p>
+<h2>4. 质量门和放行规则</h2>
+<table><thead><tr>
+<th>环节</th>
+<th>当前门限/规则</th>
+<th>失败处理</th>
+</tr></thead><tbody>
+<tr>
+<td>CAD 单帧匹配</td>
+<td>至少 4 个有效对应孔；正深度；法向方向正确</td>
+<td>该帧不进入求解</td>
+</tr>
+<tr>
+<td>CAD 单帧重投影</td>
+<td>RMSE ≤ 2 px，最大误差 ≤ 4 px</td>
+<td>配准失败，不进入运动</td>
+</tr>
+<tr>
+<td>CAD 多帧稳定性</td>
+<td>采集 5 帧，至少 3 帧有效；中心 P95 ≤ 1.5 mm</td>
+<td>本次注册失败</td>
+</tr>
+<tr>
+<td>映射唯一性</td>
+<td>对称/多解必须人工确认或读取已确认映射</td>
+<td>禁止自动任意选解</td>
+</tr>
+<tr>
+<td>340 mm 共享深度</td>
+<td>默认 8 帧，至少 5 帧有效；平面 RMSE ≤ 3.5 mm；高度散布 P95 ≤ 2.0 mm</td>
+<td>不执行该孔组</td>
+</tr>
+<tr>
+<td>260 mm 精定位</td>
+<td>默认 12 帧，至少 6 帧有效；丢弃 10 帧稳定帧；中心散布 P95 ≤ 1.5 px；CAD-YOLO 匹配距离 ≤ 70 px</td>
+<td>不执行该孔</td>
+</tr>
+<tr>
+<td>手眼</td>
+<td>生产必须使用已验证手眼；实验手眼只能显式覆盖</td>
+<td>生产模式阻止运动</td>
+</tr>
+<tr>
+<td>阶段 0 预览</td>
+<td><code>motion_allowed=False</code></td>
+<td>只输出原图、叠加图、映射和 JSON</td>
+</tr>
+</tbody></table>
+<p>质量门全部通过只表示视觉/几何条件通过，不代表机器人已经完成机械精度验收。特别是当前 260 mm 的 CAD-YOLO 平均像素距离属于诊断信息，不是单独的运动放行门；仍需结合中心稳定性、实际 TCP 记录和现场孔边缘覆盖情况验收。</p>
+<h2>5. 最近一次实验运行证据</h2>
+<p>数据目录：<code>C:\MM\aubo_tools\data\cad_motion_runs\cad-motion-20260807_165112</code></p>
+<h3>5.1 CAD 配准和 340 mm 共享深度</h3>
+<table><thead><tr>
+<th>项目</th>
+<th>结果</th>
+</tr></thead><tbody>
+<tr>
+<td>CAD 自动注册有效帧</td>
+<td>5/5</td>
+</tr>
+<tr>
+<td>跨帧中心 P95</td>
+<td>约 0.297 mm</td>
+</tr>
+<tr>
+<td>CAD 注册失败原因</td>
+<td>无</td>
+</tr>
+<tr>
+<td>阶段 0 <code>motion_allowed</code></td>
+<td><code>False</code>（预览模块的固定安全规则）</td>
+</tr>
+<tr>
+<td>选定孔</td>
+<td>CAD-09、CAD-06、CAD-10</td>
+</tr>
+<tr>
+<td>共享深度有效帧</td>
+<td>8/8</td>
+</tr>
+<tr>
+<td>共享深度中位高度</td>
+<td>336.452 mm</td>
+</tr>
+<tr>
+<td>相对 340 mm 的高度偏移</td>
+<td>-3.548 mm</td>
+</tr>
+<tr>
+<td>共享 Z 修正记录</td>
+<td>约 +3.548 mm</td>
+</tr>
+<tr>
+<td>共享深度状态</td>
+<td><code>passed</code></td>
+</tr>
+</tbody></table>
+<p>这说明“以选定孔组为共同视野，在 340 mm 一次采集深度”的代码路径已经运行起来；它不是以某一个孔单独的 340 mm 结果代表全部孔。</p>
+<h3>5.2 260 mm 精定位结果</h3>
+<table><thead><tr>
+<th>孔</th>
+<th>有效帧</th>
+<th>中心散布 P95</th>
+<th>CAD-YOLO 平均距离</th>
+<th>最终 XY 修正 mm</th>
+</tr></thead><tbody>
+<tr>
+<td>CAD-09</td>
+<td>12/12</td>
+<td>0.14 px</td>
+<td>4.92 px</td>
+<td><code>[0.4996, 2.3816]</code></td>
+</tr>
+<tr>
+<td>CAD-06</td>
+<td>12/12</td>
+<td>0.22 px</td>
+<td>2.64 px</td>
+<td><code>[0.4866, 2.5215]</code></td>
+</tr>
+<tr>
+<td>CAD-10</td>
+<td>12/12</td>
+<td>0.15 px</td>
+<td>4.44 px</td>
+<td><code>[0.6192, 2.4189]</code></td>
+</tr>
+</tbody></table>
+<p>本次报告的总体状态为 <code>completed_experimental_handeye</code>，且 <code>motion_requested=True</code>、<code>motion_executed=True</code>。运行使用的手眼候选仍为 <code>handeye_validated=False</code> 并启用了实验覆盖，因此这组数据只能作为功能联调证据，不能作为生产精度承诺。</p>
+<h2>6. 位姿和高度计算说明</h2>
+<h3>6.1 CAD 坐标到基坐标</h3>
+<p>初始位置完成 CAD 注册后，代码按以下关系冻结当前工件的 CAD 位姿：</p>
+<pre><code>T_base_cad = T_base_camera_initial @ T_camera_cad</code></pre>
+<p>之后每个选定孔的基坐标中心和法向由 CAD 模型转换得到。工件一次运行中不移动时，不需要每个孔重新示教 CAD；每次新的运动运行会重新做一次当前相机画面的自动匹配并立即应用。</p>
+<h3>6.2 340 mm 高度和 260 mm 精定位的关系</h3>
+<p>340 mm 是深度可靠的共同观测高度，不是某一个孔的最终插入高度。系统在共同视野位置采集深度，得到选定孔组的共享高度偏移，并把该偏移用于后续 CAD 目标 Z。</p>
+<p>260 mm 是每个孔的精定位观测高度。到达 260 mm 后，RGB/YOLO 用来计算最终 XY 修正；最终 Z 仍由 CAD 顶面高度和 340 mm 深度修正共同确定。当前代码不是简单地“把 340 mm 减去 80 mm”，而是先用 CAD 位姿规划 260 mm 目标，再用共同深度结果修正 Z。</p>
+<h3>6.3 最终偏置</h3>
+<ul>
+<li>保留当前最终 Z 逻辑。</li>
+<li>保留现有夹爪/工具偏置配置；代码支持夹爪目标模式和法向目标模式。</li>
+<li>保留现有 ChArUco TCP-XY 补偿模型，但本次运行未单独形成 ChArUco 精度验收结论。</li>
+<li>最终基坐标 <code>+Y 0.3 mm</code> 在 Z 动作之后执行。</li>
+</ul>
+<h2>7. 当前代码和数据追溯</h2>
+<table><thead><tr>
+<th>类别</th>
+<th>文件/目录</th>
+<th>作用</th>
+</tr></thead><tbody>
+<tr>
+<td>CAD 模型恢复</td>
+<td><code>aubo_workbench/cad_model.py</code></td>
+<td>校验并恢复 CAD JSON</td>
+</tr>
+<tr>
+<td>CAD 配准</td>
+<td><code>aubo_workbench/cad_registration.py</code></td>
+<td>匹配、PnP/IPPE、质量门、投影和残差</td>
+</tr>
+<tr>
+<td>CAD 预览</td>
+<td><code>run_cad_registration_preview.py</code></td>
+<td>RGB 预览、映射确认、5 帧报告；不运动</td>
+</tr>
+<tr>
+<td>CAD 运动</td>
+<td><code>run_yolo_eye_in_hand_optimized.py</code></td>
+<td>340 mm 共享深度、260 mm 精定位、运动和报告</td>
+</tr>
+<tr>
+<td>GUI</td>
+<td><code>run_workbench.py</code>、<code>aubo_workbench/gui_hole_localization.py</code></td>
+<td>CAD 预览、运动按钮、精定位可视化和结果目录</td>
+</tr>
+<tr>
+<td>夹爪窗口</td>
+<td><code>aubo_workbench/gripper_control.py</code></td>
+<td>独立夹爪控制窗口</td>
+</tr>
+<tr>
+<td>夹爪驱动</td>
+<td><code>C:\MM\aubo_tools\JiaZhua\z_erg_20c.py</code></td>
+<td>串口/Modbus 夹爪控制</td>
+</tr>
+<tr>
+<td>CAD 模型</td>
+<td><code>C:\MM\aubo_tools\data\cad_model\cad_hole_model.json</code></td>
+<td>11 孔模型</td>
+</tr>
+<tr>
+<td>最新运动报告</td>
+<td><code>C:\MM\aubo_tools\data\cad_motion_runs\cad-motion-20260807_165112\report.json</code></td>
+<td>当前实验运行证据</td>
+</tr>
+<tr>
+<td>最新注册报告</td>
+<td><code>...\cad_registration_auto\cad_registration_report.json</code></td>
+<td>运动启动时的实时 CAD 注册证据</td>
+</tr>
+<tr>
+<td>当前追溯摘要</td>
+<td>本 DR 第 1、4、5、7、8、9 节</td>
+<td>旧版三孔追溯矩阵已删除；当前 CAD 与非 CAD 双路径以本 DR 及 README 为准</td>
+</tr>
+</tbody></table>
+<p>项目当前离线测试套件为 115 项，最近一次整套运行通过。测试通过只说明代码回归正常，不替代真实机器人、相机和手眼的现场验收。</p>
+<h2>8. 当前问题、风险和限制</h2>
+<h3>8.1 手眼质量门尚未达标</h3>
+<p>最新实验报告明确记录 <code>handeye_validated=False</code>。当前直接运行配置 <code>run_hole_localization_pycharm.py</code> 已改为默认不执行运动、不允许实验手眼；但仍保留显式覆盖开关，操作员不能把该入口当作生产安全配置。正式放行前应：</p>
+<ol>
+<li>使用独立验证数据重新完成手眼候选筛选；</li>
+<li>将生产入口改为“未验证手眼禁止运动”；</li>
+<li>在 GUI 中显示并强制确认手眼质量状态；</li>
+<li>记录验证报告编号、采集日期和适用相机/工具配置。</li>
+</ol>
+<h3>8.2 现场精度证据不足</h3>
+<p>当前运行只处理了 CAD-09、CAD-06、CAD-10 三个孔。虽然 5 帧注册、8 帧共享深度和每孔 12 帧精定位均满足当前代码门限，但还缺少以下证据：</p>
+<ul>
+<li>同一工件多次重新摆放后的 CAD 自动匹配稳定性；</li>
+<li>11 孔或代表性孔组的重复运动结果；</li>
+<li>CAD 投影在真实孔边缘上的现场覆盖记录；</li>
+<li>末端工具/夹爪进入孔位后的实际机械误差；</li>
+<li>光照、反光、遮挡、漏检和对称匹配异常下的拒绝行为。</li>
+</ul>
+<h3>8.3 旧路径和配置一致性</h3>
+<p>旧点云粗定位代码仍保留，供兼容、对照和回退使用；它包含原来的多段安全位移、每孔 340 mm 粗定位、点云中心/法向闭环、260 mm RGB 精定位和逐孔目标点运动。CAD 路径不调用这套点云粗定位结果，但两条路径共享机器人运动、ChArUco XY、最终 Z、工具偏置和 <code>+Y 0.3 mm</code> 等部分底层逻辑。后续整理必须明确区分 <code>CAD_MOTION_MODE=True/False</code> 的报告和质量门。</p>
+<h2>9. 下一阶段验收计划</h2>
+<p>按以下顺序推进，不满足前一项时不扩大运动范围：</p>
+<ol>
+<li>在不运动模式下连续采集多次 RGB，确认 CAD 11 孔投影、孔号和 YOLO 框稳定重合。</li>
+<li>更换孔位板摆放位置，验证每次运动开始前的自动匹配能重新建立正确映射。</li>
+<li>使用已验证手眼重新做同样的 340 mm 共享深度和 260 mm 精定位实验。</li>
+<li>先开放单孔，再开放 2～3 孔共享高度，最后开放 4 个及以上孔的共享高度。</li>
+<li>对每个阶段记录目标 TCP、实际 TCP、最终 XY、最终 Z、<code>+Y 0.3 mm</code> trim 和夹爪动作结果。</li>
+<li>完成独立的重复性、漏检/误检、对称解和异常停止验收后，才允许切换为生产配置。</li>
+</ol>
+<p>生产放行条件建议至少包括：手眼验证通过；CAD 配准、340 mm 深度和 260 mm 精定位质量门连续通过；现场机械末端误差达到项目要求；所有异常都能停止运动并保留报告。</p>
+<h2>10. 评审结论</h2>
+<p>本阶段已经完成 CAD 模型加载、RGB 自动配准、映射确认、全孔投影、共同视野深度采集、260 mm YOLO XY 精定位、ChArUco 补偿接口、最终 Z/工具偏置/<code>+Y 0.3 mm</code> 运动链路以及 GUI 结果展示。最近一次实验运行证明了“每次运动前自动匹配并直接应用”的链路可执行。</p>
+<p>但由于当前手眼仍未通过生产质量门，且缺少多次摆放、全孔/多孔组和末端机械精度数据，本 DR 不能给出生产放行结论。下一阶段应优先关闭手眼和现场重复性两个风险，再扩大孔组和运动范围。</p>
+<hr>
+<p><strong>评审状态：工程实现完成，实验联调通过，生产验收待完成。</strong></p>
+</main></body></html>
