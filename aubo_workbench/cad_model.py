@@ -17,6 +17,8 @@ from typing import Any
 
 import numpy as np
 
+from .geometry import unit_vector
+
 
 CAD_SCHEMA_VERSION = "cad_hole_model_v1"
 DEFAULT_TOP_Z_MM = 6.0
@@ -31,11 +33,12 @@ def _finite_vector(value: Any, size: int, name: str) -> np.ndarray:
 
 
 def _unit(value: Any, name: str) -> np.ndarray:
-    vector = _finite_vector(value, 3, name)
-    length = float(np.linalg.norm(vector))
-    if length <= 1e-12:
-        raise ValueError(f"{name} 不能是零向量")
-    return vector / length
+    """先做本模块的维度/有限性校验，再交给 geometry.unit_vector 归一化。
+
+    保留 _finite_vector 是为了"必须是有限的 3 维数值"这条更具体的报错，
+    实际的除法只在 geometry.unit_vector 一处实现。
+    """
+    return unit_vector(_finite_vector(value, 3, name), name)
 
 
 def _first(data: dict[str, Any], *keys: str, default: Any = None) -> Any:

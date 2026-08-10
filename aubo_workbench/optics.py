@@ -40,6 +40,10 @@ def distortion_coeffs(intrinsics: Any) -> np.ndarray:
 
     两个字段都不存在时抛错，而不是静默当作无畸变——后者会让标定结果偏移
     却看不出任何异常。
+
+    空序列是合法的"无畸变"表达（``camera.CameraIntrinsics.distortion``
+    默认就是 ``()``）；但字段存在却含 NaN/inf 属于坏标定，同样必须抛错，
+    不能退回零畸变蒙混过去。
     """
     if hasattr(intrinsics, "distortion"):
         raw = getattr(intrinsics, "distortion")
@@ -50,8 +54,12 @@ def distortion_coeffs(intrinsics: Any) -> np.ndarray:
             f"{type(intrinsics).__name__} 既没有 distortion 也没有 dist_coeffs，无法确定畸变参数"
         )
     values = np.asarray(raw, dtype=np.float64).reshape(-1)
-    if values.size == 0 or not np.isfinite(values).all():
+    if values.size == 0:
         return np.zeros(0, dtype=np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"{type(intrinsics).__name__} 的畸变参数含有非有限值，无法使用：{values.tolist()}"
+        )
     return values
 
 

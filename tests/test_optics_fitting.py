@@ -93,6 +93,19 @@ class DistortionCoeffsTests(unittest.TestCase):
         with self.assertRaisesRegex(AttributeError, "dist_coeffs"):
             distortion_coeffs(Bare())
 
+    def test_non_finite_distortion_raises_instead_of_falling_back_to_zero(self):
+        # 字段缺失会响亮抛错，但字段存在却含 NaN/inf 曾被静默当成零畸变，
+        # 属于同一类静默失败：标定坏了却照常算出一个看似正常的结果。
+        for bad in ((0.1, np.nan, 0.0, 0.0, 0.0), (np.inf, 0.0, 0.0, 0.0, 0.0)):
+            with self.assertRaisesRegex(ValueError, "非有限值"):
+                distortion_coeffs(_rgb_intrinsics(bad))
+
+    def test_non_finite_distortion_also_blocks_undistort_pixels(self):
+        # 保证抛错发生在真正用到系数的调用路径上，而不只是取值函数里。
+        intr = _rgb_intrinsics((0.1, np.nan, 0.0, 0.0, 0.0))
+        with self.assertRaisesRegex(ValueError, "非有限值"):
+            undistort_pixels(intr, np.asarray([[640.0, 360.0]]))
+
     def test_swapped_arguments_fail_loudly(self):
         # cad_registration.undistort_pixels 的参数顺序与本模块相反。
         # 传错顺序必须立刻抛错，而不是把畸变静默当成 0 —— 后者会让结果

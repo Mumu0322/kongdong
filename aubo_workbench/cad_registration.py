@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from .cad_model import CadHole, CadModel
-from .geometry import make_transform
+from .geometry import make_transform, unit_vector
 from .io_utils import jsonable
 
 # 实现已统一到 io_utils.jsonable；保留原名供本模块内既有调用点使用。
@@ -30,13 +30,11 @@ _jsonable = jsonable
 
 
 def _unit(value: Any, name: str) -> np.ndarray:
+    """保留"含有非有限值"这条更具体的报错，归一化本身交给 geometry.unit_vector。"""
     vector = np.asarray(value, dtype=np.float64).reshape(3)
     if not np.isfinite(vector).all():
         raise ValueError(f"{name} 含有非有限值")
-    length = float(np.linalg.norm(vector))
-    if length <= 1e-12:
-        raise ValueError(f"{name} 不能为零向量")
-    return vector / length
+    return unit_vector(vector, name)
 
 
 def _validate_transform(value: Any, name: str) -> np.ndarray:
