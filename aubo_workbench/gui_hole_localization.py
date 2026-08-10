@@ -21,18 +21,25 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
+from .paths import (
+    CAD_MODEL_PATH,
+    CAD_MOTION_RUNS_DIR,
+    CAD_REGISTRATION_RUNS_DIR,
+    HANDEYE_CANDIDATE_PATH,
+    HOLE_LOCALIZATION_RUNS_DIR,
+    CAMERA_CALIBRATION_PATH,
+    MODEL_PATH,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 LOCALIZATION_SCRIPT = PROJECT_DIR / "run_yolo_eye_in_hand_optimized.py"
 OFFSET_TEST_SCRIPT = PROJECT_DIR / "run_coarse_to_fine_offset_test.py"
 CAD_REGISTRATION_SCRIPT = PROJECT_DIR / "run_cad_registration_preview.py"
-DEFAULT_MODEL = Path(r"C:\MM\models\small_silu.pt")
-DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-DEFAULT_CAD_MODEL = Path(r"C:\MM\aubo_tools\data\cad_model\cad_hole_model.json")
-DEFAULT_INTRINSICS = Path(r"C:\MM\aubo_tools\data\camera_calibration\current_rgb_intrinsics.json")
-RUNS_DIR = PROJECT_DIR.parent / "data" / "hole_localization_runs"
-CAD_MOTION_RUNS_DIR = PROJECT_DIR.parent / "data" / "cad_motion_runs"
-CAD_REGISTRATION_RUNS_DIR = PROJECT_DIR.parent / "data" / "cad_registration_runs"
+DEFAULT_MODEL = MODEL_PATH
+DEFAULT_HANDEYE = HANDEYE_CANDIDATE_PATH
+DEFAULT_CAD_MODEL = CAD_MODEL_PATH
+DEFAULT_INTRINSICS = CAMERA_CALIBRATION_PATH
+RUNS_DIR = HOLE_LOCALIZATION_RUNS_DIR
 
 
 class ScrollableTab(ttk.Frame):
@@ -160,9 +167,9 @@ class HoleLocalizationPanel(ttk.Frame):
         self.offset_radii_var = tk.StringVar(value="0 5 10 15 20")
         self.offset_angles_var = tk.StringVar(value="0 45 90 135 180 225 270 315")
         self.execute_var = tk.BooleanVar(value=False)
-        self.experimental_var = tk.BooleanVar(value=True)
+        self.experimental_var = tk.BooleanVar(value=False)
         self.cad_workspace_checked_var = tk.BooleanVar(value=False)
-        self.final_xy_var = tk.BooleanVar(value=True)
+        self.final_xy_var = tk.BooleanVar(value=False)
         self.final_target_mode_var = tk.StringVar(value="机械爪模式")
         self.include_final_motion_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="待开始：默认仅预览，不会下发机器人运动")

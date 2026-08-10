@@ -34,6 +34,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from aubo_workbench.paths import (
+    CAMERA_CALIBRATION_PATH,
+    HANDEYE_CANDIDATE_PATH,
+    HOLE_LOCALIZATION_RUNS_DIR,
+    MODEL_PATH as DEFAULT_MODEL_PATH,
+)
+
 
 # ============================================================================
 # 用户配置区：在 PyCharm 中只改这里
@@ -42,10 +49,10 @@ import numpy as np
 TEST_MODE = "auto_multiview"  # repeat / plane_repeat / multiview / auto_multiview / tilt_sim
 
 TARGET_SCRIPT = Path(__file__).with_name("run_yolo_eye_in_hand_optimized.py")
-MODEL_PATH = Path(r"C:\MM\models\small_silu.pt")
-HANDEYE_PATH = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-INTRINSICS_JSON = Path(r"C:\MM\aubo_tools\data\camera_calibration\current_rgb_intrinsics.json")
-OUTPUT_ROOT = Path(r"C:\MM\aubo_tools\data\hole_localization_runs\precision_diagnostics")
+MODEL_PATH = DEFAULT_MODEL_PATH
+HANDEYE_PATH = HANDEYE_CANDIDATE_PATH
+INTRINSICS_JSON = CAMERA_CALIBRATION_PATH
+OUTPUT_ROOT = HOLE_LOCALIZATION_RUNS_DIR / "precision_diagnostics"
 
 CONFIDENCE = 0.35
 REPEAT_FRAMES = 60

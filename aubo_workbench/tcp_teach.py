@@ -22,13 +22,19 @@ from typing import Any
 import tkinter as tk
 from tkinter import BOTH, END, LEFT, RIGHT, X, Y, filedialog, messagebox, ttk
 
+from .paths import (
+    DATA_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_USER,
+)
 from .sdk_paths import add_aubo_sdk_to_path
 
 add_aubo_sdk_to_path()
 
 import pyaubo_sdk as aubo  # noqa: E402
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_POINTS_FILE = DATA_DIR / "tcp_teach_points.json"
 
 
@@ -382,10 +388,10 @@ class TcpTeachPanel(ttk.Frame):
         self.poll_after_id: str | None = None
         self.last_poll_error = ""
 
-        self.ip_var = tk.StringVar(value="192.168.50.200")
-        self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value="AUBO")
-        self.password_var = tk.StringVar(value="123456")
+        self.ip_var = tk.StringVar(value=DEFAULT_ROBOT_IP)
+        self.port_var = tk.StringVar(value=str(DEFAULT_ROBOT_PORT))
+        self.user_var = tk.StringVar(value=DEFAULT_ROBOT_USER)
+        self.password_var = tk.StringVar(value=DEFAULT_ROBOT_PASSWORD)
         self.status_var = tk.StringVar(value="未连接")
         self.robot_var = tk.StringVar(value="-")
         self.mode_var = tk.StringVar(value="-")

@@ -23,10 +23,11 @@ import numpy as np
 from .config import BOARD_CFG, E7_HAND_EYE_CFG, ROBOT_CAMERA_INTEGRATION_CFG
 from .geometry import average_transforms, make_transform, rotation_error_deg, rotx, roty, rotz
 from .io_utils import atomic_write_json, matrix_to_list, timestamp_str
+from .paths import CHARUCO_POINT_EXPERIMENTS_DIR
 
 
 DEFAULT_CANDIDATE_PATH = Path(E7_HAND_EYE_CFG.candidate_dir) / "e7_handeye_candidate_current.json"
-DEFAULT_OUTPUT_DIR = Path(r"C:\MM\aubo_tools\data\charuco_point_experiments")
+DEFAULT_OUTPUT_DIR = CHARUCO_POINT_EXPERIMENTS_DIR
 WINDOW_NAME = "ChArUco selected point hand-eye experiment (read only)"
 DEFAULT_FIXED_BASE_RZ_RAD = 1.735
 

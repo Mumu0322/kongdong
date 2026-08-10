@@ -323,10 +323,16 @@ class TwoStageGeometryTests(unittest.TestCase):
         for diameter in (64.6, 70.2, 74.7):
             self.assertEqual(min(module.HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter)), round(diameter / 5.0) * 5.0)
 
-    def test_current_handeye_and_charuco_defaults_are_explicit(self) -> None:
+    def test_motion_defaults_are_preview_and_validated_only(self) -> None:
         parser = module.build_parser()
-        self.assertTrue(parser.parse_args([]).allow_experimental_handeye)
+        defaults = parser.parse_args([])
+        self.assertFalse(defaults.execute)
+        self.assertFalse(defaults.allow_experimental_handeye)
+        self.assertFalse(defaults.move_final_xy)
         self.assertFalse(parser.parse_args(["--require-validated-handeye"]).allow_experimental_handeye)
+        self.assertTrue(parser.parse_args(["--execute"]).execute)
+        self.assertTrue(parser.parse_args(["--allow-experimental-handeye"]).allow_experimental_handeye)
+        self.assertTrue(parser.parse_args(["--move-final-xy"]).move_final_xy)
         self.assertEqual(parser.parse_args([]).final_target_mode, "gripper")
         self.assertEqual(parser.parse_args(["--final-target-mode", "normal"]).final_target_mode, "normal")
         self.assertIsNone(parser.parse_args([]).tcp_xy_offset_mm)

@@ -33,10 +33,14 @@ from aubo_workbench.motion_control import (  # noqa: E402
     DEFAULT_USER,
     sdk_ok,
 )
+from aubo_workbench.paths import (  # noqa: E402
+    HANDEYE_40_POSE_PLAN_PATH,
+    HANDEYE_40_POSE_PROGRESS_PATH,
+)
 
 
-DEFAULT_PLAN = Path(r"C:\MM\aubo_tools\data\handeye_40_pose_plan_current.json")
-DEFAULT_PROGRESS = Path(r"C:\MM\aubo_tools\data\handeye_40_pose_progress_current.json")
+DEFAULT_PLAN = HANDEYE_40_POSE_PLAN_PATH
+DEFAULT_PROGRESS = HANDEYE_40_POSE_PROGRESS_PATH
 LIVE_CONFIRMATION = "MOVE HAND-EYE POSES"
 
 

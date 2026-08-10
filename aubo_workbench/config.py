@@ -16,6 +16,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .paths import (
+    CHARUCO_CALIBRATION_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+    DATA_DIR,
+    HANDEYE_CANDIDATE_DIR,
+    HANDEYE_VALIDATION_PATH,
+)
+
 
 @dataclass
 class BoardConfig:
@@ -50,7 +62,7 @@ class BoardConfig:
 
 @dataclass
 class CameraConfig:
-    save_dir: str = r"C:\MM\aubo_tools\charuco_pointcloud_calib"
+    save_dir: str = str(CHARUCO_CALIBRATION_DIR)
     min_valid_z_mm: float = 250.0
     max_valid_z_mm: float = 1200.0
     depth_vis_min_mm: float = 250.0
@@ -83,11 +95,11 @@ class CameraConfig:
 class RobotConfig:
     # 默认自动读取 AUBO 当前 TCP 位姿。只读，不写 TCP，不控制运动。
     robot_pose_read_enable: bool = True
-    ip: str = "192.168.50.200"
-    rpc_port: int = 30004
-    user: str = "AUBO"
-    password: str = "123456"
-    request_timeout_ms: int = 1500
+    ip: str = DEFAULT_ROBOT_IP
+    rpc_port: int = DEFAULT_ROBOT_PORT
+    user: str = DEFAULT_ROBOT_USER
+    password: str = DEFAULT_ROBOT_PASSWORD
+    request_timeout_ms: int = DEFAULT_ROBOT_TIMEOUT_MS
     network_precheck_timeout_s: float = 1.0
 
     # tcp：读取当前 TCP 在基坐标系下的位姿，推荐用于眼在手。
@@ -107,16 +119,14 @@ class RobotCameraIntegrationConfig:
     """自动入孔所需权威证据文件位置；不使用可手工翻转的解锁布尔值。"""
 
     production_camera_serial: str = "CP4B85P001L"
-    handeye_validation_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\e7_handeye_validation_current.json"
-    )
+    handeye_validation_evidence_path: str = str(HANDEYE_VALIDATION_PATH)
 
 
 @dataclass
 class SolveConfig:
     # 8组只允许做诊断求解；正式E7由 E7HandEyeConfig 单独控制。
     min_samples_for_solve: int = 8
-    output_json: str = r"C:\MM\aubo_tools\data\handeye_diagnostic_current.json"
+    output_json: str = str(DATA_DIR / "handeye_diagnostic_current.json")
     also_write_compatible_key_t_tooltcp_cam: bool = False
     enable_nonlinear_refine: bool = True
     nonlinear_rotation_weight_mm: float = 80.0
@@ -135,7 +145,7 @@ class E7HandEyeConfig:
     maximum_validation_center_scatter_rms_mm: float = 0.10
     require_tcp_pose_source: bool = True
     allow_manual_pose: bool = False
-    candidate_dir: str = r"C:\MM\aubo_tools\data\e7_candidates"
+    candidate_dir: str = str(HANDEYE_CANDIDATE_DIR)
 
     # 视野覆盖必须能由原始样本自动计算，不能由人工布尔值直接声称通过。
     center_region_half_width_ratio: float = 0.22

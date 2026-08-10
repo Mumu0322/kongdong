@@ -47,9 +47,10 @@ from aubo_workbench.motion_control import (
     sdk_ok,
 )
 from aubo_workbench.quality import evaluate_image_quality
+from aubo_workbench.paths import CHARUCO_HEIGHT_ERROR_DIR
 
 
-DEFAULT_OUTPUT_ROOT = Path(r"C:\MM\aubo_tools\data\charuco_height_error")
+DEFAULT_OUTPUT_ROOT = CHARUCO_HEIGHT_ERROR_DIR
 # 默认视野实验高度：300/320/340/360 mm。
 DEFAULT_HEIGHTS_MM = (300.0, 320.0, 340.0, 360.0)
 # 1280x800 RGB画面中的3x3目标板中心；XY由操作者手动移动。

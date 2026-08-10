@@ -8,8 +8,8 @@
 深度只提供共享高度偏差 -> 逐孔使用 CAD 中心/法向规划260 mm位姿 -> 仅用当前孔
 的RGB/YOLO观测修正最终XY -> 移动到当前目标点。
 
-默认进入两阶段流程并启用实验运动；运动自动执行，仅在开始检测下一个已选孔前输入 m。
-默认允许使用当前实验手眼结果，仅适用于现场诊断，不代表生产授权。
+默认进入两阶段流程但只做预览；必须显式启用运动和相应的验证开关后，才会连接运动控制。
+默认不允许使用未通过生产验证的实验手眼结果。
 """
 
 from __future__ import annotations
@@ -51,15 +51,22 @@ from aubo_workbench.geometry import (  # noqa: E402
     rotz,
     transform_to_pose6_rzryrx,
 )
+from aubo_workbench.paths import (  # noqa: E402
+    CAD_MODEL_PATH,
+    CAD_MOTION_RUNS_DIR,
+    CAD_REGISTRATION_RUNS_DIR,
+    HANDEYE_CANDIDATE_PATH,
+    MODEL_PATH,
+    TCP_ABSOLUTE_XY_MODEL_DIR,
+    HOLE_LOCALIZATION_RUNS_DIR,
+)
 
 
-DEFAULT_MODEL = Path(r"C:\MM\models\small_silu.pt")
-DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-DEFAULT_CAD_MODEL_JSON = Path(r"C:\MM\aubo_tools\data\cad_model\cad_hole_model.json")
+DEFAULT_MODEL = MODEL_PATH
+DEFAULT_HANDEYE = HANDEYE_CANDIDATE_PATH
+DEFAULT_CAD_MODEL_JSON = CAD_MODEL_PATH
 WINDOW = "YOLO eye-in-hand hole selection (click hole, Enter=confirm, Esc=quit)"
-RUNS_DIR = ROOT.parent / "data" / "hole_localization_runs"
-CAD_REGISTRATION_RUNS_DIR = ROOT.parent / "data" / "cad_registration_runs"
-CAD_MOTION_RUNS_DIR = ROOT.parent / "data" / "cad_motion_runs"
+RUNS_DIR = HOLE_LOCALIZATION_RUNS_DIR
 HOLE_DIAMETERS_MM = (65.0, 70.0, 75.0)
 FINAL_TARGET_MODE_GRIPPER = "gripper"
 FINAL_TARGET_MODE_NORMAL = "normal"
@@ -177,15 +184,16 @@ CHARUCO_XY_MODEL_MATRIX = np.array([
 ], dtype=np.float64)
 CHARUCO_XY_MODEL_BIAS_MM = np.array([0.05229713949213546, 3.1959138367376676], dtype=np.float64)
 CHARUCO_XY_MODEL_SOURCE = Path(
-    r"C:\MM\aubo_tools\data\tcp_absolute_xy_model\charuco-tcp-xy-20260727_174559\report.json"
+    TCP_ABSOLUTE_XY_MODEL_DIR / "charuco-tcp-xy-20260727_174559" / "report.json"
 )
 
-# PyCharm 直接运行的默认模式：不需要额外命令行参数。
-# 运动自动执行，仅在开始检测下一个已选孔前输入 m。
+# 直接运行的默认模式：不需要额外命令行参数即可做离线/现场预览。
+# 只有明确传入 --execute 时才允许连接运动控制和下发机器人命令。
 DEFAULT_TWO_STAGE_HOLE_LOCALIZATION = True
-DEFAULT_EXECUTE_MOTION = True
-DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE = True
+DEFAULT_EXECUTE_MOTION = False
+DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE = False
 DEFAULT_CAD_MOTION = False
+DEFAULT_MOVE_FINAL_XY = False
 
 
 @dataclass(frozen=True)
@@ -5254,12 +5262,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cad-settle-discard-frames", type=int, default=10,
                    help="到达260 mm后丢弃的RGB预热帧数")
     p.add_argument("--execute", dest="execute", action="store_true", default=DEFAULT_EXECUTE_MOTION,
-                   help="兼容参数：默认已启用真实运动，仅开始检测下一个已选孔前需要输入 m")
+                   help="显式启用真实运动；不传入时只预览，不连接运动控制")
     p.add_argument("--no-execute", dest="execute", action="store_false",
                    help="仅预览：不连接运动控制或下发机器人运动")
     p.add_argument("--allow-experimental-handeye", dest="allow_experimental_handeye", action="store_true",
                    default=DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE,
-                   help="兼容参数：默认允许当前实验手眼结果用于现场诊断")
+                   help="显式允许当前实验手眼结果；默认只接受已验证手眼")
     p.add_argument("--require-validated-handeye", dest="allow_experimental_handeye", action="store_false",
                    help="只允许已获生产授权的手眼结果")
     p.add_argument("--speed-m-s", type=float, default=0.08,
@@ -5296,8 +5304,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FINAL_TARGET_MODE,
         help="最终点模式：gripper=机械爪模式(X+64,Z+50)，normal=平常模式(无X/Z偏置)",
     )
-    p.add_argument("--move-final-xy", dest="move_final_xy", action="store_true", default=True,
-                   help="兼容参数：两阶段流程默认已启用最终 TCP XY 微调")
+    p.add_argument("--move-final-xy", dest="move_final_xy", action="store_true", default=DEFAULT_MOVE_FINAL_XY,
+                   help="显式启用精定位后的最终 TCP XY 微调")
     p.add_argument("--no-move-final-xy", dest="move_final_xy", action="store_false",
                    help="仅排障使用：关闭精定位后的最终 TCP XY 微调")
     p.add_argument("--tcp-xy-offset-mm", type=float, nargs=2, metavar=("DX", "DY"), default=None,

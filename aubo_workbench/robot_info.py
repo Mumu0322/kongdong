@@ -13,6 +13,13 @@ import argparse
 import json
 from typing import Any, Callable
 
+from .paths import (
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+)
 from .sdk_paths import add_aubo_sdk_to_path
 
 add_aubo_sdk_to_path()
@@ -149,11 +156,11 @@ def read_all(ip: str, port: int, user: str, password: str, timeout_ms: int) -> d
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read AUBO robot information without motion commands.")
-    parser.add_argument("--ip", default="192.168.50.200")
-    parser.add_argument("--port", type=int, default=30004)
-    parser.add_argument("--user", default="AUBO")
-    parser.add_argument("--password", default="123456")
-    parser.add_argument("--timeout-ms", type=int, default=3000)
+    parser.add_argument("--ip", default=DEFAULT_ROBOT_IP)
+    parser.add_argument("--port", type=int, default=DEFAULT_ROBOT_PORT)
+    parser.add_argument("--user", default=DEFAULT_ROBOT_USER)
+    parser.add_argument("--password", default=DEFAULT_ROBOT_PASSWORD)
+    parser.add_argument("--timeout-ms", type=int, default=DEFAULT_ROBOT_TIMEOUT_MS)
     args = parser.parse_args()
 
     try:

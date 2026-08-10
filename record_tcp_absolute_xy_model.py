@@ -39,6 +39,7 @@ from aubo_workbench.charuco_point_experiment import (
 from aubo_workbench.config import ROBOT_CFG
 from aubo_workbench.geometry import average_transforms
 from aubo_workbench.motion_control import AuboMotionSession, sdk_ok
+from aubo_workbench.paths import HANDEYE_CANDIDATE_PATH, TCP_ABSOLUTE_XY_MODEL_DIR
 from aubo_workbench.robot import AuboPoseSession
 
 
@@ -46,8 +47,8 @@ from aubo_workbench.robot import AuboPoseSession
 # 用户配置区：在 PyCharm 中直接 Run；通常只修改这里
 # ============================================================================
 
-HANDEYE_PATH = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-OUTPUT_ROOT = Path(r"C:\MM\aubo_tools\data\tcp_absolute_xy_model")
+HANDEYE_PATH = HANDEYE_CANDIDATE_PATH
+OUTPUT_ROOT = TCP_ABSOLUTE_XY_MODEL_DIR
 
 # 选择 3x3 个分散的 ChArUco 内部角点；每个格点只触碰一次。
 # 当前目标是测量视野位置误差，因此每次必须选择不同角点，不做同点重复。
@@ -78,7 +79,7 @@ VISUAL_TO_TCP_MATRIX_2X2 = np.array([
 ], dtype=np.float64)
 VISUAL_TO_TCP_BIAS_MM = np.array([0.05229713949213546, 3.1959138367376676], dtype=np.float64)
 VISUAL_TO_TCP_MODEL_SOURCE = Path(
-    r"C:\MM\aubo_tools\data\tcp_absolute_xy_model\charuco-tcp-xy-20260727_174559\report.json"
+    TCP_ABSOLUTE_XY_MODEL_DIR / "charuco-tcp-xy-20260727_174559" / "report.json"
 )
 
 CAPTURE_VALID_FRAMES = 20

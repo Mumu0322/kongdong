@@ -20,21 +20,40 @@ import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable
 
+from .paths import (
+    DATA_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+)
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
 AUBO_TOOLS_DIR = PROJECT_DIR.parent
-DATA_DIR = AUBO_TOOLS_DIR / "data"
 POINTS_FILE = DATA_DIR / "aubo_motion_points.json"
 HOME_POINT_FILE = DATA_DIR / "aubo_home_point.json"
 DEFAULT_SDK_DIR = Path(r"C:\MM\third_party\aubo_sdk")
 
-DEFAULT_IP = "192.168.50.200"
-DEFAULT_PORT = 30004
-DEFAULT_USER = "AUBO"
-DEFAULT_PASSWORD = "123456"
-DEFAULT_TIMEOUT_MS = 3000
+DEFAULT_IP = DEFAULT_ROBOT_IP
+DEFAULT_PORT = DEFAULT_ROBOT_PORT
+DEFAULT_USER = DEFAULT_ROBOT_USER
+DEFAULT_PASSWORD = DEFAULT_ROBOT_PASSWORD
+DEFAULT_TIMEOUT_MS = DEFAULT_ROBOT_TIMEOUT_MS
 MOTION_FRAME_CHOICES = ("基坐标系", "工具/TCP坐标系")
+
+
+@dataclass(frozen=True)
+class MotionSafetyPolicy:
+    """底层运动会话的最小安全门。"""
+
+    require_power_on: bool = True
+    require_steady_for_position_move: bool = True
+    reject_collision: bool = True
+    require_within_safety_limits: bool = True
+    expected_dof: int = 6
 
 
 def add_local_sdk_path() -> Path | None:
@@ -238,6 +257,7 @@ class AuboMotionSession:
         self.manage: Any | None = None
         self.config: Any | None = None
         self.robot_name = ""
+        self.safety_policy = MotionSafetyPolicy()
 
     @property
     def connected(self) -> bool:
@@ -300,6 +320,40 @@ class AuboMotionSession:
         if not self.connected or self.state is None or self.motion is None or self.manage is None:
             raise RuntimeError("尚未连接机械臂。")
 
+    def _require_motion_state(self, *, require_steady: bool) -> None:
+        """检查所有运动命令都必须满足的控制器状态条件。"""
+        self.require_connected()
+        assert self.state is not None
+        policy = self.safety_policy
+
+        if policy.require_power_on and not bool(self.state.isPowerOn()):
+            raise RuntimeError("机械臂未上电，已拒绝运动命令。")
+        if policy.reject_collision and bool(self.state.isCollisionOccurred()):
+            raise RuntimeError("控制器报告发生碰撞，已拒绝继续运动。")
+        if policy.require_within_safety_limits:
+            within_limits = getattr(self.state, "isWithinSafetyLimits", None)
+            if callable(within_limits) and not bool(within_limits()):
+                raise RuntimeError("机械臂当前不在控制器安全范围内，已拒绝运动命令。")
+        if require_steady and policy.require_steady_for_position_move and not bool(self.state.isSteady()):
+            raise RuntimeError("机械臂尚未静止，已拒绝新的位置运动命令。")
+
+    def _validate_vector(self, values: list[float], label: str) -> list[float]:
+        normalized = [float(value) for value in values]
+        if len(normalized) != self.safety_policy.expected_dof:
+            raise ValueError(
+                f"{label} 必须包含 {self.safety_policy.expected_dof} 个数值，收到 {len(normalized)} 个。"
+            )
+        if not all(math.isfinite(value) for value in normalized):
+            raise ValueError(f"{label} 包含 NaN 或无穷值，已拒绝运动命令。")
+        return normalized
+
+    @staticmethod
+    def _validate_positive(value: float, label: str) -> float:
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0.0:
+            raise ValueError(f"{label} 必须是有限正数，收到 {value!r}。")
+        return normalized
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             self.require_connected()
@@ -309,6 +363,10 @@ class AuboMotionSession:
             snap["power_on"] = bool(self.state.isPowerOn())
             snap["steady"] = bool(self.state.isSteady())
             snap["collision"] = bool(self.state.isCollisionOccurred())
+            try:
+                snap["within_safety_limits"] = bool(self.state.isWithinSafetyLimits())
+            except Exception:
+                snap["within_safety_limits"] = None
             snap["robot_mode"] = str(self.state.getRobotModeType())
             snap["safety_mode"] = str(self.state.getSafetyModeType())
             snap["joints_rad"] = [float(v) for v in list(self.state.getJointPositions())]
@@ -350,39 +408,51 @@ class AuboMotionSession:
 
     def move_joint(self, joints_rad: list[float], speed_rad_s: float, acc_rad_s2: float) -> list[Any]:
         with self.lock:
-            self.require_connected()
+            joints = self._validate_vector(joints_rad, "关节目标")
+            speed = self._validate_positive(speed_rad_s, "关节速度")
+            acc = self._validate_positive(acc_rad_s2, "关节加速度")
+            self._require_motion_state(require_steady=True)
             assert self.motion is not None
             rets: list[Any] = []
             try:
                 rets.append(self.motion.clearPath())
             except Exception as exc:
                 rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveJoint([float(v) for v in joints_rad], float(speed_rad_s), float(acc_rad_s2), 0.0, 0.0))
+            rets.append(self.motion.moveJoint(joints, speed, acc, 0.0, 0.0))
             return rets
 
     def move_line(self, pose_m_rad: list[float], speed_m_s: float, acc_m_s2: float) -> list[Any]:
         with self.lock:
-            self.require_connected()
+            pose = self._validate_vector(pose_m_rad, "直线目标位姿")
+            speed = self._validate_positive(speed_m_s, "直线速度")
+            acc = self._validate_positive(acc_m_s2, "直线加速度")
+            self._require_motion_state(require_steady=True)
             assert self.motion is not None
             rets: list[Any] = []
             try:
                 rets.append(self.motion.clearPath())
             except Exception as exc:
                 rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveLine([float(v) for v in pose_m_rad], float(speed_m_s), float(acc_m_s2), 0.0, 0.0))
+            rets.append(self.motion.moveLine(pose, speed, acc, 0.0, 0.0))
             return rets
 
     def speed_joint(self, speeds_rad_s: list[float], acc_rad_s2: float, duration_s: float) -> Any:
         with self.lock:
-            self.require_connected()
+            speeds = self._validate_vector(speeds_rad_s, "关节速度向量")
+            acc = self._validate_positive(acc_rad_s2, "关节加速度")
+            duration = self._validate_positive(duration_s, "速度控制时长")
+            self._require_motion_state(require_steady=False)
             assert self.motion is not None
-            return self.motion.speedJoint([float(v) for v in speeds_rad_s], float(acc_rad_s2), float(duration_s))
+            return self.motion.speedJoint(speeds, acc, duration)
 
     def speed_line(self, speed_m_rad_s: list[float], acc_m_s2: float, duration_s: float) -> Any:
         with self.lock:
-            self.require_connected()
+            speeds = self._validate_vector(speed_m_rad_s, "直线速度向量")
+            acc = self._validate_positive(acc_m_s2, "直线加速度")
+            duration = self._validate_positive(duration_s, "速度控制时长")
+            self._require_motion_state(require_steady=False)
             assert self.motion is not None
-            return self.motion.speedLine([float(v) for v in speed_m_rad_s], float(acc_m_s2), float(duration_s))
+            return self.motion.speedLine(speeds, acc, duration)
 
     def freedrive(self, enable: bool) -> Any:
         with self.lock:

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AUBO 工具工作台：一个窗口里切换机械臂信息、运动控制、TCP 示教、眼在手标定、伞架孔验证页面。
+"""AUBO 工具工作台：切换机械臂信息、运动控制、TCP 示教、眼在手标定、孔位验证页面。
 
 每个页面都是各自模块里的独立 ttk.Frame，workbench 只负责导航栏、
-连接参数同步和统一关闭。
+连接参数同步和统一关闭。夹爪控制单独使用一个非模态窗口，便于同时操作
+其他工作台页面。
 """
 
 from __future__ import annotations
@@ -21,7 +22,16 @@ from typing import Any
 from .gui_common import GuiLogWriter
 from .gui_handeye import HandEyeGuiPanel
 from .gui_hole_localization import HoleLocalizationPanel
+from .gripper_control import GripperControlPanel
 from .motion_control import AuboMotionPanel
+from .paths import (
+    DATA_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+)
 from .robot_info import read_all
 from .tcp_teach import TcpTeachPanel
 
@@ -163,7 +173,7 @@ class RobotInfoPanel(ttk.Frame):
             messagebox.showwarning("没有数据", "请先读取机械臂信息。")
             return
         path = filedialog.asksaveasfilename(
-            initialdir=str(Path(__file__).resolve().parent.parent / "data"),
+            initialdir=str(DATA_DIR),
             initialfile="aubo_robot_info.json", defaultextension=".json",
             filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
         )
@@ -345,15 +355,17 @@ class AuboWorkbench(tk.Tk):
         self.geometry("1440x880")
         self.minsize(1160, 720)
 
-        self.ip_var = tk.StringVar(value="192.168.50.200")
-        self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value="AUBO")
-        self.password_var = tk.StringVar(value="123456")
-        self.timeout_var = tk.StringVar(value="3000")
+        self.ip_var = tk.StringVar(value=DEFAULT_ROBOT_IP)
+        self.port_var = tk.StringVar(value=str(DEFAULT_ROBOT_PORT))
+        self.user_var = tk.StringVar(value=DEFAULT_ROBOT_USER)
+        self.password_var = tk.StringVar(value=DEFAULT_ROBOT_PASSWORD)
+        self.timeout_var = tk.StringVar(value=str(DEFAULT_ROBOT_TIMEOUT_MS))
 
         self.pages: dict[str, ttk.Frame] = {}
         self.nav_buttons: dict[str, ttk.Button] = {}
         self.current_page = ""
+        self.gripper_window: tk.Toplevel | None = None
+        self.gripper_panel: GripperControlPanel | None = None
         self.old_stdout: Any | None = None
         self.old_stderr: Any | None = None
 
@@ -400,9 +412,11 @@ class AuboWorkbench(tk.Tk):
         ttk.Label(nav, text="机器人与标定", foreground="#555555").pack(anchor="w", pady=(8, 5))
         for key, text in [
             ("motion_control", "机器人控制"),
+            ("gripper", "夹爪控制"),
             ("calibration", "标定中心"),
         ]:
-            btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
+            command = self.open_gripper_window if key == "gripper" else lambda page=key: self.show_page(page)
+            btn = ttk.Button(nav, text=text, command=command)
             btn.pack(fill=X, pady=(0, 8))
             self.nav_buttons[key] = btn
         ttk.Label(nav, text="系统", foreground="#555555").pack(anchor="w", pady=(8, 5))
@@ -426,6 +440,9 @@ class AuboWorkbench(tk.Tk):
         }
 
     def show_page(self, key: str) -> None:
+        if key == "gripper":
+            self.open_gripper_window()
+            return
         if self.current_page == key:
             return
         page = self.pages.get(key)
@@ -481,7 +498,64 @@ class AuboWorkbench(tk.Tk):
             if isinstance(var, tk.StringVar):
                 var.set(value)
 
+    def open_gripper_window(self) -> None:
+        """打开独立的夹爪控制窗口，不切换或阻塞主工作台页面。"""
+
+        if self.gripper_window is not None and self.gripper_window.winfo_exists():
+            self.gripper_window.deiconify()
+            self.gripper_window.lift()
+            self.gripper_window.focus_force()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("夹爪控制 - Z-ERG-20C")
+        window.geometry("1040x760")
+        window.minsize(900, 650)
+        window.protocol("WM_DELETE_WINDOW", self.close_gripper_window)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        panel = GripperControlPanel(window)
+        panel.grid(row=0, column=0, sticky="nsew")
+        self.gripper_window = window
+        self.gripper_panel = panel
+
+        # 不使用 transient/grab_set：主工作台和夹爪窗口可以同时操作。
+        window.lift()
+        window.focus_force()
+
+    def close_gripper_window(self) -> None:
+        """关闭夹爪窗口并释放其串口连接。"""
+
+        window = self.gripper_window
+        panel = self.gripper_panel
+        if panel is not None and panel.busy:
+            messagebox.showwarning(
+                "夹爪操作进行中",
+                "当前夹爪动作尚未完成，请等待动作结束后再关闭窗口。",
+                parent=window if window is not None and window.winfo_exists() else self,
+            )
+            return
+        if panel is not None:
+            panel.on_close()
+        self.gripper_panel = None
+        self.gripper_window = None
+        if window is not None and window.winfo_exists():
+            window.destroy()
+
     def on_close(self) -> None:
+        # 主工作台退出时，夹爪窗口一并关闭；此时不再拦截正在进行的窗口关闭。
+        panel = self.gripper_panel
+        window = self.gripper_window
+        self.gripper_panel = None
+        self.gripper_window = None
+        if panel is not None:
+            try:
+                panel.on_close()
+            except Exception:
+                pass
+        if window is not None and window.winfo_exists():
+            window.destroy()
         for page in self.pages.values():
             close = getattr(page, "on_close", None)
             if callable(close):

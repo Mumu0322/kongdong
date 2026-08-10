@@ -3,6 +3,7 @@
 模块地图
 --------
 config.py           所有可调参数（dataclass 单例）
+paths.py            项目、运行数据、模型和 CAD 资源路径约定
 geometry.py          4x4 变换、旋转、位姿格式转换等纯数学函数
 io_utils.py          文件系统小工具（建目录、时间戳、矩阵<->list）
 camera.py            Gemini 435Le 相机封装（依赖 pyorbbecsdk）
@@ -34,7 +35,7 @@ workbench.py         机械臂信息/运动控制/TCP示教/手眼标定/伞架�
 """
 
 __all__ = [
-    "config", "geometry", "io_utils", "camera", "robot", "charuco_detect",
+    "config", "paths", "geometry", "io_utils", "camera", "robot", "charuco_detect",
     "drawing", "visualization", "quality", "samples", "solve", "capture",
     "gui_common", "gui_handeye", "robot_info", "motion_control", "tcp_teach",
     "charuco_height_error", "workbench",

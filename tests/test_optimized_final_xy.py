@@ -27,12 +27,12 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertEqual(final_point_offsets_for_mode("gripper"), (64.0, 50.0))
         self.assertEqual(final_point_offsets_for_mode("normal"), (0.0, 0.0))
 
-    def test_final_xy_motion_is_enabled_by_default(self):
+    def test_motion_defaults_are_preview_only(self):
         args = build_parser().parse_args([])
-        self.assertTrue(args.move_final_xy)
+        self.assertFalse(args.move_final_xy)
         self.assertTrue(args.two_stage_hole_localization)
-        self.assertTrue(args.execute)
-        self.assertTrue(args.allow_experimental_handeye)
+        self.assertFalse(args.execute)
+        self.assertFalse(args.allow_experimental_handeye)
 
     def test_coarse_normal_gate_matches_measured_depth_repeatability(self):
         self.assertEqual(TwoStageConfig().normal_tolerance_deg, 2.0)

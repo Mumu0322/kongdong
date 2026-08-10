@@ -59,14 +59,22 @@ from aubo_workbench.cad_registration import (  # noqa: E402
     undistort_pixels,
 )
 from aubo_workbench.geometry import invert_transform  # noqa: E402
+from aubo_workbench.paths import (  # noqa: E402
+    CAD_MODEL_PATH,
+    CAD_REGISTRATION_RUNS_DIR,
+    CAMERA_CALIBRATION_PATH,
+    HANDEYE_CANDIDATE_PATH,
+    MODEL_PATH,
+    STEP_MODEL_PATH,
+)
 
 
-DEFAULT_INTRINSICS = Path(r"C:\MM\aubo_tools\data\camera_calibration\current_rgb_intrinsics.json")
-DEFAULT_STEP = Path(r"C:\MM\aubo_tools\aubo_workbench_project\孔位板_JXDZ26-KWB-001.STEP")
-DEFAULT_CAD_MODEL = Path(r"C:\MM\aubo_tools\data\cad_model\cad_hole_model.json")
-DEFAULT_YOLO = Path(r"C:\MM\models\small_silu.pt")
-DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-DEFAULT_RUN_ROOT = Path(r"C:\MM\aubo_tools\data\cad_registration_runs")
+DEFAULT_INTRINSICS = CAMERA_CALIBRATION_PATH
+DEFAULT_STEP = STEP_MODEL_PATH
+DEFAULT_CAD_MODEL = CAD_MODEL_PATH
+DEFAULT_YOLO = MODEL_PATH
+DEFAULT_HANDEYE = HANDEYE_CANDIDATE_PATH
+DEFAULT_RUN_ROOT = CAD_REGISTRATION_RUNS_DIR
 CAD_PANEL_WIDTH = 330
 
 

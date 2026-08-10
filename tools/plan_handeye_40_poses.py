@@ -14,15 +14,26 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
-DEFAULT_SAMPLE_DIR = Path(r"C:\MM\aubo_tools\charuco_pointcloud_calib\samples")
-DEFAULT_HANDEYE = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-DEFAULT_JSON = Path(r"C:\MM\aubo_tools\data\handeye_40_pose_plan_current.json")
-DEFAULT_CSV = Path(r"C:\MM\aubo_tools\data\handeye_40_pose_plan_current.csv")
+from aubo_workbench.paths import (
+    CHARUCO_CALIBRATION_DIR,
+    HANDEYE_40_POSE_CSV_PATH,
+    HANDEYE_40_POSE_PLAN_PATH,
+    HANDEYE_CANDIDATE_PATH,
+)
+
+DEFAULT_SAMPLE_DIR = CHARUCO_CALIBRATION_DIR / "samples"
+DEFAULT_HANDEYE = HANDEYE_CANDIDATE_PATH
+DEFAULT_JSON = HANDEYE_40_POSE_PLAN_PATH
+DEFAULT_CSV = HANDEYE_40_POSE_CSV_PATH
 BOARD_CENTER_Q_MM = np.array([180.0, 135.0, 0.0], dtype=np.float64)
 BOARD_OUTER_CORNERS_Q_MM = np.array(
     [[0.0, 0.0, 0.0], [360.0, 0.0, 0.0], [360.0, 270.0, 0.0], [0.0, 270.0, 0.0]],
