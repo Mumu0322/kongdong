@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -14,11 +13,6 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
 
 from aubo_workbench.calibration_readiness import assess_handeye_cross_validation
 from aubo_workbench.capture import board_view_metadata, pose_bracket_report

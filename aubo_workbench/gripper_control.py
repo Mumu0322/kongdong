@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Z-ERG-20C 旋转电爪 GUI 控制页。
 
-夹爪驱动仍保存在 ``C:\MM\aubo_tools\JiaZhua\z_erg_20c.py``，本模块只负责：
+夹爪驱动仍保存在 ``C:/MM/aubo_tools/JiaZhua/z_erg_20c.py``，本模块只负责：
 
 * 读取串口/从站/波特率等连接参数；
 * 在后台线程执行 Modbus 操作，避免阻塞 Tk 主线程；

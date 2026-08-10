@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aubo-workbench"
+version = "0.1.0"
+description = "AUBO + Gemini 435Le + YOLO/CAD 孔位定位工作台"
+readme = "README.md"
+
+# 厂商 SDK pyaubo_sdk 只提供 cp310-win_amd64 的二进制扩展
+# (third_party/aubo_sdk/pyaubo_sdk.cp310-win_amd64.pyd)，
+# 因此整个项目被硬绑定在 CPython 3.10 + Windows x64。
+requires-python = ">=3.10,<3.11"
+
+# 版本按当前验证过的运行环境 (conda: lip_env310) 锁定。
+# 升级任一项都需要重跑 tests/ 并更新此处。
+dependencies = [
+    "numpy==2.2.6",
+    "opencv-python==4.13.0.92",
+    "opencv-contrib-python==4.13.0.90",
+    "scipy==1.15.3",
+    "ultralytics==8.4.51",
+    "matplotlib==3.10.8",
+    "pillow==12.1.0",
+]
+
+[project.optional-dependencies]
+# STEP 解析用的可选依赖。缺失时 aubo_workbench.cad_model 会明确报错，
+# 不会静默生成假 CAD 数据。
+cad = ["cadquery-ocp==7.9.3.1.1"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+aubo-workbench = "aubo_workbench.workbench:main"
+
+# 以下依赖不通过 pip 管理，由 aubo_workbench.sdk_paths 在运行时加入 sys.path：
+#   pyaubo_sdk    -> third_party/aubo_sdk
+#   pyorbbecsdk   -> OrbbecSDK_v2-main
+# 升级或替换 SDK 时另行建立版本记录，不要写进 dependencies。
+
+[tool.setuptools]
+# 当前仍是平铺布局：包在仓库根，入口脚本也在根。
+packages = ["aubo_workbench"]
+
+# 这些根脚本被 tests/ 和 aubo_workbench 内部反向导入，所以必须可安装。
+# 它们同时承载业务逻辑（合计约 1.2 万行），属于待偿技术债：
+# 逻辑迁入 aubo_workbench/pipelines/ 后，此列表应逐项删除。
+py-modules = [
+    "diagnose_hole_precision_pycharm",
+    "record_tcp_absolute_xy_model",
+    "run_cad_registration_preview",
+    "run_charuco_height_error_experiment",
+    "run_coarse_to_fine_offset_test",
+    "run_handeye_pose_sequence",
+    "run_hole_localization_pycharm",
+    "run_workbench",
+    "run_yolo_eye_in_hand_optimized",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

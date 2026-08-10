@@ -2,21 +2,18 @@
 # -*- coding: utf-8 -*-
 
 import json
-import sys
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from aubo_workbench.cad_model import (  # noqa: E402
+from aubo_workbench.cad_model import (
     CadModel,
     load_cad_model_json,
     parse_step_model,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CadModelTests(unittest.TestCase):
