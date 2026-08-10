@@ -187,45 +187,13 @@ T_base_cad = T_base_camera_initial @ T_camera_cad
 | `CAD_MOVE_FINAL_XY` | 是否执行 260 mm 后的最终 XY | 先用预览/单孔验证，再按现场权限开启 |
 | `CAD_BASE_Y_TRIM_MM` | 最终基坐标 Y 修正 | 当前为 `0.3 mm`，变更需重新评审 |
 
-当前最新运行报告标记为：
-
-```text
-status=completed_experimental_handeye
-handeye_validated=False
-experimental_motion_override=True
-```
-
-这表示功能链路已经跑通，不表示该手眼结果可以用于生产。
+最新运行报告的 `status` / `handeye_validated` / `experimental_motion_override` 三个字段以实际报告文件为准。当前链路已跑通，但这不表示手眼结果可以用于生产。
 
 ## 5. 最近一次 CAD 运动结果
 
-报告目录：
+具体数值以 [DR V2.0](docs/reviews/DR_镀膜伞具孔位板_CAD配准运动_阶段评审_V2.0.md) 和 `data\cad_motion_runs\` 下的运行报告为准，这里不再复制一份，避免两处数字各自漂移。
 
-`C:\MM\aubo_tools\data\cad_motion_runs\cad-motion-20260807_165112`
-
-关键结果：
-
-| 项目 | 结果 |
-|---|---:|
-| CAD 注册有效帧 | 5/5 |
-| CAD 跨帧中心 P95 | 约 0.297 mm |
-| 选定孔 | CAD-09、CAD-06、CAD-10 |
-| 340 mm 共享深度 | 8/8 帧有效 |
-| 共享深度中位高度 | 336.452 mm |
-| 高度偏移 | -3.548 mm |
-| 260 mm 精定位 | 3 个孔均 12/12 帧有效 |
-| 最终 Y trim | `+0.3 mm` |
-| 运行状态 | `completed_experimental_handeye` |
-
-260 mm 精定位诊断结果：
-
-| 孔 | 中心散布 P95 | CAD-YOLO 平均距离 | 最终 XY 修正 mm |
-|---|---:|---:|---:|
-| CAD-09 | 0.14 px | 4.92 px | `[0.4996, 2.3816]` |
-| CAD-06 | 0.22 px | 2.64 px | `[0.4866, 2.5215]` |
-| CAD-10 | 0.15 px | 4.44 px | `[0.6192, 2.4189]` |
-
-CAD-YOLO 平均距离是诊断字段，不是独立的生产放行门；最终验收还要看孔边缘覆盖、实际 TCP 记录和机械末端误差。
+需要注意的判读规则：CAD-YOLO 平均距离是诊断字段，不是独立的生产放行门；最终验收还要看孔边缘覆盖、实际 TCP 记录和机械末端误差。
 
 ## 6. 重要代码目录
 
@@ -238,11 +206,17 @@ aubo_workbench_project/
 ├── run_handeye_pose_sequence.py            # 手眼候选位姿序列实验
 ├── run_charuco_height_error_experiment.py  # ChArUco 高度/视野实验
 ├── run_coarse_to_fine_offset_test.py       # 粗到精视野偏移实验
-├── aubo_workbench/
+├── aubo_workbench/                         # 共 32 个模块，下面只列主要的
 │   ├── cad_model.py                        # CAD JSON 加载和校验
 │   ├── cad_registration.py                 # CAD↔RGB 匹配、PnP/IPPE、质量门
+│   ├── geometry.py                         # 4x4 变换、旋转、位姿格式转换（纯数学）
+│   ├── optics.py                           # 去畸变、像素光线、光线求平面、倾斜圆心修正
+│   ├── fitting.py                          # 平面/球面最小二乘拟合，含外点剔除
+│   ├── motion_guards.py                    # 运动前状态校验和到位等待（不依赖 tkinter）
+│   ├── io_utils.py                         # JSON 可序列化转换和 CSV 落盘
+│   ├── paths.py                            # 项目/数据/模型路径和连接默认值
+│   ├── config.py                           # 机器人连接参数覆盖
 │   ├── gui_hole_localization.py            # 孔洞定位页面
-│   ├── paths.py                             # 项目/数据/模型路径和连接默认值
 │   ├── gripper_control.py                  # 独立夹爪控制窗口
 │   ├── workbench.py                        # 工作台主窗口
 │   ├── robot.py                            # AUBO 只读位姿会话
@@ -250,6 +224,8 @@ aubo_workbench_project/
 │   ├── tcp_teach.py                        # TCP 示教
 │   ├── gui_handeye.py                      # 手眼标定 GUI
 │   └── ...
+├── pyproject.toml                          # 依赖与打包配置
+├── conftest.py                             # 测试 sys.path 处理
 ├── tests/                                  # 离线单元测试
 └── docs/
     ├── reviews/
@@ -291,14 +267,17 @@ aubo_workbench_project/
 
 ## 10. 离线验证
 
-当前项目最近一次完整离线测试为 115 项，通过。代码或配置变更后，建议在 `lip_env310` 环境中重新运行测试；真实硬件测试前先完成不运动 CAD 预览。
+代码或配置变更后，在 `lip_env310` 环境中重新运行下面的命令；真实硬件测试前先完成不运动 CAD 预览。这里不写具体测试条数，避免每次加测试都要改文档。
 
 连接密码不再写入业务源码。可以在启动前设置 `AUBO_PASSWORD` 环境变量，或直接在 GUI/命令行输入；未提供密码时不会自动尝试登录。
 
 ```text
 python -m py_compile aubo_workbench/*.py run_workbench.py
-python -m unittest discover -s tests -v
+python -m pytest -q
+python -m unittest discover -s tests -v   # 等价的备选
 ```
+
+两条测试命令都必须在本目录（`aubo_workbench_project`）下执行。在别的目录跑 `unittest discover -s tests` 会因为找不到 `tests` 而输出 `Ran 0 tests ... OK`，看起来像通过，实际什么都没测。
 
 离线测试覆盖 CAD 模型/注册、几何变换、RGB/ChArUco、运动计划、质量门、报告字段和夹爪控制接口；它不替代真实相机、机器人、手眼和夹爪的现场验收。
 
