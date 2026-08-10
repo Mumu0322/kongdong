@@ -37,6 +37,7 @@ from aubo_workbench.charuco_point_experiment import (
     nearest_detected_corner,
 )
 from aubo_workbench.config import ROBOT_CFG
+from aubo_workbench.io_utils import jsonable
 from aubo_workbench.geometry import average_transforms
 from aubo_workbench.motion_control import AuboMotionSession, sdk_ok
 from aubo_workbench.paths import HANDEYE_CANDIDATE_PATH, TCP_ABSOLUTE_XY_MODEL_DIR
@@ -98,18 +99,8 @@ RESUME_LATEST_INCOMPLETE = True
 RESUME_RUN_DIR: Path | None = None
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
+# 实现已统一到 aubo_workbench.io_utils.jsonable。
+_jsonable = jsonable
 
 
 def _save_json(path: Path, value: Any) -> None:

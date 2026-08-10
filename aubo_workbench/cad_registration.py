@@ -23,22 +23,10 @@ import numpy as np
 
 from .cad_model import CadHole, CadModel
 from .geometry import make_transform
+from .io_utils import jsonable
 
-
-def _jsonable(value: Any) -> Any:
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return _jsonable(value.to_dict())
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
+# 实现已统一到 io_utils.jsonable；保留原名供本模块内既有调用点使用。
+_jsonable = jsonable
 
 
 def _unit(value: Any, name: str) -> np.ndarray:

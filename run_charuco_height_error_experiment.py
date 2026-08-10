@@ -46,6 +46,12 @@ from aubo_workbench.motion_control import (
     AuboMotionSession,
     sdk_ok,
 )
+from aubo_workbench.motion_guards import (
+    angular_delta_rad,
+    pose_error,
+    validate_robot_ready,
+    wait_for_target,
+)
 from aubo_workbench.quality import evaluate_image_quality
 from aubo_workbench.paths import CHARUCO_HEIGHT_ERROR_DIR
 
@@ -204,74 +210,9 @@ def _finite(values: Iterable[Any]) -> np.ndarray:
     return np.asarray(result, dtype=np.float64)
 
 
-def _angular_delta_rad(target: float, current: float) -> float:
-    return (float(target) - float(current) + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _pose_error(target_m_rad: list[float], current_m_rad: list[float]) -> tuple[float, float]:
-    xyz_mm = float(np.linalg.norm(
-        np.asarray(target_m_rad[:3], dtype=np.float64)
-        - np.asarray(current_m_rad[:3], dtype=np.float64)
-    ) * 1000.0)
-    rotation_rad = float(np.linalg.norm([
-        _angular_delta_rad(target_m_rad[index], current_m_rad[index])
-        for index in range(3, 6)
-    ]))
-    return xyz_mm, rotation_rad
-
-
-def validate_robot_ready(snapshot: dict[str, Any]) -> None:
-    if not bool(snapshot.get("power_on")):
-        raise RuntimeError("机械臂未上电；实验脚本不会自动上电")
-    if bool(snapshot.get("collision")):
-        raise RuntimeError("控制器存在碰撞标志，拒绝继续")
-    if not bool(snapshot.get("steady")):
-        raise RuntimeError("机械臂当前未稳定")
-    pose = snapshot.get("tcp_pose_m_rad")
-    if not isinstance(pose, list) or len(pose) < 6 or not np.isfinite(
-        np.asarray(pose[:6], dtype=np.float64)
-    ).all():
-        raise RuntimeError("当前TCP位姿不可用")
-
-
-def wait_for_target(
-    session: AuboMotionSession,
-    target_m_rad: list[float],
-    timeout_s: float,
-    position_tolerance_mm: float,
-    rotation_tolerance_rad: float,
-) -> dict[str, Any]:
-    deadline = time.monotonic() + float(timeout_s)
-    last: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        last = session.snapshot()
-        if bool(last.get("collision")):
-            try:
-                session.stop_motion()
-            finally:
-                raise RuntimeError("运动期间检测到碰撞标志，已请求停止")
-        current = [float(v) for v in last["tcp_pose_m_rad"][:6]]
-        xyz_error_mm, rotation_error_rad = _pose_error(target_m_rad, current)
-        if (
-            bool(last.get("steady"))
-            and xyz_error_mm <= float(position_tolerance_mm)
-            and rotation_error_rad <= float(rotation_tolerance_rad)
-        ):
-            return {
-                "snapshot": last,
-                "position_error_mm": xyz_error_mm,
-                "rotation_error_rad": rotation_error_rad,
-            }
-        time.sleep(0.1)
-    if last is None:
-        raise TimeoutError("等待到位超时，且未读到机器人状态")
-    xyz_error_mm, rotation_error_rad = _pose_error(
-        target_m_rad, [float(v) for v in last["tcp_pose_m_rad"][:6]],
-    )
-    raise TimeoutError(
-        f"等待到位超时：位置误差={xyz_error_mm:.3f} mm，"
-        f"姿态误差={rotation_error_rad:.6f} rad"
-    )
+# 兼容原有下划线命名的模块内调用点；实现已统一到 aubo_workbench.motion_guards。
+_angular_delta_rad = angular_delta_rad
+_pose_error = pose_error
 
 
 def scalar_statistics(values: Iterable[Any]) -> dict[str, Any]:

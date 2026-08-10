@@ -11,7 +11,6 @@ X/Y 平面内横向偏移，使孔洞分别落在 0/5/10/15/20 mm 的圆形范�
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import sys
@@ -31,6 +30,7 @@ import run_yolo_eye_in_hand_optimized as loc  # noqa: E402
 from aubo_workbench.camera import get_device_identity, init_pipeline  # noqa: E402
 from aubo_workbench.charuco_point_experiment import load_handeye_experiment_result  # noqa: E402
 from aubo_workbench.config import ROBOT_CFG  # noqa: E402
+from aubo_workbench.io_utils import write_dict_rows  # noqa: E402
 
 
 DEFAULT_RADII_MM = (0.0, 5.0, 10.0, 15.0, 20.0)
@@ -481,11 +481,8 @@ def _recover_after_final_target(
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    keys = sorted({key for row in rows for key in row}) if rows else ["sample_id", "status"]
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+    """按本脚本的空表回退列写 CSV；落盘细节统一在 io_utils.write_dict_rows。"""
+    write_dict_rows(path, rows, fallback_fields=("sample_id", "status"))
 
 
 def _write_polar_plot(

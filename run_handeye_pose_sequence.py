@@ -24,6 +24,14 @@ PROJECT_DIR = Path(__file__).resolve().parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
+# 说明：angular_delta_rad 在本模块体内未直接调用，但作为既有公开名被
+# tests/test_handeye_pose_sequence.py 直接导入，因此保留再导出。
+from aubo_workbench.motion_guards import (  # noqa: E402,F401
+    angular_delta_rad,
+    pose_error,
+    validate_robot_ready,
+    wait_for_target,
+)
 from aubo_workbench.motion_control import (  # noqa: E402
     AuboMotionSession,
     DEFAULT_IP,
@@ -85,71 +93,10 @@ def pose_mm_rad_to_sdk_m_rad(values: list[float]) -> list[float]:
     ]
 
 
-def angular_delta_rad(target: float, current: float) -> float:
-    return (float(target) - float(current) + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def pose_error(target_m_rad: list[float], current_m_rad: list[float]) -> tuple[float, float]:
-    xyz_mm = math.sqrt(sum((target_m_rad[index] - current_m_rad[index]) ** 2 for index in range(3))) * 1000.0
-    rotation = math.sqrt(sum(angular_delta_rad(target_m_rad[index], current_m_rad[index]) ** 2 for index in range(3, 6)))
-    return xyz_mm, rotation
-
-
 def format_pose_mm_rad(values: list[float]) -> str:
     return (
         f"XYZ(mm)=({values[0]:.3f}, {values[1]:.3f}, {values[2]:.3f})  "
         f"RPY(rad)=({values[3]:.6f}, {values[4]:.6f}, {values[5]:.6f})"
-    )
-
-
-def validate_robot_ready(snapshot: dict[str, Any]) -> None:
-    if not bool(snapshot.get("power_on")):
-        raise RuntimeError("机械臂未上电；本脚本不会自动上电")
-    if bool(snapshot.get("collision")):
-        raise RuntimeError("控制器存在碰撞标志，拒绝运动")
-    if not bool(snapshot.get("steady")):
-        raise RuntimeError("机械臂当前未稳定，等待稳定后再试")
-    current = snapshot.get("tcp_pose_m_rad")
-    if not isinstance(current, list) or len(current) < 6 or not all(math.isfinite(float(v)) for v in current[:6]):
-        raise RuntimeError("当前TCP位姿不可用")
-
-
-def wait_for_target(
-    session: AuboMotionSession,
-    target_m_rad: list[float],
-    timeout_s: float,
-    position_tolerance_mm: float,
-    rotation_tolerance_rad: float,
-) -> dict[str, Any]:
-    deadline = time.monotonic() + float(timeout_s)
-    last_snapshot: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        snapshot = session.snapshot()
-        last_snapshot = snapshot
-        if bool(snapshot.get("collision")):
-            try:
-                session.stop_motion()
-            finally:
-                raise RuntimeError("运动期间检测到碰撞标志，已请求停止")
-        current = [float(value) for value in snapshot["tcp_pose_m_rad"][:6]]
-        xyz_error_mm, rotation_error_rad = pose_error(target_m_rad, current)
-        if (
-            bool(snapshot.get("steady"))
-            and xyz_error_mm <= float(position_tolerance_mm)
-            and rotation_error_rad <= float(rotation_tolerance_rad)
-        ):
-            return {
-                "snapshot": snapshot,
-                "position_error_mm": xyz_error_mm,
-                "rotation_error_rad": rotation_error_rad,
-            }
-        time.sleep(0.10)
-    if last_snapshot is None:
-        raise TimeoutError("等待到位超时，且未读到机器人状态")
-    current = [float(value) for value in last_snapshot["tcp_pose_m_rad"][:6]]
-    xyz_error_mm, rotation_error_rad = pose_error(target_m_rad, current)
-    raise TimeoutError(
-        f"等待到位超时：位置误差={xyz_error_mm:.3f} mm，姿态误差={rotation_error_rad:.6f} rad"
     )
 
 

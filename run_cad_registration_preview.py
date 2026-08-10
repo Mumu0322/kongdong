@@ -44,6 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from aubo_workbench.cad_model import load_cad_model_json, parse_step_model  # noqa: E402
+from aubo_workbench.config import apply_robot_connection_overrides  # noqa: E402
 from aubo_workbench.cad_registration import (  # noqa: E402
     CadFrameResult,
     CadRegistrationConfig,
@@ -126,21 +127,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_robot_connection_overrides(args: argparse.Namespace) -> None:
-    """让工作台顶部连接参数对现场只读 TCP 采集生效。"""
-
-    from aubo_workbench.config import ROBOT_CFG
-
-    for arg_name, config_name in (
-        ("robot_ip", "ip"),
-        ("robot_port", "rpc_port"),
-        ("robot_user", "user"),
-        ("robot_password", "password"),
-        ("robot_timeout_ms", "request_timeout_ms"),
-    ):
-        value = getattr(args, arg_name, None)
-        if value is not None:
-            setattr(ROBOT_CFG, config_name, value)
+# 实现已统一到 aubo_workbench.config.apply_robot_connection_overrides。
+_apply_robot_connection_overrides = apply_robot_connection_overrides
 
 
 def _collect_image_paths(args: argparse.Namespace) -> list[Path]:

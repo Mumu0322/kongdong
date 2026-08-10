@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .paths import (
     CHARUCO_CALIBRATION_DIR,
@@ -271,3 +272,25 @@ CONFLICT_DIAG_CFG = ConflictDiagnosisConfig()
 AUTO_CAPTURE_CFG = AutoCaptureConfig()
 
 ESC_KEY = 27
+
+
+# argparse 参数名 -> RobotConfig 字段名。工作台顶栏的连接参数通过命令行传给
+# 子进程脚本后，用下面的函数写回全局 ROBOT_CFG。
+_ROBOT_CONNECTION_ARG_MAP: tuple[tuple[str, str], ...] = (
+    ("robot_ip", "ip"),
+    ("robot_port", "rpc_port"),
+    ("robot_user", "user"),
+    ("robot_password", "password"),
+    ("robot_timeout_ms", "request_timeout_ms"),
+)
+
+
+def apply_robot_connection_overrides(args: Any) -> None:
+    """把命令行传入的连接参数写回全局 ROBOT_CFG；未提供的参数保持默认。
+
+    仅覆盖显式给出（非 None）的字段，因此可以只传部分参数。
+    """
+    for arg_name, config_name in _ROBOT_CONNECTION_ARG_MAP:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(ROBOT_CFG, config_name, value)

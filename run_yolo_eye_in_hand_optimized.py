@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import sys
@@ -42,7 +41,11 @@ from aubo_workbench.camera import (  # noqa: E402
     init_pipeline,
 )
 from aubo_workbench.charuco_point_experiment import load_handeye_experiment_result  # noqa: E402
-from aubo_workbench.config import ROBOT_CFG  # noqa: E402
+from aubo_workbench.config import (  # noqa: E402
+    ROBOT_CFG,
+    apply_robot_connection_overrides,
+)
+from aubo_workbench.io_utils import jsonable, write_dict_rows  # noqa: E402
 from aubo_workbench.geometry import (  # noqa: E402
     invert_transform,
     make_transform,
@@ -1139,25 +1142,12 @@ def _fuse_normals(normals: list[np.ndarray]) -> np.ndarray:
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    keys = sorted({key for row in rows for key in row}) if rows else ["stage", "frame_index", "error"]
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+    """按本脚本的空表回退列写 CSV；落盘细节统一在 io_utils.write_dict_rows。"""
+    write_dict_rows(path, rows, fallback_fields=("stage", "frame_index", "error"))
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
+# 实现已统一到 aubo_workbench.io_utils.jsonable。
+_jsonable = jsonable
 
 
 def _overlay(image: np.ndarray, detection: dict[str, Any] | None,
@@ -5319,18 +5309,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _apply_robot_connection_overrides(args: Any) -> None:
-    """让工作台顶栏连接参数对独立定位进程生效。"""
-    for arg_name, config_name in (
-        ("robot_ip", "ip"),
-        ("robot_port", "rpc_port"),
-        ("robot_user", "user"),
-        ("robot_password", "password"),
-        ("robot_timeout_ms", "request_timeout_ms"),
-    ):
-        value = getattr(args, arg_name, None)
-        if value is not None:
-            setattr(ROBOT_CFG, config_name, value)
+# 实现已统一到 aubo_workbench.config.apply_robot_connection_overrides。
+_apply_robot_connection_overrides = apply_robot_connection_overrides
 
 
 def main(argv: list[str] | None = None) -> int:
