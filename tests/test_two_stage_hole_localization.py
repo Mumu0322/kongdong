@@ -233,13 +233,34 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertEqual(len(result["attempts"]), 3)
         self.assertEqual(result["attempts"][-1]["fusion_status"], "degraded_failed")
 
-    def test_next_hole_confirmation_is_the_only_sequential_pause_event(self) -> None:
+    def test_next_hole_confirmation_is_kept_between_selected_holes(self) -> None:
         output = StringIO()
         with patch("builtins.input", return_value="m"), redirect_stdout(output):
             command = module._request_next_hole_confirmation(1, 2)
         self.assertEqual(command, "m")
         self.assertIn("[NEXT_HOLE_CONFIRM_REQUIRED]", output.getvalue())
         self.assertIn("下一个检测孔=2", output.getvalue())
+
+    def test_next_cycle_confirmation_blocks_second_initial_capture(self) -> None:
+        with patch("builtins.input", return_value="m"):
+            command = module._request_next_cycle_confirmation(1)
+        self.assertEqual(command, "m")
+
+    def test_initial_capture_waits_for_two_steady_reads(self) -> None:
+        first = np.eye(4)
+        second = np.eye(4)
+        second[0, 3] = 1.0
+        with patch.object(
+            module,
+            "_wait_robot_steady",
+            side_effect=[({}, first), ({}, second)],
+        ) as wait_steady, patch.object(module.time, "sleep") as sleep:
+            actual = module._wait_robot_steady_before_initial_capture(
+                object(), settle_delay_s=0.5,
+            )
+        self.assertEqual(wait_steady.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+        self.assertTrue(np.allclose(actual, second))
 
     def test_timing_recorder_persists_completed_and_failed_events(self) -> None:
         report: dict[str, object] = {}
@@ -287,7 +308,10 @@ class TwoStageGeometryTests(unittest.TestCase):
                 "synthetic precision", np.eye(4), np.eye(4), args,
                 motion, None, require_confirmation=False, motion_profile="precision",
             )
-        self.assertEqual(motion.calls, [(0.05, 0.15), (0.04, 0.12), (0.03, 0.10)])
+        self.assertEqual(
+            motion.calls,
+            [(0.05, 0.15), (0.04, 0.12), (0.03, 0.10)],
+        )
 
     def test_choose_boxes_uses_clicked_count_when_count_is_omitted(self) -> None:
         image = np.zeros((120, 160, 3), dtype=np.uint8)
@@ -318,6 +342,54 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertIsNotNone(selection)
         assert selection is not None
         self.assertEqual(selection[0], [0])
+
+    def test_initial_selection_degrades_one_bad_plane_to_shared_navigation_plane(self) -> None:
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            xyz_map_mm=np.zeros((120, 160, 3), dtype=np.float64),
+            intrinsics=self.intrinsics,
+        )
+        detections = [
+            {"box": [620.0, 340.0, 660.0, 380.0], "center": [640.0, 360.0], "class_id": 0},
+            {"box": [680.0, 340.0, 720.0, 380.0], "center": [700.0, 360.0], "class_id": 0},
+        ]
+        good_plane = module.PlaneEstimate(
+            point_camera_mm=np.array([0.0, 0.0, 1000.0]),
+            normal_camera=np.array([0.0, 0.0, 1.0]),
+            rmse_mm=1.0,
+            ring_points=20,
+            surface_model="ring",
+        )
+        bad_plane = module.PlaneEstimate(
+            point_camera_mm=np.array([0.0, 0.0, 1010.0]),
+            normal_camera=np.array([0.0, 0.0, 1.0]),
+            rmse_mm=22.9,
+            ring_points=20,
+            surface_model="ring",
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_aligned_frame_bundle", return_value=bundle), \
+                patch.object(module, "detect", return_value=detections), \
+                patch.object(
+                    module, "choose_boxes",
+                    return_value=([0, 1], [[640.0, 360.0], [700.0, 360.0]]),
+                ), \
+                patch.object(module, "hole_camera_point", return_value=(np.array([0.0, 0.0, 1000.0]), {})), \
+                patch.object(module, "_plane_estimate_from_info", side_effect=[good_plane, bad_plane]), \
+                patch.object(module.cv2, "imwrite", return_value=True):
+            _, holes, group_center, group_plane, _ = module._capture_initial_multi_hole_selection(
+                pipeline=object(), align=object(), chain=object(), model=object(),
+                confidence=0.5, run_dir=Path(directory), max_plane_rmse_mm=3.5,
+            )
+
+        self.assertEqual(len(holes), 2)
+        self.assertFalse(holes[0]["initial_geometry_fallback"])
+        self.assertTrue(holes[1]["initial_geometry_fallback"])
+        self.assertEqual(holes[1]["initial_surface_model"], "initial_group_plane_fallback")
+        self.assertEqual(holes[1]["initial_geometry_fallback_reason"].split(":", 1)[0], "ValueError")
+        self.assertTrue(np.allclose(group_center, [0.0, 0.0, 1000.0]))
+        self.assertAlmostEqual(group_plane.rmse_mm, 1.0)
 
     def test_diameter_categories_cover_all_supported_holes(self) -> None:
         for diameter in (64.6, 70.2, 74.7):

@@ -70,21 +70,22 @@
 
 `C:\MM\aubo_tools\aubo_workbench_project\run_hole_localization_pycharm.py`
 
-正式使用优先从 GUI 点击 CAD 相关按钮。每次开始一次真实运动前，流程会重新做实时 CAD 配准，策略为 `fresh_live_auto_each_run`，不直接复用上一次报告中的旧位姿。
+正式使用优先从 GUI 点击 CAD 相关按钮。每次开始一次真实运动前，流程会先连接运动会话并回到保存的原点/观察位，等待机器人稳定后再重新做实时 CAD 配准，策略为 `fresh_live_auto_each_run`，不直接复用上一次报告中的旧位姿。预览模式不自动移动机器人。
 
 安全默认值：主脚本、PyCharm 配置入口和 GUI 默认只预览，不执行真实运动、不启用实验手眼、不执行最终 XY。只有明确传入 `--execute` 或在配置/GUI 中逐项打开对应开关，且通过独立安全门后，才允许下发运动。
 
 运动流程为：
 
-1. 连接机器人并回到保存的原点/安全位置；
-2. 根据 CAD 投影选择本次要处理的一个或多个孔；
-3. 根据所选孔的 CAD 中心和法向规划共同视野位置，使所选孔尽可能处于相机视野中心；
-4. 在共同视野位置约 340 mm 采集一次 RGB-D，用于得到孔组共享高度偏移；
-5. 逐孔移动到 CAD 规划的约 260 mm 精定位位姿；
-6. 丢弃稳定等待帧后采集 RGB/YOLO，使用 CAD 投影附近的检测计算最终 XY 修正；
-7. 继续沿用 ChArUco TCP-XY 补偿；
-8. 执行最终 Z、工具/夹爪偏置以及基坐标 `+Y 0.3 mm`；
-9. 到达每个目标后保存结果，并由操作员确认是否继续下一个孔。
+1. 连接机器人并回到保存的原点/观察位；
+2. 等待机器人稳定，在原点处采集 5 帧 RGB，完成 CAD 与当前相机画面的自动配准；
+3. 根据原点处的 CAD 投影选择本次要处理的一个或多个孔；
+4. 根据所选孔的 CAD 中心和法向规划共同视野位置，使所选孔尽可能处于相机视野中心；
+5. 在共同视野位置约 340 mm 采集一次 RGB-D，用于得到孔组共享高度偏移；
+6. 逐孔移动到 CAD 规划的约 260 mm 精定位位姿；
+7. 丢弃稳定等待帧后采集 RGB/YOLO，使用 CAD 投影附近的检测计算最终 XY 修正；
+8. 继续沿用 ChArUco TCP-XY 补偿；
+9. 执行最终 Z、工具/夹爪偏置以及基坐标 `+Y 0.3 mm`；
+10. 到达每个目标后保存结果，并由操作员确认是否继续下一个孔。
 
 注意：340 mm 不是某一个孔单独的参考高度。单孔时使用单孔深度；选定 2～3 个孔时使用选定孔共享高度；选定不少于 4 个孔时使用至少 4 个有效孔进行共享高度估计。这样不需要对每个孔重复做 340 mm 深度采集。
 
@@ -96,12 +97,13 @@
 
 1. 回原点后在初始 RGB-D 画面中点击一个或多个孔，按 Enter/空格确认；
 2. 按初始孔号逐孔处理，先安全抬升/横移，再移动到该孔约 340 mm 粗定位位；
-3. 在 340 mm 采集点云孔口环带，拟合局部平面，求 YOLO 中心射线与平面的交点、孔中心和法向；
+3. 在 340 mm 采集点云孔口外侧环带，只保留朝相机最近的前表面深度簇，拟合局部平面，求 YOLO 中心射线与平面的交点、孔中心和法向；
 4. 根据中心偏差和法向误差做最多 2 次粗定位闭环修正，仍未通过质量门则停止；
 5. 依据该孔点云平面逐次只修正基坐标 Z，到约 260 mm；
 6. 在 260 mm 只采 RGB/YOLO 多帧，精定位中心仍锁定在该孔的点云锚点附近，并用 RGB 中心与粗平面求精定位点；
 7. 保留 ChArUco TCP-XY 补偿、最终 Z、工具/夹爪偏置和基坐标 `+Y 0.3 mm`；
-8. 当前孔完成后，输入 `m` 才开始下一个已选孔；每个孔的粗中心、法向、精中心和运动结果都会写入两阶段报告。
+8. 当前孔完成后，输入 `m` 才开始下一个已选孔；每个孔的粗中心、法向、精中心和运动结果都会写入两阶段报告；
+9. 本轮所有孔完成后，真实运动模式先让机器人保持当前位置；随后等待操作员点击 GUI 的“开始下一轮检测”（命令行输入 `m`），确认后才回到原点，确认完全停止后再采集下一轮初始画面。相机和机器人会话保持运行；在选孔窗口按 `Esc` 或取消确认可结束会话。预览模式只执行一轮。
 
 两条路径的职责区别如下：
 
@@ -113,6 +115,10 @@
 | 法向来源 | CAD 法向 | 340 mm 点云局部平面法向 |
 | 结果目录 | `data\cad_motion_runs\cad-motion-*` | `data\hole_localization_runs\two-stage-*` |
 | 入口开关 | `CAD_MOTION_MODE=True` 或 `--cad-motion` | `CAD_MOTION_MODE=False` 且 `TWO_STAGE_MODE=True`，或 `--two-stage-hole-localization` |
+
+旧两阶段在真实运动模式下默认启用粗定位缓存复用：初始选孔后在当前位置追加 3 帧 RGB-D，单孔至少 2 帧有效才写入当前运行目录的 `coarse_cache/manifest.json` 和 `hole_XX.npz`；同时把成功粗定位的几何摘要和局部点云保存到固定的 `data\hole_localization_coarse_cache`。缓存点云使用“孔口外侧环带 + 最近前表面”策略；算法策略变化时旧缓存自动拒绝并重建。后续运行按机器人 base 坐标匹配历史孔位，不依赖上一次孔号；匹配成功后先安全到达 340 mm，再直接调用缓存的中心、平面和法向，不再对目标孔采现场复核帧，也不再用现场深度改写缓存 Z，随后进入260 mm高度修正和RGB精定位。相机序列号、手眼矩阵/路径、内参和畸变不兼容时拒绝历史缓存；缓存缺失或损坏时自动执行原粗定位并刷新当前运行及持久化缓存。预览模式不建立或使用缓存，CAD 路径不读取该开关。
+
+命令行可显式控制：`--reuse-coarse-cache`（默认）或 `--no-reuse-coarse-cache`，以及跨运行的 `--reuse-persistent-coarse-cache`（默认）或 `--no-reuse-persistent-coarse-cache`。0.3秒停稳缓冲只用于缓存缺失/损坏后的完整粗定位回退，直接命中缓存时不等待；可用 `--coarse-settle-delay-s` 调整回退缓冲。base 坐标匹配、缓存直接调用/回退状态及估算节省时间会写入两阶段 `report.json`。
 
 `run_hole_localization_pycharm.py` 当前默认将 `CAD_MOTION_MODE=True`；主脚本参数的默认值仍是 `CAD_MOTION=False`、`two_stage_hole_localization=True`。因此直接运行主脚本时必须明确确认自己要进入哪条路径，不能根据文件名猜测。
 
@@ -206,9 +212,10 @@ aubo_workbench_project/
 ├── run_handeye_pose_sequence.py            # 手眼候选位姿序列实验
 ├── run_charuco_height_error_experiment.py  # ChArUco 高度/视野实验
 ├── run_coarse_to_fine_offset_test.py       # 粗到精视野偏移实验
-├── aubo_workbench/                         # 共 32 个模块，下面只列主要的
+├── aubo_workbench/                         # 共 33 个模块，下面只列主要的
 │   ├── cad_model.py                        # CAD JSON 加载和校验
 │   ├── cad_registration.py                 # CAD↔RGB 匹配、PnP/IPPE、质量门
+│   ├── coarse_cache.py                     # 旧两阶段当前运行/基坐标持久化缓存
 │   ├── geometry.py                         # 4x4 变换、旋转、位姿格式转换（纯数学）
 │   ├── optics.py                           # 去畸变、像素光线、光线求平面、倾斜圆心修正
 │   ├── fitting.py                          # 平面/球面最小二乘拟合，含外点剔除
@@ -244,9 +251,34 @@ aubo_workbench_project/
 | `C:\MM\aubo_tools\data\cad_registration_runs` | CAD 预览原图、叠加图、映射和配准报告 |
 | `C:\MM\aubo_tools\data\cad_motion_runs` | CAD 真实/预览运动报告、共享深度和逐孔精定位结果 |
 | `C:\MM\aubo_tools\data\cad_motion_runs\...\fine_visualizations` | 260 mm 每孔逐帧可视化、CAD 投影、YOLO 框和残差 |
+| `C:\MM\aubo_tools\data\hole_localization_runs` | 旧两阶段报告；启用缓存时每次运行的 `two-stage-*\coarse_cache` 保存 manifest 和局部点云 NPZ |
+| `C:\MM\aubo_tools\data\hole_localization_coarse_cache` | 旧两阶段跨运行 base 坐标缓存；按当前初始选孔的 base 坐标匹配后，在安全到达 340 mm 后直接调用 |
 | `C:\MM\aubo_tools\data\e7_candidates` | 手眼候选和验证状态 |
 | `C:\MM\aubo_tools\data\tcp_absolute_xy_model` | ChArUco TCP-XY 模型及报告 |
 | `C:\MM\aubo_tools\data\charuco_height_error` | ChArUco 高度/视野实验数据 |
+
+### NPZ 局部点云可视化
+
+粗定位缓存的 NPZ 已经包含逐帧环带点云、帧索引、相机内参、缓存采集位姿、
+基坐标变换和质量统计，不需要转换成 PLY。使用工具查看单孔：
+
+~~~
+python tools\visualize_coarse_cache.py --cache-dir C:\MM\aubo_tools\data\hole_localization_coarse_cache --hole-id 3 --show
+~~~
+
+需要和 RGB 图叠加时，传入与缓存采集时相同相机位姿下的 RGB 图片：
+
+~~~
+python tools\visualize_coarse_cache.py --cache-dir C:\MM\aubo_tools\data\hole_localization_coarse_cache --hole-id 3 --rgb C:\path\to\rgb.png --output C:\MM\hole_03_cache.png
+~~~
+
+真实运行建立初始缓存时，三帧共享RGB快照会保存到本次运行的
+coarse_cache\initial_cache_rgb_frame_00.png 等文件，并记录在报告的
+coarse_cache.rgb_snapshot_images 中。
+工具左侧显示三维点云和缓存法向，右侧把相机坐标点投影到 RGB 图；
+参数 --coordinate-frame base 可切换到基坐标显示，参数 --frame 1 可只查看某一帧，
+参数 --list-holes 可列出缓存孔号。RGB 图片必须和缓存点云来自同一采集位姿，
+否则投影叠加只具有参考意义。
 
 ## 8. 夹爪控制
 

@@ -31,7 +31,7 @@
 | RGB YOLO + 椭圆拟合精定位 | `fit_hole_ellipse`、`_capture_fine_burst`、`_fuse_fine` | 不改动，只做最终 XY 修正 |
 | 最终 Z 规划 | `plan_final_tcp_base_z` | 不改动 |
 | 机械爪 X/Z 偏置 | `apply_final_point_base_offsets`、`final_point_offsets_for_mode` | 不改动 |
-| 基坐标 +Y 0.2 mm | `plan_final_tcp_base_y_trim`（`FINAL_BASE_Y_AFTER_Z_MM`） | 不改动 |
+| 基坐标 +Y 0.3 mm | `plan_final_tcp_base_y_trim`（`FINAL_BASE_Y_AFTER_Z_MM`） | 不改动 |
 | ChArUco TCP-XY 补偿 | `record_tcp_absolute_xy_model.py` 相关模型 | 不改动，在最终 XY 之后按现有方式应用 |
 | 运动前人工确认/安全快照 | `_require_safe_snapshot`、`_request_motion_confirmation`、`_confirm_and_move_line` | 不改动，CAD 配准阶段同样禁止无确认自动运动 |
 

@@ -55,6 +55,9 @@ HANDEYE_VALIDATION_PATH = DATA_DIR / "e7_handeye_validation_current.json"
 HANDEYE_DIAGNOSTIC_PATH = DATA_DIR / "handeye_diagnostic_current.json"
 
 HOLE_LOCALIZATION_RUNS_DIR = DATA_DIR / "hole_localization_runs"
+# 旧两阶段的跨运行局部点云缓存。缓存中的几何均落在机器人 base 坐标系，
+# 每次复用前仍必须在340 mm现场验证；CAD流程不读取此目录。
+HOLE_LOCALIZATION_COARSE_CACHE_DIR = DATA_DIR / "hole_localization_coarse_cache"
 CAD_MOTION_RUNS_DIR = DATA_DIR / "cad_motion_runs"
 CAD_REGISTRATION_RUNS_DIR = DATA_DIR / "cad_registration_runs"
 CHARUCO_HEIGHT_ERROR_DIR = DATA_DIR / "charuco_height_error"

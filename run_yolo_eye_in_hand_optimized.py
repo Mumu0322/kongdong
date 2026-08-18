@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,20 @@ from aubo_workbench.camera import (  # noqa: E402
     init_pipeline,
 )
 from aubo_workbench.charuco_point_experiment import load_handeye_experiment_result  # noqa: E402
+from aubo_workbench.coarse_cache import (  # noqa: E402
+    CacheValidationGates,
+    CoarseCacheEntry,
+    cache_entry_compatibility_reasons,
+    load_cache_entries,
+    load_persistent_cache_entries,
+    match_entries_by_base_point,
+    rekey_cache_entry,
+    save_cache_entries,
+    save_persistent_cache_entries,
+    transform_cached_points_to_camera,
+    validate_cache_entry,
+    replace_base_z,
+)
 from aubo_workbench.config import (  # noqa: E402
     ROBOT_CFG,
     apply_robot_connection_overrides,
@@ -78,6 +92,7 @@ from aubo_workbench.paths import (  # noqa: E402
     CAD_MOTION_RUNS_DIR,
     CAD_REGISTRATION_RUNS_DIR,
     HANDEYE_CANDIDATE_PATH,
+    HOLE_LOCALIZATION_COARSE_CACHE_DIR,
     MODEL_PATH,
     TCP_ABSOLUTE_XY_MODEL_DIR,
     HOLE_LOCALIZATION_RUNS_DIR,
@@ -90,6 +105,10 @@ DEFAULT_CAD_MODEL_JSON = CAD_MODEL_PATH
 WINDOW = "YOLO eye-in-hand hole selection (click hole, Enter=confirm, Esc=quit)"
 RUNS_DIR = HOLE_LOCALIZATION_RUNS_DIR
 HOLE_DIAMETERS_MM = (65.0, 70.0, 75.0)
+# 旧两阶段点云只允许使用孔口外侧、朝相机最近的表面。
+# 这与CAD深度路径使用的兼容默认环带分开，避免改变CAD流程。
+COARSE_SURFACE_SELECTION_POLICY = "front_surface_outer_ring_v2"
+COARSE_SURFACE_MODEL = "local_tangent_plane_front_surface_outer_ring_v2"
 FINAL_TARGET_MODE_GRIPPER = "gripper"
 FINAL_TARGET_MODE_NORMAL = "normal"
 DEFAULT_FINAL_TARGET_MODE = FINAL_TARGET_MODE_GRIPPER
@@ -100,6 +119,13 @@ FINAL_BASE_Y_AFTER_Z_MM = 0.3
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
 # 机器人到位检测只影响轮询响应，不改变控制器的运动轨迹。
 ROBOT_STEADY_POLL_INTERVAL_S = 0.10
+# 回到原点后，开始下一轮初始拍摄前再留出一小段静止缓冲，避免相机抓到末端
+# 刚停止时的残余振动帧或控制器状态切换瞬间。
+ROBOT_INITIAL_CAPTURE_SETTLE_DELAY_S = 0.50
+
+
+class TwoStageSelectionCancelled(RuntimeError):
+    """用户在回原点后的新一轮初始选孔窗口中按 Esc 退出。"""
 
 
 class TimingRecorder:
@@ -237,6 +263,9 @@ class TwoStageConfig:
     initial_max_plane_rmse_mm: float = 3.5
     max_plane_rmse_mm: float = 3.5
     coarse_settle_frames: int = 5
+    # 缓存缺失或损坏回退完整粗定位时，到达340 mm后给机械臂/相机的
+    # 固定停稳缓冲；直接命中base缓存时不等待、不做现场复核。
+    coarse_settle_delay_s: float = 0.3
     coarse_max_attempt_multiplier: int = 4
     max_coarse_center_scatter_p95_px: float = 0.8
     fine_stable_min_frames: int = 15
@@ -326,6 +355,11 @@ class PlaneEstimate:
     sphere_center_camera_mm: np.ndarray | None = None
     sphere_radius_mm: float | None = None
     surface_plane_point_camera_mm: np.ndarray | None = None
+    points_camera_mm: np.ndarray | None = None
+    surface_selection_policy: str = "legacy"
+    front_surface_z_mm: float | None = None
+    ring_points_raw: int | None = None
+    surface_points_selected: int | None = None
 
 
 @dataclass
@@ -339,6 +373,7 @@ class Observation:
     error: str | None = None
     center_source: str = "unknown"
     quality_note: str | None = None
+    tracking_distance_px: float | None = None
 
 
 def load_yolo(model_path: Path):
@@ -381,6 +416,8 @@ def hole_camera_point(
     *,
     ray_center_xy: tuple[float, float] | np.ndarray | None = None,
     ray_center_is_undistorted: bool = False,
+    include_points: bool = False,
+    surface_selection_policy: str = "legacy",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """用孔外环带拟合平面，再将孔中心射线与平面求交。
 
@@ -390,9 +427,28 @@ def hole_camera_point(
     """
     ring_u, ring_v = map(float, ring_center_xy)
     h, w = xyz_map_mm.shape[:2]
+    policy = str(surface_selection_policy).strip().lower()
+    if policy == COARSE_SURFACE_SELECTION_POLICY:
+        # YOLO框可能略小于真实孔口；把内圈再向外收，避免孔壁/孔底进入拟合。
+        ring_inner_factor = 1.25
+        ring_outer_factor = 1.50
+        front_percentile = 5.0
+        surface_band_mm = 8.0
+        min_surface_fraction = 0.03
+        surface_model = COARSE_SURFACE_MODEL
+    elif policy == "legacy":
+        ring_inner_factor = 1.08
+        ring_outer_factor = 1.35
+        front_percentile = 20.0
+        surface_band_mm = 8.0
+        min_surface_fraction = 0.10
+        surface_model = "local_tangent_plane"
+    else:
+        raise ValueError(f"未知点云表面筛选策略：{surface_selection_policy!r}")
+
     # 只在孔附近建立环带网格，避免每个粗定位帧都为整幅RGB-D图创建
-    # 1280x800级别的坐标矩阵；环带定义与原实现保持一致。
-    ring_outer_px = max(8.0, radius_px * 1.35)
+    # 1280x800级别的坐标矩阵；环带定义按策略选择。
+    ring_outer_px = max(8.0, radius_px * ring_outer_factor)
     x0 = max(0, int(math.floor(ring_u - ring_outer_px - 1.0)))
     x1 = min(w, int(math.ceil(ring_u + ring_outer_px + 2.0)))
     y0 = max(0, int(math.floor(ring_v - ring_outer_px - 1.0)))
@@ -401,7 +457,10 @@ def hole_camera_point(
         raise ValueError("孔环带超出深度图范围，无法提取点云")
     yy, xx = np.mgrid[y0:y1, x0:x1]
     rr = np.hypot(xx - ring_u, yy - ring_v)
-    ring = (rr >= max(4.0, radius_px * 1.08)) & (rr <= max(8.0, radius_px * 1.35))
+    ring = (
+        (rr >= max(4.0, radius_px * ring_inner_factor))
+        & (rr <= max(8.0, radius_px * ring_outer_factor))
+    )
     points = xyz_map_mm[y0:y1, x0:x1][ring]
     points = points[np.isfinite(points).all(axis=1)]
     points = points[(points[:, 2] > 100.0) & (points[:, 2] < 3000.0)]
@@ -412,10 +471,18 @@ def hole_camera_point(
     # 镀膜伞具的孔壁/孔内深度会落入环带；它们通常比外表面离相机更远，
     # 混入后会把局部平面RMSE拉到二十多毫米。按前景深度簇筛选外表面，
     # 同时保留足够带宽覆盖孔面倾斜与局部曲率。
-    front_surface_z = float(np.percentile(points[:, 2], 20.0))
-    surface_band_mm = 8.0
-    surface_points = points[np.abs(points[:, 2] - front_surface_z) <= surface_band_mm]
-    if len(surface_points) >= max(80, int(len(points) * 0.10)):
+    front_surface_z = float(np.percentile(points[:, 2], front_percentile))
+    # 相机坐标Z沿视线向远处增加，因此孔口前表面必须取最小深度簇，
+    # 不能用“离第20百分位绝对值相近”把更远的孔底簇带回来。
+    surface_points = points[points[:, 2] <= front_surface_z + surface_band_mm]
+    min_surface_points = max(80, int(len(points) * min_surface_fraction))
+    if len(surface_points) < min_surface_points:
+        if policy == COARSE_SURFACE_SELECTION_POLICY:
+            raise ValueError(
+                "孔口前表面有效点不足，拒绝把孔底/孔壁混入平面："
+                f"{len(surface_points)}/{min_surface_points}"
+            )
+    else:
         points = surface_points
     # 粗拍姿态只需要选中孔处的局部切平面。对单孔窄环带拟合整球半径
     # 数值病态，且镀膜反光会使球心/法向跳变；不能用它直接规划TCP姿态。
@@ -444,7 +511,7 @@ def hole_camera_point(
     point = ray * scale
     if not np.isfinite(point).all() or point[2] <= 0:
         raise ValueError("孔中心反投影得到无效深度")
-    return point, {
+    result = {
         "ring_points": int(len(points)),
         "ring_points_raw": raw_ring_points,
         "front_surface_z_mm": front_surface_z,
@@ -454,7 +521,13 @@ def hole_camera_point(
         # 当前中心仍由中心射线与该局部平面求交得到。
         "local_plane_point_camera_mm": plane_point.tolist(),
         "plane_point_camera_mm": point.tolist(),
-        "surface_model": "local_tangent_plane",
+        "surface_model": surface_model,
+        "surface_selection_policy": policy,
+        "ring_inner_factor": float(ring_inner_factor),
+        "ring_outer_factor": float(ring_outer_factor),
+        "front_surface_percentile": float(front_percentile),
+        "surface_band_mm": float(surface_band_mm),
+        "surface_points_selected": int(len(points)),
         "sphere_center_camera_mm": sphere_center.tolist() if sphere_center is not None else None,
         "sphere_radius_mm": sphere_radius,
         "sphere_rmse_mm": sphere_rmse,
@@ -462,6 +535,9 @@ def hole_camera_point(
         "ray_center_px": ray_center.tolist(),
         "ray_center_is_undistorted": bool(ray_center_is_undistorted),
     }
+    if include_points:
+        result["points_camera_mm"] = np.asarray(points, dtype=np.float32)
+    return point, result
 
 
 def choose_boxes(image: np.ndarray, detections: list[dict[str, Any]], count: int | None = None,
@@ -1127,6 +1203,20 @@ def _wait_robot_steady(pose_session: Any, timeout_s: float = 45.0) -> tuple[dict
     raise RuntimeError(f"等待机器人稳定超时：{last_reason}")
 
 
+def _wait_robot_steady_before_initial_capture(
+    pose_session: Any,
+    *,
+    settle_delay_s: float = ROBOT_INITIAL_CAPTURE_SETTLE_DELAY_S,
+) -> np.ndarray:
+    """在初始选孔拍摄前再次确认停稳，并丢开停止瞬间的残余振动。"""
+    _, actual = _wait_robot_steady(pose_session)
+    delay = max(0.0, float(settle_delay_s))
+    if delay > 0.0:
+        time.sleep(delay)
+    _, actual = _wait_robot_steady(pose_session)
+    return np.asarray(actual, dtype=np.float64).copy()
+
+
 def _print_motion_preview(label: str, current: np.ndarray, target: np.ndarray, extra: str = "") -> None:
     delta = np.asarray(target[:3, 3]) - np.asarray(current[:3, 3])
     rotation = _angle_deg(current[:3, 2], target[:3, 2])
@@ -1206,8 +1296,6 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
     return actual
 
 
-
-
 def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_session: Any) -> np.ndarray:
     snapshot, current = _require_safe_snapshot(pose_session)
     current_joints = np.asarray(snapshot.get("joints_rad", []), dtype=np.float64)
@@ -1257,7 +1345,7 @@ def _capture_initial_multi_hole_selection(
     pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
     run_dir: Path, max_plane_rmse_mm: float, count: int | None = None,
 ) -> tuple[Any, list[dict[str, Any]], np.ndarray, PlaneEstimate, Any]:
-    """初始画面选择任意数量的孔，按 Enter 结束并记录每孔联合几何导航数据。"""
+    """初始画面选择任意数量的孔，并允许单孔深度异常降级到共享平面导航。"""
     required = None if count is None else max(1, int(count))
     bundle = None
     for _ in range(10):
@@ -1273,7 +1361,7 @@ def _capture_initial_multi_hole_selection(
         bundle.color_bgr, detections, count=required, return_clicks=True,
     )
     if selection is None:
-        raise RuntimeError("未选择初始孔")
+        raise TwoStageSelectionCancelled("用户取消初始选孔")
     selected_indices, selection_clicks = selection
     selected = [detections[index] for index in selected_indices]
     class_ids = {int(item.get("class_id", -1)) for item in selected}
@@ -1284,35 +1372,121 @@ def _capture_initial_multi_hole_selection(
     points_camera: list[np.ndarray] = []
     normals_camera: list[np.ndarray] = []
     overlays: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-    for hole_id, (detection_index, detection) in enumerate(zip(selected_indices, selected), start=1):
-        selection_click = np.asarray(selection_clicks[detection_index], dtype=np.float64).reshape(2)
+    geometries: list[dict[str, Any] | None] = []
+    geometry_errors: list[str | None] = []
+
+    for hole_id, (detection_index, detection) in enumerate(
+        zip(selected_indices, selected), start=1,
+    ):
+        selection_click = np.asarray(
+            selection_clicks[detection_index], dtype=np.float64,
+        ).reshape(2)
         radius = max(
             float(detection["box"][2] - detection["box"][0]),
             float(detection["box"][3] - detection["box"][1]),
         ) / 2.0
         # 初始选孔只把点击用于确定目标身份；几何中心统一采用YOLO框中心。
-        # 椭圆中心不再参与初始点云中心、法向或导航位姿计算。
         yolo_center = np.asarray(detection["center"], dtype=np.float64).reshape(2)
-        ring_center = tuple(yolo_center.tolist())
-        try:
-            point, info = hole_camera_point(
-                ring_center, bundle.xyz_map_mm, bundle.intrinsics, radius,
-                ray_center_xy=yolo_center, ray_center_is_undistorted=False,
-            )
-            plane = _plane_estimate_from_info(info, f"initial multi-hole {hole_id} plane normal")
-        except Exception as exc:
-            raise RuntimeError(f"初始孔{hole_id}点云几何计算失败：{exc}") from exc
-        if plane.rmse_mm > float(max_plane_rmse_mm):
-            raise RuntimeError(
-                f"初始孔{hole_id}深度拟合RMSE过大：{plane.rmse_mm:.3f} mm "
-                f"> {float(max_plane_rmse_mm):.3f} mm"
-            )
-
         display_detection = dict(detection)
         display_detection["_hole_id"] = hole_id
         overlays.append((display_detection, None))
-        points_camera.append(np.asarray(point, dtype=np.float64))
-        normals_camera.append(np.asarray(plane.normal_camera, dtype=np.float64))
+        try:
+            point, info = hole_camera_point(
+                tuple(yolo_center.tolist()),
+                bundle.xyz_map_mm,
+                bundle.intrinsics,
+                radius,
+                ray_center_xy=yolo_center,
+                ray_center_is_undistorted=False,
+                surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
+            )
+            plane = _plane_estimate_from_info(
+                info, f"initial multi-hole {hole_id} plane normal",
+            )
+            if plane.rmse_mm > float(max_plane_rmse_mm):
+                raise ValueError(
+                    f"深度拟合RMSE过大：{plane.rmse_mm:.3f} mm "
+                    f"> {float(max_plane_rmse_mm):.3f} mm"
+                )
+            geometries.append({
+                "point": np.asarray(point, dtype=np.float64),
+                "plane": plane,
+                "fallback": False,
+            })
+            geometry_errors.append(None)
+            points_camera.append(np.asarray(point, dtype=np.float64))
+            normals_camera.append(np.asarray(plane.normal_camera, dtype=np.float64))
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            geometries.append(None)
+            geometry_errors.append(reason)
+            print(
+                f"[INITIAL_GEOMETRY_FALLBACK] hole={hole_id} reason={reason}",
+                flush=True,
+            )
+
+    if not points_camera:
+        reasons = "; ".join(
+            f"hole_{index + 1}:{reason}"
+            for index, reason in enumerate(geometry_errors)
+            if reason
+        )
+        raise RuntimeError(f"初始选孔没有任何可用局部平面：{reasons}")
+
+    # 共享平面只用于异常孔的安全340 mm导航和缓存匹配兜底；正常孔仍使用自己的局部平面。
+    group_center_camera = np.mean(np.asarray(points_camera, dtype=np.float64), axis=0)
+    group_normal_camera = _fuse_normals(normals_camera)
+    successful_geometries = [
+        geometry for geometry in geometries if geometry is not None
+    ]
+    group_rmse_mm = float(np.max([
+        float(geometry["plane"].rmse_mm) for geometry in successful_geometries
+    ]))
+    group_ring_points = int(sum(
+        int(geometry["plane"].ring_points) for geometry in successful_geometries
+    ))
+    group_plane = PlaneEstimate(
+        point_camera_mm=group_center_camera,
+        normal_camera=group_normal_camera,
+        rmse_mm=group_rmse_mm,
+        ring_points=group_ring_points,
+        surface_model="initial_multi_hole_group",
+    )
+
+    for hole_id, (detection_index, detection), geometry, geometry_error in zip(
+        range(1, len(selected) + 1),
+        zip(selected_indices, selected),
+        geometries,
+        geometry_errors,
+    ):
+        selection_click = np.asarray(
+            selection_clicks[detection_index], dtype=np.float64,
+        ).reshape(2)
+        yolo_center = np.asarray(detection["center"], dtype=np.float64).reshape(2)
+        fallback = geometry is None
+        if fallback:
+            # 该孔的当前环带深度不可信时，只用共享平面求一个保守导航点。
+            # 真正进入340 mm后仍优先直接调用缓存；无缓存则走完整粗定位。
+            fallback_point = ray_plane_intersection(
+                np.zeros(3, dtype=np.float64),
+                camera_ray(bundle.intrinsics, yolo_center, already_undistorted=False),
+                group_center_camera,
+                group_normal_camera,
+            )
+            point = fallback_point
+            plane = PlaneEstimate(
+                point_camera_mm=fallback_point,
+                normal_camera=group_normal_camera,
+                rmse_mm=group_rmse_mm,
+                ring_points=group_ring_points,
+                surface_model="initial_group_plane_fallback",
+                surface_plane_point_camera_mm=group_center_camera,
+                surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
+            )
+        else:
+            point = np.asarray(geometry["point"], dtype=np.float64)
+            plane = geometry["plane"]
+
         holes.append({
             "hole_id": hole_id,
             "initial_selection_order": hole_id,
@@ -1332,18 +1506,15 @@ def _capture_initial_multi_hole_selection(
             "initial_plane_rmse_mm": float(plane.rmse_mm),
             "initial_ring_points": int(plane.ring_points),
             "initial_surface_model": plane.surface_model,
-            "pointcloud_segmentation": "yolo_box_annular_depth_ring",
+            "initial_surface_selection_policy": plane.surface_selection_policy,
+            "initial_front_surface_z_mm": plane.front_surface_z_mm,
+            "initial_ring_points_raw": plane.ring_points_raw,
+            "initial_surface_points_selected": plane.surface_points_selected,
+            "initial_geometry_fallback": bool(fallback),
+            "initial_geometry_fallback_reason": geometry_error,
+            "pointcloud_segmentation": f"yolo_box_{COARSE_SURFACE_SELECTION_POLICY}",
         })
 
-    group_center_camera = np.mean(np.asarray(points_camera, dtype=np.float64), axis=0)
-    group_normal_camera = _fuse_normals(normals_camera)
-    group_plane = PlaneEstimate(
-        point_camera_mm=group_center_camera,
-        normal_camera=group_normal_camera,
-        rmse_mm=float(np.max([float(item["initial_plane_rmse_mm"]) for item in holes])),
-        ring_points=int(sum(int(item["initial_ring_points"]) for item in holes)),
-        surface_model="initial_multi_hole_group",
-    )
     cv2.imwrite(
         str(run_dir / "01_home_selected.png"),
         _overlay_multi(bundle.color_bgr, overlays, "initial multi-hole group selection"),
@@ -1398,6 +1569,8 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
                           initial_anchor_px: np.ndarray | None = None,
                           tracking_tolerance_px: float | None = None,
                           lock_anchor: bool = False,
+                          stop_when_stable: bool = True,
+                          include_points: bool = False,
                           ) -> tuple[list[Observation], np.ndarray]:
     observations: list[Observation] = []
     latest_image: np.ndarray | None = None
@@ -1408,9 +1581,8 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
         get_aligned_frame_bundle(pipeline, align, chain)
     for attempt in range(cfg.coarse_frames * cfg.coarse_max_attempt_multiplier):
         valid_count = len([item for item in observations if item.error is None and item.plane is not None])
-        if (
-            valid_count >= cfg.coarse_frames
-            or (
+        if valid_count >= cfg.coarse_frames or (
+            stop_when_stable and (
                 valid_count >= cfg.min_coarse_valid
                 and _coarse_burst_stable(
                     {1: observations}, cfg.min_coarse_valid,
@@ -1441,7 +1613,7 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
         if tracking_tolerance_px is not None and tracking_distance > float(tracking_tolerance_px):
             observations.append(Observation(
                 name, attempt, search_anchor, timestamp_ns=bundle.host_timestamp_ns,
-                error="tracking_distance",
+                error="tracking_distance", tracking_distance_px=tracking_distance,
             ))
             continue
         # 粗定位只使用YOLO框中心和点云环带，测量孔中心及局部法向。
@@ -1453,14 +1625,19 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
             _, plane_info = hole_camera_point(
                 ring_center, bundle.xyz_map_mm, bundle.intrinsics, radius,
                 ray_center_xy=center, ray_center_is_undistorted=False,
+                include_points=include_points,
+                surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
             )
             plane = _plane_estimate_from_info(plane_info, "coarse plane normal")
             valid = plane.rmse_mm <= cfg.max_plane_rmse_mm
-            observations.append(Observation(name, attempt, center, None, plane, bundle.host_timestamp_ns,
-                                            None if valid else "plane_quality"))
+            observations.append(Observation(
+                name, attempt, center, None, plane, bundle.host_timestamp_ns,
+                None if valid else "plane_quality", tracking_distance_px=tracking_distance,
+            ))
         except Exception as exc:
             observations.append(Observation(name, attempt, center, None, timestamp_ns=bundle.host_timestamp_ns,
-                                            error=f"plane_error:{exc}"))
+                                            error=f"plane_error:{exc}",
+                                            tracking_distance_px=tracking_distance))
         if not lock_anchor:
             anchor = detection_center
         latest_detection = detection
@@ -2037,7 +2214,11 @@ def _register_fresh_cad_at_motion_start(
     output_dir: Path,
     max_cross_frame_p95_mm: float,
 ) -> CadMotionInput:
-    """每次 CAD 运动启动前，用当前位置的 RGB/TCP 自动更新 CAD 位姿。"""
+    """每次 CAD 运动启动前，用稳定参考位姿的 RGB/TCP 自动更新 CAD 位姿。
+
+    真实运动模式的调用方会先回到保存的原点；预览模式不自动移动机器人，
+    因而仍使用启动时的当前位置作为只读参考。
+    """
 
     from aubo_workbench.cad_registration import (
         CadRegistrationConfig,
@@ -2936,9 +3117,26 @@ def _plane_estimate_from_info(info: dict[str, Any], label: str) -> PlaneEstimate
             float(info["sphere_radius_mm"])
             if info.get("sphere_radius_mm") is not None else None
         ),
+        points_camera_mm=(
+            np.asarray(info["points_camera_mm"], dtype=np.float32).reshape(-1, 3)
+            if info.get("points_camera_mm") is not None else None
+        ),
         surface_plane_point_camera_mm=(
             np.asarray(info["local_plane_point_camera_mm"], dtype=np.float64)
             if info.get("local_plane_point_camera_mm") is not None else None
+        ),
+        surface_selection_policy=str(info.get("surface_selection_policy", "legacy")),
+        front_surface_z_mm=(
+            float(info["front_surface_z_mm"])
+            if info.get("front_surface_z_mm") is not None else None
+        ),
+        ring_points_raw=(
+            int(info["ring_points_raw"])
+            if info.get("ring_points_raw") is not None else None
+        ),
+        surface_points_selected=(
+            int(info["surface_points_selected"])
+            if info.get("surface_points_selected") is not None else None
         ),
     )
 
@@ -3096,10 +3294,519 @@ def _apply_coarse_geometry_to_hole(
             if item.error is None and item.plane is not None
         ])),
         "coarse_surface_model": summary["surface_model"],
+        "coarse_surface_selection_policy": summary.get("surface_selection_policy"),
+        "coarse_front_surface_z_mm": summary.get("front_surface_z_median_mm"),
+        "coarse_ring_points_raw_median": summary.get("ring_points_raw_median"),
+        "coarse_surface_points_selected_median": summary.get(
+            "surface_points_selected_median"
+        ),
         "coarse_sphere_center_camera_mm": summary.get("sphere_center_camera_mm"),
         "coarse_sphere_radius_mm": summary.get("sphere_radius_mm"),
     })
     return summary
+
+
+def _cache_intrinsics_dict(intrinsics: Any) -> dict[str, Any]:
+    if hasattr(intrinsics, "as_dict") and callable(intrinsics.as_dict):
+        return dict(intrinsics.as_dict())
+    return {
+        "width": int(intrinsics.width), "height": int(intrinsics.height),
+        "fx": float(intrinsics.fx), "fy": float(intrinsics.fy),
+        "cx": float(intrinsics.cx), "cy": float(intrinsics.cy),
+        "distortion": [float(value) for value in getattr(intrinsics, "distortion", ())],
+    }
+
+
+def _cache_measurements_from_observations(
+    observations: list[Observation],
+) -> list[dict[str, Any]]:
+    measurements: list[dict[str, Any]] = []
+    for item in observations:
+        measurement: dict[str, Any] = {
+            "frame_index": int(item.frame_index),
+            "timestamp_ns": item.timestamp_ns,
+            "center_px": np.asarray(item.center_px, dtype=np.float64),
+            "tracking_distance_px": item.tracking_distance_px,
+            "error": item.error,
+        }
+        if item.plane is not None:
+            measurement.update({
+                "plane_point_camera_mm": np.asarray(item.plane.point_camera_mm, dtype=np.float64),
+                "surface_plane_point_camera_mm": (
+                    np.asarray(item.plane.surface_plane_point_camera_mm, dtype=np.float64)
+                    if item.plane.surface_plane_point_camera_mm is not None
+                    else np.asarray(item.plane.point_camera_mm, dtype=np.float64)
+                ),
+                "normal_camera": np.asarray(item.plane.normal_camera, dtype=np.float64),
+                "plane_rmse_mm": float(item.plane.rmse_mm),
+                "ring_points": int(item.plane.ring_points),
+                "surface_model": item.plane.surface_model,
+                "surface_selection_policy": item.plane.surface_selection_policy,
+                "front_surface_z_mm": item.plane.front_surface_z_mm,
+                "ring_points_raw": item.plane.ring_points_raw,
+                "surface_points_selected": item.plane.surface_points_selected,
+            })
+        measurements.append(measurement)
+    return measurements
+
+
+def _cache_entry_from_observations(
+    hole_id: int,
+    observations: list[Observation],
+    *,
+    T_base_camera: np.ndarray,
+    T_tcp_camera: np.ndarray,
+    tcp_pose_m_rad: list[float],
+    camera_serial: str,
+    handeye_path: str,
+    intrinsics: Any,
+    cfg: TwoStageConfig,
+    min_valid_frames: int,
+) -> CoarseCacheEntry:
+    valid = [
+        item for item in observations
+        if item.error is None and item.plane is not None and item.plane.points_camera_mm is not None
+    ]
+    summary = _fuse_coarse(observations, cfg, min_valid_frames=min_valid_frames)
+    if len(valid) < int(min_valid_frames):
+        raise RuntimeError(f"孔{hole_id}缓存有效帧不足：{len(valid)}/{min_valid_frames}")
+    T_base_camera = np.asarray(T_base_camera, dtype=np.float64).reshape(4, 4)
+    R_base_camera = T_base_camera[:3, :3]
+    t_base_camera = T_base_camera[:3, 3]
+    point_camera = np.asarray(summary["plane_point_camera_mm"], dtype=np.float64)
+    plane_point_camera_value = summary.get("surface_plane_point_camera_mm")
+    plane_point_camera = (
+        point_camera if plane_point_camera_value is None
+        else np.asarray(plane_point_camera_value, dtype=np.float64)
+    )
+    normal_camera = _unit(np.asarray(summary["plane_normal_camera"], dtype=np.float64), f"缓存孔{hole_id}法向")
+    point_base = R_base_camera @ point_camera + t_base_camera
+    plane_point_base = R_base_camera @ plane_point_camera + t_base_camera
+    normal_base = _unit(R_base_camera @ normal_camera, f"缓存孔{hole_id}基坐标法向")
+    if float(normal_base @ (t_base_camera - point_base)) < 0.0:
+        normal_base = -normal_base
+    frame_indices = np.asarray([item.frame_index for item in valid], dtype=np.int64)
+    frame_centers_px = np.asarray([item.center_px for item in valid], dtype=np.float64)
+    frame_plane_rmse_mm = np.asarray([item.plane.rmse_mm for item in valid], dtype=np.float64)
+    points_by_frame = tuple(
+        np.asarray(item.plane.points_camera_mm, dtype=np.float32).reshape(-1, 3)
+        for item in valid
+    )
+    return CoarseCacheEntry(
+        hole_id=int(hole_id),
+        T_base_camera_build=T_base_camera,
+        T_tcp_camera=np.asarray(T_tcp_camera, dtype=np.float64),
+        tcp_pose_m_rad=list(tcp_pose_m_rad),
+        camera_serial=str(camera_serial),
+        handeye_path=str(handeye_path),
+        intrinsics=_cache_intrinsics_dict(intrinsics),
+        center_px=np.asarray(summary["center_px"], dtype=np.float64),
+        point_camera_mm=point_camera,
+        plane_point_camera_mm=plane_point_camera,
+        normal_camera=normal_camera,
+        point_base_mm=point_base,
+        plane_point_base_mm=plane_point_base,
+        normal_base=normal_base,
+        plane_rmse_mm=float(summary["plane_rmse_median_mm"]),
+        valid_frames=len(valid),
+        total_frames=len(observations),
+        center_scatter_p95_px=float(summary["center_scatter_p95_px"]),
+        ring_points_median=float(np.median([item.plane.ring_points for item in valid])),
+        surface_model=str(summary["surface_model"]),
+        frame_indices=frame_indices,
+        frame_centers_px=frame_centers_px,
+        frame_plane_rmse_mm=frame_plane_rmse_mm,
+        points_camera_mm_by_frame=points_by_frame,
+    )
+
+
+def _build_initial_coarse_cache(
+    pipeline: Any,
+    align: Any,
+    chain: Any,
+    model: Any,
+    confidence: float,
+    holes: list[dict[str, Any]],
+    *,
+    T_base_camera: np.ndarray,
+    current_tcp: np.ndarray,
+    handeye: Any,
+    handeye_path: str,
+    camera_serial: str,
+    intrinsics: Any,
+    cfg: TwoStageConfig,
+    gates: CacheValidationGates,
+    rgb_output_dir: Path | None = None,
+) -> tuple[dict[int, CoarseCacheEntry], dict[int, str]]:
+    """在初始选孔位置追加三帧，为每个选中孔建立局部缓存。
+
+    rgb_output_dir 只保存每个缓存采集帧一张共享RGB图，便于之后用
+    NPZ可视化工具做同位姿投影检查；不把整幅RGB图塞进NPZ。
+    """
+    observations_by_hole: dict[int, list[Observation]] = {
+        int(hole["hole_id"]): [] for hole in holes
+    }
+    for frame_index in range(int(gates.validation_frames)):
+        bundle = get_aligned_frame_bundle(pipeline, align, chain)
+        if bundle is None or bundle.intrinsics is None:
+            for hole in holes:
+                hole_id = int(hole["hole_id"])
+                observations_by_hole[hole_id].append(Observation(
+                    "initial_cache", frame_index,
+                    np.asarray(hole["initial_center_px"], dtype=np.float64),
+                    timestamp_ns=None, error="frame_missing",
+                ))
+            continue
+        if rgb_output_dir is not None:
+            try:
+                rgb_output_dir.mkdir(parents=True, exist_ok=True)
+                written = cv2.imwrite(
+                    str(rgb_output_dir / f"initial_cache_rgb_frame_{frame_index:02d}.png"),
+                    bundle.color_bgr,
+                )
+                if not written:
+                    raise RuntimeError("cv2.imwrite返回False")
+            except Exception as exc:
+                print(
+                    f"[CACHE_RGB_SNAPSHOT_WARNING] frame={frame_index} reason={exc}",
+                    flush=True,
+                )
+        detections = detect(model, bundle.color_bgr, confidence)
+        available = set(range(len(detections)))
+        ordered_holes = sorted(holes, key=lambda item: int(item["hole_id"]))
+        assignments: dict[int, tuple[dict[str, Any] | None, float | None]] = {}
+        for hole in ordered_holes:
+            hole_id = int(hole["hole_id"])
+            anchor = np.asarray(hole["initial_center_px"], dtype=np.float64).reshape(2)
+            candidates = [
+                index for index in available
+                if int(detections[index].get("class_id", -1)) == int(hole["class_id"])
+            ]
+            if not candidates:
+                assignments[hole_id] = (None, None)
+                continue
+            index = min(
+                candidates,
+                key=lambda candidate: float(
+                    np.linalg.norm(np.asarray(detections[candidate]["center"], dtype=np.float64) - anchor)
+                ),
+            )
+            available.remove(index)
+            detection = detections[index]
+            distance = float(
+                np.linalg.norm(np.asarray(detection["center"], dtype=np.float64) - anchor)
+            )
+            assignments[hole_id] = (detection, distance)
+        for hole in holes:
+            hole_id = int(hole["hole_id"])
+            anchor = np.asarray(hole["initial_center_px"], dtype=np.float64).reshape(2)
+            detection, tracking_distance = assignments[hole_id]
+            if detection is None:
+                observations_by_hole[hole_id].append(Observation(
+                    "initial_cache", frame_index, anchor,
+                    timestamp_ns=bundle.host_timestamp_ns, error="yolo_missing",
+                ))
+                continue
+            center = np.asarray(detection["center"], dtype=np.float64)
+            if tracking_distance is None or tracking_distance > float(gates.max_tracking_distance_px):
+                observations_by_hole[hole_id].append(Observation(
+                    "initial_cache", frame_index, center,
+                    timestamp_ns=bundle.host_timestamp_ns, error="tracking_distance",
+                    tracking_distance_px=tracking_distance,
+                ))
+                continue
+            radius = max(
+                float(detection["box"][2] - detection["box"][0]),
+                float(detection["box"][3] - detection["box"][1]),
+            ) / 2.0
+            try:
+                _, info = hole_camera_point(
+                    tuple(center.tolist()), bundle.xyz_map_mm, bundle.intrinsics, radius,
+                    ray_center_xy=center, ray_center_is_undistorted=False,
+                    include_points=True,
+                    surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
+                )
+                plane = _plane_estimate_from_info(info, f"初始缓存孔{hole_id}法向")
+                error = None if plane.rmse_mm <= float(gates.max_plane_rmse_mm) else "plane_quality"
+                observations_by_hole[hole_id].append(Observation(
+                    "initial_cache", frame_index, center, None, plane,
+                    bundle.host_timestamp_ns, error, tracking_distance_px=tracking_distance,
+                ))
+            except Exception as exc:
+                observations_by_hole[hole_id].append(Observation(
+                    "initial_cache", frame_index, center,
+                    timestamp_ns=bundle.host_timestamp_ns,
+                    error=f"plane_error:{exc}", tracking_distance_px=tracking_distance,
+                ))
+
+    entries: dict[int, CoarseCacheEntry] = {}
+    failures: dict[int, str] = {}
+    tcp_pose = transform_to_sdk_pose_m_rad(current_tcp)
+    for hole in holes:
+        hole_id = int(hole["hole_id"])
+        observations = observations_by_hole[hole_id]
+        valid = [item for item in observations if item.error is None and item.plane is not None]
+        if len(valid) < int(gates.min_valid_frames):
+            failures[hole_id] = f"valid_frames:{len(valid)}/{int(gates.min_valid_frames)}"
+            continue
+        try:
+            entry = _cache_entry_from_observations(
+                hole_id, observations,
+                T_base_camera=T_base_camera,
+                T_tcp_camera=handeye.T_tcp_rgb_camera,
+                tcp_pose_m_rad=tcp_pose,
+                camera_serial=camera_serial,
+                handeye_path=handeye_path,
+                intrinsics=intrinsics,
+                cfg=cfg,
+                min_valid_frames=int(gates.min_valid_frames),
+            )
+            if entry.center_scatter_p95_px > float(gates.max_center_scatter_p95_px):
+                raise RuntimeError(
+                    f"center_scatter:{entry.center_scatter_p95_px:.3f}px"
+                )
+            entries[hole_id] = entry
+        except Exception as exc:
+            failures[hole_id] = f"{type(exc).__name__}:{exc}"
+    return entries, failures
+
+
+def _apply_cached_geometry_to_hole(
+    hole: dict[str, Any], entry: CoarseCacheEntry, validation: Any,
+    *, source: str = "current_run_initial_cache",
+    persistent_hole_id: int | None = None,
+) -> None:
+    """复用缓存的XY/法向，并用现场深度结果替换基坐标Z。"""
+    current_point_base = replace_base_z(entry.point_base_mm, validation.current_point_base_mm)
+    current_plane_base = replace_base_z(
+        entry.plane_point_base_mm, validation.current_plane_point_base_mm,
+    )
+    hole.update({
+        "coarse_center_px": validation.current_center_px,
+        "coarse_center_camera_mm": validation.current_point_camera_mm,
+        "coarse_center_base_mm": current_point_base,
+        "coarse_plane_point_camera_mm": validation.current_plane_point_camera_mm,
+        "coarse_plane_point_base_mm": current_plane_base,
+        "coarse_normal_camera": entry.normal_camera,
+        "coarse_normal_toward_camera_base": entry.normal_base,
+        "coarse_plane_rmse_mm": validation.max_plane_rmse_mm,
+        "coarse_valid_frames": validation.valid_frames,
+        "coarse_total_frames": validation.total_frames,
+        "coarse_center_scatter_p95_px": validation.center_scatter_p95_px,
+        "coarse_ring_points_median": entry.ring_points_median,
+        "coarse_surface_model": f"cached_{COARSE_SURFACE_MODEL}_with_live_z",
+        "coarse_surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+        "coarse_front_surface_z_mm": None,
+        "coarse_ring_points_raw_median": None,
+        "coarse_surface_points_selected_median": None,
+        "coarse_sphere_center_camera_mm": None,
+        "coarse_sphere_radius_mm": None,
+        "coarse_cache_source": str(source),
+        "coarse_cache_entry_created_at": entry.created_at,
+        "coarse_cache_persistent_hole_id": (
+            None if persistent_hole_id is None else int(persistent_hole_id)
+        ),
+    })
+
+
+def _apply_direct_cached_geometry_to_hole(
+    hole: dict[str, Any], entry: CoarseCacheEntry,
+    *, current_T_base_camera: np.ndarray,
+    source: str = "current_run_initial_cache",
+    persistent_hole_id: int | None = None,
+) -> None:
+    """直接使用base坐标缓存，不采现场复核帧、不用现场深度改写Z。"""
+    T_base_camera = np.asarray(current_T_base_camera, dtype=np.float64).reshape(4, 4)
+    T_camera_base = invert_transform(T_base_camera)
+    point_base = np.asarray(entry.point_base_mm, dtype=np.float64).reshape(3)
+    plane_point_base = np.asarray(entry.plane_point_base_mm, dtype=np.float64).reshape(3)
+    point_camera = T_camera_base[:3, :3] @ point_base + T_camera_base[:3, 3]
+    plane_point_camera = T_camera_base[:3, :3] @ plane_point_base + T_camera_base[:3, 3]
+    normal_camera = _unit(
+        T_base_camera[:3, :3].T @ np.asarray(entry.normal_base, dtype=np.float64),
+        "direct cached normal camera",
+    )
+    hole.update({
+        "coarse_center_px": np.asarray(entry.center_px, dtype=np.float64),
+        "coarse_center_camera_mm": point_camera,
+        "coarse_center_base_mm": point_base,
+        "coarse_plane_point_camera_mm": plane_point_camera,
+        "coarse_plane_point_base_mm": plane_point_base,
+        "coarse_normal_camera": normal_camera,
+        "coarse_normal_toward_camera_base": np.asarray(entry.normal_base, dtype=np.float64),
+        "coarse_plane_rmse_mm": float(entry.plane_rmse_mm),
+        "coarse_valid_frames": int(entry.valid_frames),
+        "coarse_total_frames": int(entry.total_frames),
+        "coarse_center_scatter_p95_px": float(entry.center_scatter_p95_px),
+        "coarse_ring_points_median": float(entry.ring_points_median),
+        "coarse_surface_model": f"cached_{entry.surface_model}_direct_base_reuse",
+        "coarse_surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+        "coarse_front_surface_z_mm": None,
+        "coarse_ring_points_raw_median": None,
+        "coarse_surface_points_selected_median": None,
+        "coarse_sphere_center_camera_mm": None,
+        "coarse_sphere_radius_mm": None,
+        "coarse_cache_source": str(source),
+        "coarse_cache_entry_created_at": entry.created_at,
+        "coarse_cache_persistent_hole_id": (
+            None if persistent_hole_id is None else int(persistent_hole_id)
+        ),
+    })
+
+
+def _validate_coarse_cache_at_current_pose(
+    hole: dict[str, Any], entry: CoarseCacheEntry, *,
+    pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
+    run_dir: Path, cfg: TwoStageConfig, gates: CacheValidationGates,
+    current_T_base_camera: np.ndarray, intrinsics: Any,
+) -> tuple[Any, list[Observation], Any]:
+    validation_cfg = replace(
+        cfg,
+        coarse_frames=int(gates.validation_frames),
+        min_coarse_valid=int(gates.min_valid_frames),
+        coarse_max_attempt_multiplier=1,
+        max_coarse_center_scatter_p95_px=float(gates.max_center_scatter_p95_px),
+        max_plane_rmse_mm=float(gates.max_plane_rmse_mm),
+    )
+    expected_anchor = _project_base_point_to_pixel(
+        entry.point_base_mm, current_T_base_camera, intrinsics,
+    )
+    observations, _ = _capture_coarse_burst(
+        pipeline, align, chain, model, confidence,
+        hole["initial_detection"], validation_cfg, run_dir,
+        f"hole_{int(hole['hole_id']):02d}_coarse_cache_verify",
+        initial_anchor_px=expected_anchor,
+        tracking_tolerance_px=float(gates.max_tracking_distance_px),
+        lock_anchor=True,
+        stop_when_stable=False,
+        include_points=False,
+    )
+    validation = validate_cache_entry(
+        entry,
+        _cache_measurements_from_observations(observations),
+        current_T_base_camera=current_T_base_camera,
+        intrinsics=intrinsics,
+        gates=gates,
+    )
+    return validation, observations, expected_anchor
+
+
+def _upsert_persistent_cache_entry(
+    entry: CoarseCacheEntry,
+    *,
+    current_hole_id: int,
+    persistent_entries: dict[int, CoarseCacheEntry],
+    persistent_source_ids: dict[int, int],
+    max_match_distance_mm: float = 30.0,
+    min_match_margin_mm: float = 5.0,
+) -> int:
+    """把当前成功粗定位结果写回 base 坐标持久化缓存。"""
+
+    hole_id = int(current_hole_id)
+    source_id = persistent_source_ids.get(hole_id)
+    if source_id is None and persistent_entries:
+        current_point = np.asarray(entry.point_base_mm, dtype=np.float64).reshape(3)
+        used_source_ids = {
+            int(value) for key, value in persistent_source_ids.items()
+            if int(key) != hole_id
+        }
+        candidates = sorted(
+            (
+                float(np.linalg.norm(
+                    current_point[:2]
+                    - np.asarray(candidate.point_base_mm, dtype=np.float64).reshape(3)[:2],
+                )),
+                int(candidate_id),
+            )
+            for candidate_id, candidate in persistent_entries.items()
+            if int(candidate_id) not in used_source_ids
+        )
+        if candidates and candidates[0][0] <= float(max_match_distance_mm):
+            if (
+                len(candidates) == 1
+                or candidates[1][0] - candidates[0][0] >= float(min_match_margin_mm)
+            ):
+                source_id = candidates[0][1]
+    if source_id is None:
+        source_id = max([int(value) for value in persistent_entries] or [0]) + 1
+    persistent_entries[int(source_id)] = rekey_cache_entry(entry, int(source_id))
+    persistent_source_ids[hole_id] = int(source_id)
+    return int(source_id)
+
+
+def _load_persistent_coarse_cache_for_run(
+    *,
+    run_dir: Path,
+    camera_serial: str,
+    handeye: Any,
+    handeye_path: str,
+    intrinsics: Any,
+    persistent_cache_dir: Path,
+    required_surface_model: str | None = None,
+) -> tuple[dict[int, CoarseCacheEntry], dict[int, str], dict[str, Any]]:
+    """读取固定 base 坐标缓存；首次升级时兼容导入最近一次运行缓存。"""
+
+    errors: dict[int, str] = {}
+    audit: dict[str, Any] = {
+        "requested_dir": str(persistent_cache_dir),
+        "source": None,
+        "bootstrap_source": None,
+        "loaded_count": 0,
+        "required_surface_model": required_surface_model,
+        "compatibility_rejected": {},
+        "load_errors": {},
+    }
+    entries: dict[int, CoarseCacheEntry] = {}
+    if (persistent_cache_dir / "manifest.json").is_file():
+        try:
+            entries = load_persistent_cache_entries(persistent_cache_dir, errors=errors)
+            audit["source"] = str(persistent_cache_dir)
+        except Exception as exc:
+            audit["load_errors"]["manifest"] = f"{type(exc).__name__}:{exc}"
+    else:
+        # 旧版本只把缓存写在每次运行目录。第一次启用持久化时自动把最近
+        # 一个可读的旧缓存作为种子，避免用户必须重新做一遍完整粗定位。
+        candidates = sorted(
+            (
+                path for path in RUNS_DIR.glob("two-stage-*/coarse_cache/manifest.json")
+                if path.parent.parent.resolve() != run_dir.resolve()
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for manifest_path in candidates:
+            try:
+                entries = load_cache_entries(manifest_path.parent)
+            except Exception as exc:
+                audit["load_errors"][str(manifest_path)] = f"{type(exc).__name__}:{exc}"
+                continue
+            if entries:
+                audit["source"] = str(manifest_path.parent)
+                audit["bootstrap_source"] = str(manifest_path.parent)
+                break
+
+    compatible: dict[int, CoarseCacheEntry] = {}
+    for persistent_id, entry in entries.items():
+        reasons: list[str] = []
+        if (
+            required_surface_model is not None
+            and str(entry.surface_model) != str(required_surface_model)
+        ):
+            reasons.append("surface_selection_policy_mismatch")
+        reasons.extend(cache_entry_compatibility_reasons(
+            entry,
+            camera_serial=camera_serial,
+            T_tcp_camera=handeye.T_tcp_rgb_camera,
+            intrinsics=intrinsics,
+            handeye_path=handeye_path,
+        ))
+        if reasons:
+            audit["compatibility_rejected"][str(int(persistent_id))] = reasons
+        else:
+            compatible[int(persistent_id)] = entry
+    audit["loaded_count"] = len(compatible)
+    audit["load_errors"].update({str(key): value for key, value in errors.items()})
+    return compatible, errors, audit
 
 
 def _fuse_coarse(
@@ -3122,6 +3829,18 @@ def _fuse_coarse(
     ]
     sphere_centers = [item.plane.sphere_center_camera_mm for item in valid if item.plane.sphere_center_camera_mm is not None]
     sphere_radii = [item.plane.sphere_radius_mm for item in valid if item.plane.sphere_radius_mm is not None]
+    front_surface_zs = [
+        item.plane.front_surface_z_mm for item in valid
+        if item.plane.front_surface_z_mm is not None
+    ]
+    ring_points_raw = [
+        item.plane.ring_points_raw for item in valid
+        if item.plane.ring_points_raw is not None
+    ]
+    surface_points_selected = [
+        item.plane.surface_points_selected for item in valid
+        if item.plane.surface_points_selected is not None
+    ]
     return {
         "valid_frames": len(valid), "total_frames": len(observations), "center_px": center,
         "center_scatter_p95_px": float(np.percentile(scatter, 95)),
@@ -3132,6 +3851,16 @@ def _fuse_coarse(
         ),
         "plane_rmse_median_mm": float(np.median([item.plane.rmse_mm for item in valid])),
         "surface_model": valid[0].plane.surface_model,
+        "surface_selection_policy": valid[0].plane.surface_selection_policy,
+        "front_surface_z_median_mm": (
+            float(np.median(front_surface_zs)) if front_surface_zs else None
+        ),
+        "ring_points_raw_median": (
+            int(np.median(ring_points_raw)) if ring_points_raw else None
+        ),
+        "surface_points_selected_median": (
+            int(np.median(surface_points_selected)) if surface_points_selected else None
+        ),
         "sphere_center_camera_mm": _fuse_vectors(sphere_centers, "sphere centers") if sphere_centers else None,
         "sphere_radius_mm": float(np.median(sphere_radii)) if sphere_radii else None,
     }
@@ -3236,7 +3965,7 @@ def _observation_rows(observations: list[Observation]) -> list[dict[str, Any]]:
             "stage": item.stage, "frame_index": item.frame_index, "timestamp_ns": item.timestamp_ns,
             "center_u_px": float(item.center_px[0]), "center_v_px": float(item.center_px[1]),
             "center_source": item.center_source, "quality_note": item.quality_note,
-            "error": item.error,
+            "error": item.error, "tracking_distance_px": item.tracking_distance_px,
         }
         if item.plane is not None:
             row.update({
@@ -3247,6 +3976,13 @@ def _observation_rows(observations: list[Observation]) -> list[dict[str, Any]]:
                     if item.plane.surface_plane_point_camera_mm is not None else None
                 ),
                 "surface_model": item.plane.surface_model,
+                "surface_selection_policy": item.plane.surface_selection_policy,
+                "front_surface_z_mm": item.plane.front_surface_z_mm,
+                "ring_points_raw": item.plane.ring_points_raw,
+                "surface_points_selected": item.plane.surface_points_selected,
+                "pointcloud_points": int(
+                    0 if item.plane.points_camera_mm is None else len(item.plane.points_camera_mm)
+                ),
             })
         if item.ellipse is not None:
             row.update({
@@ -3290,6 +4026,15 @@ def _record_hole_tracking_event(
         "errors": [item.error for item in observations if item.error is not None],
     }
     hole.setdefault("tracking_events", []).append(event)
+
+
+def _timing_elapsed_with_prefix(timing: TimingRecorder, prefix: str) -> float:
+    return float(sum(
+        float(item["elapsed_s"])
+        for item in timing.events
+        if str(item.get("name", "")).startswith(prefix)
+        and str(item.get("status", "completed")) == "completed"
+    ))
 
 
 def _move_to_sequential_coarse_pose(
@@ -3342,6 +4087,16 @@ def _run_sequential_hole_workflow(
     runtime: dict[str, Any],
     pose_session: Any, motion_session: Any, current_tcp: np.ndarray,
     initial_holes: list[dict[str, Any]], initial_intrinsics: Any,
+    *,
+    coarse_cache_entries: dict[int, CoarseCacheEntry] | None = None,
+    coarse_cache_sources: dict[int, str] | None = None,
+    coarse_cache_source_ids: dict[int, int] | None = None,
+    coarse_cache_dir: Path | None = None,
+    coarse_cache_gates: CacheValidationGates | None = None,
+    coarse_cache_metadata: dict[str, Any] | None = None,
+    persistent_cache_entries: dict[int, CoarseCacheEntry] | None = None,
+    persistent_cache_dir: Path | None = None,
+    persistent_cache_metadata: dict[str, Any] | None = None,
 ) -> int:
     """按初始孔号逐个执行：粗定位 -> 精定位 -> 最终目标点 -> 下一个孔。"""
     if not initial_holes:
@@ -3350,11 +4105,28 @@ def _run_sequential_hole_workflow(
     fixed_rz_rad = _matrix_to_rpy_zyx(current_tcp[:3, :3])[2]
     results: list[dict[str, Any]] = []
     order_ids = [int(item["hole_id"]) for item in initial_holes]
+    cache_entries = coarse_cache_entries if coarse_cache_entries is not None else {}
+    cache_sources = coarse_cache_sources if coarse_cache_sources is not None else {}
+    cache_source_ids = coarse_cache_source_ids if coarse_cache_source_ids is not None else {}
+    cache_gates = coarse_cache_gates or CacheValidationGates()
+    cache_enabled = bool(getattr(args, "reuse_coarse_cache", True)) and coarse_cache_dir is not None
+    persistent_enabled = bool(
+        cache_enabled
+        and getattr(args, "reuse_persistent_coarse_cache", True)
+        and persistent_cache_dir is not None
+    )
+    persistent_entries = persistent_cache_entries if persistent_cache_entries is not None else {}
+    report.setdefault("coarse_cache", {}).setdefault("cache_reused", [])
+    report.setdefault("coarse_cache", {}).setdefault("persistent_cache_reused", [])
+    report.setdefault("coarse_cache", {}).setdefault("cache_validation_skipped", [])
+    report.setdefault("coarse_cache", {}).setdefault("cache_validation_failed", [])
+    report.setdefault("coarse_cache", {}).setdefault("full_coarse_fallback", [])
     report["stages"]["sequential_plan"] = {
         "mode": "initial_selection_then_one_hole_complete",
         "hole_count": len(initial_holes),
         "hole_order": order_ids,
         "fixed_rz_rad": fixed_rz_rad,
+        "coarse_settle_buffer_s": float(cfg.coarse_settle_delay_s),
         "tracking_identity_source": "initial_selection_order_and_initial_rgbd_3d_projection",
         "confirmation_policy": "only_before_starting_next_selected_hole",
         "camera_pipeline_policy": "reuse_single_rgbd_pipeline_for_coarse_and_rgb_fine",
@@ -3402,13 +4174,28 @@ def _run_sequential_hole_workflow(
     for order, hole in enumerate(initial_holes, start=1):
         hole_id = int(hole["hole_id"])
         chosen = hole["initial_detection"]
-        point_base = np.asarray(hole["initial_center_base_mm"], dtype=np.float64).reshape(3)
-        normal_base = _unit(
+        current_selection_point_base = np.asarray(
+            hole["initial_center_base_mm"], dtype=np.float64,
+        ).reshape(3)
+        current_selection_normal_base = _unit(
             np.asarray(hole["initial_plane_normal_base"], dtype=np.float64),
             f"hole {hole_id} initial normal",
         )
+        point_base = current_selection_point_base.copy()
+        normal_base = current_selection_normal_base.copy()
         hole["tracking_identity"] = f"initial_selection_hole_{hole_id}"
         hole["processing_order"] = order
+
+        # 无论缓存来自本轮还是历史运行，第一次导航都使用本次初始选孔的
+        # 当前base坐标；缓存只在安全到达340 mm后直接接管后续几何。
+        # 这样工件发生小幅重新装夹时，不会先按旧缓存坐标移动机器人。
+        hole["coarse_navigation_source"] = "current_initial_selection"
+        hole["coarse_navigation_point_base_mm"] = point_base.copy()
+        hole["coarse_navigation_normal_base"] = normal_base.copy()
+        if cache_enabled and hole_id in cache_entries:
+            hole["coarse_cache_reference_point_base_mm"] = np.asarray(
+                cache_entries[hole_id].point_base_mm, dtype=np.float64,
+            ).copy()
 
         rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
         coarse_target, coarse_pose_geometry = _plan_hole_tcp_pose_fixed_rz(
@@ -3427,11 +4214,133 @@ def _run_sequential_hole_workflow(
                 args, motion_session, pose_session,
             )
 
+        coarse_settle_delay_s = max(0.0, float(cfg.coarse_settle_delay_s))
         coarse_captures: list[dict[str, Any]] = []
-        final_center_offset = math.inf
-        final_normal_error = math.inf
-        for capture_index in range(1, 4):
+        final_center_offset: float | None = None
+        final_normal_error: float | None = None
+        cache_event: dict[str, Any] = {
+            "enabled": cache_enabled,
+            "hole_id": hole_id,
+            "cache_available": hole_id in cache_entries,
+            "cache_source": cache_sources.get(hole_id),
+            "persistent_hole_id": cache_source_ids.get(hole_id),
+            "cache_reused": False,
+            "cache_validation_skipped": False,
+            "cache_validation_failed": False,
+            "full_coarse_fallback": False,
+            "coarse_settle_buffer_s": 0.0,
+            "navigation_source": hole.get("coarse_navigation_source"),
+            "navigation_point_base_mm": point_base.copy(),
+        }
+        cache_reused = False
+        last_coarse_observations: list[Observation] | None = None
+        last_coarse_T_base_camera: np.ndarray | None = None
+        last_coarse_tcp: np.ndarray | None = None
+        if cache_enabled and hole_id in cache_entries:
+            cache_entry = cache_entries[hole_id]
             T_base_camera = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+            try:
+                if cache_sources.get(hole_id) == "persistent_base_cache":
+                    disk_entries = load_persistent_cache_entries(
+                        persistent_cache_dir, [int(cache_source_ids[hole_id])],
+                    )
+                    cache_entry = disk_entries.get(int(cache_source_ids[hole_id]))
+                    if cache_entry is None:
+                        raise FileNotFoundError(
+                            f"持久化base缓存缺少孔{cache_source_ids[hole_id]}条目"
+                        )
+                    cache_entry = rekey_cache_entry(cache_entry, hole_id)
+                else:
+                    # 当前运行缓存仍从本次运行目录重新读取，NPZ损坏时回退完整粗定位。
+                    disk_entries = load_cache_entries(coarse_cache_dir, [hole_id])
+                    cache_entry = disk_entries.get(hole_id)
+                    if cache_entry is None:
+                        raise FileNotFoundError(f"当前运行缓存缺少孔{hole_id}条目")
+                cache_source = cache_sources.get(hole_id, "current_run_initial_cache")
+                _apply_direct_cached_geometry_to_hole(
+                    hole, cache_entry,
+                    current_T_base_camera=T_base_camera,
+                    source=cache_source,
+                    persistent_hole_id=cache_source_ids.get(hole_id),
+                )
+                if cache_source == "persistent_base_cache":
+                    transformed_points = transform_cached_points_to_camera(
+                        cache_entry, T_base_camera,
+                    )
+                    hole["coarse_cache_transformed_point_count"] = int(
+                        sum(len(points) for points in transformed_points)
+                    )
+                    hole["coarse_cache_transform"] = "T_base_camera_build_to_current_camera"
+                cache_reused = True
+                cache_event["cache_reused"] = True
+                cache_event["cache_validation_skipped"] = True
+                cache_event["cache_validation_skip_reason"] = (
+                    "direct_base_coordinate_reuse_no_live_target_verification"
+                )
+                cache_event["cache_validation_failed"] = False
+                cache_event["coarse_settle_buffer_s"] = 0.0
+                report["coarse_cache"]["cache_reused"].append(hole_id)
+                report["coarse_cache"]["cache_validation_skipped"].append({
+                    "hole_id": hole_id,
+                    "reason": cache_event["cache_validation_skip_reason"],
+                })
+                if cache_source == "persistent_base_cache":
+                    report["coarse_cache"]["persistent_cache_reused"].append(hole_id)
+                coarse_captures.append({
+                    "capture_index": 0,
+                    "mode": "cache_direct_reuse",
+                    "tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                    "summary": {
+                        "reuse_mode": "direct_base_coordinate_cache",
+                        "validation_skipped": True,
+                        "cached_valid_frames": int(cache_entry.valid_frames),
+                        "cached_plane_rmse_mm": float(cache_entry.plane_rmse_mm),
+                        "cached_center_scatter_p95_px": float(
+                            cache_entry.center_scatter_p95_px
+                        ),
+                    },
+                })
+            except Exception as exc:
+                cache_event["cache_validation_failed"] = False
+                cache_event["failure_reason"] = f"{type(exc).__name__}:{exc}"
+                report["coarse_cache"]["cache_validation_failed"].append({
+                    "hole_id": hole_id, "reason": cache_event["failure_reason"],
+                })
+        elif cache_enabled:
+            cache_event["cache_validation_failed"] = False
+            cache_event["failure_reason"] = "cache_unavailable"
+            report["coarse_cache"]["cache_validation_failed"].append({
+                "hole_id": hole_id, "reason": cache_event["failure_reason"],
+            })
+
+        # 只有缓存缺失/损坏而需要重新采集时才等待停稳；命中缓存的路径
+        # 已经完成安全340 mm导航，直接进入后续高度修正，不再额外等待。
+        with timing.measure(
+            f"hole_{hole_id:02d}/coarse_settle_buffer",
+            hole_id=hole_id,
+            processing_order=order,
+            delay_s=(coarse_settle_delay_s if not cache_reused else 0.0),
+            skipped=bool(cache_reused),
+        ):
+            if not cache_reused and coarse_settle_delay_s > 0.0:
+                time.sleep(coarse_settle_delay_s)
+        cache_event["coarse_settle_buffer_s"] = (
+            0.0 if cache_reused else coarse_settle_delay_s
+        )
+        cache_event["coarse_settle_buffer_reason"] = (
+            "direct_cache_reuse_no_wait" if cache_reused else "full_coarse_fallback"
+        )
+
+        if not cache_reused:
+            cache_event["full_coarse_fallback"] = bool(cache_enabled)
+            if cache_enabled:
+                report["coarse_cache"]["full_coarse_fallback"].append({
+                    "hole_id": hole_id,
+                    "reason": cache_event.get("failure_reason", "cache_unavailable"),
+                })
+        for capture_index in range(1, 4) if not cache_reused else []:
+            capture_tcp = np.asarray(current_tcp, dtype=np.float64).copy()
+            T_base_camera = camera_transform(capture_tcp, handeye.T_tcp_rgb_camera)
             tracking_point_base = np.asarray(
                 hole.get("coarse_center_base_mm", point_base), dtype=np.float64,
             ).reshape(3)
@@ -3451,6 +4360,7 @@ def _run_sequential_hole_workflow(
                     initial_anchor_px=expected_anchor_px,
                     tracking_tolerance_px=cfg.multi_coarse_tracking_tolerance_px,
                     lock_anchor=True,
+                    include_points=cache_enabled,
                 )
             rows.extend(_observation_rows(coarse_observations))
             _record_hole_tracking_event(
@@ -3467,6 +4377,9 @@ def _run_sequential_hole_workflow(
                 summary = _apply_coarse_geometry_to_hole(
                     hole, coarse_observations, T_base_camera, cfg,
                 )
+            last_coarse_observations = coarse_observations
+            last_coarse_T_base_camera = np.asarray(T_base_camera, dtype=np.float64).copy()
+            last_coarse_tcp = capture_tcp
             center_offset = float(np.linalg.norm(
                 np.asarray(summary["center_px"], dtype=np.float64)
                 - np.array([initial_intrinsics.cx, initial_intrinsics.cy])
@@ -3509,12 +4422,85 @@ def _run_sequential_hole_workflow(
                     motion_profile="approach",
                 )
         hole["coarse_captures"] = coarse_captures
-        if final_center_offset > cfg.center_tolerance_px or final_normal_error > cfg.normal_tolerance_deg:
+        hole["coarse_cache_event"] = cache_event
+        if (
+            not cache_reused
+            and (
+                final_center_offset is None
+                or final_normal_error is None
+                or final_center_offset > cfg.center_tolerance_px
+                or final_normal_error > cfg.normal_tolerance_deg
+            )
+        ):
             raise RuntimeError(
                 f"孔{hole_id}粗定位闭环后仍未通过质量门："
-                f"offset={final_center_offset:.2f}px, normal={final_normal_error:.3f}deg"
+                f"offset={float(final_center_offset or math.inf):.2f}px, "
+                f"normal={float(final_normal_error or math.inf):.3f}deg"
             )
+        if (
+            cache_enabled
+            and not cache_reused
+            and coarse_cache_dir is not None
+            and last_coarse_observations is not None
+            and last_coarse_T_base_camera is not None
+            and last_coarse_tcp is not None
+        ):
+            try:
+                refreshed = _cache_entry_from_observations(
+                    hole_id, last_coarse_observations,
+                    T_base_camera=last_coarse_T_base_camera,
+                    T_tcp_camera=handeye.T_tcp_rgb_camera,
+                    tcp_pose_m_rad=transform_to_sdk_pose_m_rad(last_coarse_tcp),
+                    camera_serial=str((report.get("camera") or {}).get("serial_number", "")),
+                    handeye_path=str(args.handeye),
+                    intrinsics=initial_intrinsics,
+                    cfg=cfg,
+                    min_valid_frames=int(cache_gates.min_valid_frames),
+                )
+                cache_entries[hole_id] = refreshed
+                save_cache_entries(
+                    coarse_cache_dir, cache_entries,
+                    metadata=coarse_cache_metadata,
+                )
+                if persistent_enabled and persistent_cache_dir is not None:
+                    persistent_id = _upsert_persistent_cache_entry(
+                        refreshed,
+                        current_hole_id=hole_id,
+                        persistent_entries=persistent_entries,
+                        persistent_source_ids=cache_source_ids,
+                    )
+                    save_persistent_cache_entries(
+                        persistent_cache_dir,
+                        persistent_entries,
+                        metadata=persistent_cache_metadata,
+                    )
+                    cache_sources[hole_id] = "persistent_base_cache"
+                    cache_source_ids[hole_id] = persistent_id
+                    cache_event["persistent_cache_refreshed"] = True
+                    cache_event["persistent_hole_id"] = persistent_id
+                cache_event["cache_refreshed"] = True
+                cache_event["cache_refresh_capture_index"] = int(
+                    coarse_captures[-1].get("capture_index", 0)
+                )
+                report["coarse_cache"]["cache_built"] = sorted(
+                    set(report["coarse_cache"].get("cache_built", [])) | {hole_id}
+                )
+                report["coarse_cache"]["cache_available"] = sorted(cache_entries)
+            except Exception as exc:
+                cache_event["cache_refresh_error"] = f"{type(exc).__name__}:{exc}"
 
+        if cache_reused:
+            cache_event["coarse_capture_frames_skipped"] = max(
+                0, int(cfg.coarse_frames),
+            )
+            cache_event["coarse_capture_time_saved_s"] = None
+            cache_event["coarse_capture_time_saved_basis"] = (
+                "direct_cache_reuse_no_live_validation_baseline"
+            )
+        else:
+            cache_event["coarse_capture_frames_skipped"] = 0
+            cache_event["coarse_capture_time_saved_s"] = 0.0
+            cache_event["coarse_capture_time_saved_basis"] = "no_cache_reuse"
         coarse_plane_base_value = hole.get("coarse_plane_point_base_mm")
         coarse_plane_base = np.asarray(
             hole["coarse_center_base_mm"] if coarse_plane_base_value is None else coarse_plane_base_value,
@@ -3616,7 +4602,15 @@ def _run_sequential_hole_workflow(
                 "coarse_plane_rmse_mm": hole["coarse_plane_rmse_mm"],
                 "coarse_valid_frames": hole["coarse_valid_frames"],
                 "coarse_center_scatter_p95_px": hole["coarse_center_scatter_p95_px"],
+                "coarse_surface_model": hole.get("coarse_surface_model"),
+                "coarse_surface_selection_policy": hole.get("coarse_surface_selection_policy"),
+                "coarse_front_surface_z_mm": hole.get("coarse_front_surface_z_mm"),
+                "coarse_ring_points_raw_median": hole.get("coarse_ring_points_raw_median"),
+                "coarse_surface_points_selected_median": hole.get(
+                    "coarse_surface_points_selected_median"
+                ),
                 "coarse_captures": hole["coarse_captures"],
+                "coarse_cache_event": hole.get("coarse_cache_event"),
                 "pointcloud_segmentation": hole["pointcloud_segmentation"],
                 "fine_z_source": "not_applied",
                 "estimated_height_mm": estimated_height,
@@ -3836,13 +4830,21 @@ def _run_sequential_hole_workflow(
             "coarse_plane_rmse_mm": hole["coarse_plane_rmse_mm"],
             "coarse_valid_frames": hole["coarse_valid_frames"],
             "coarse_center_scatter_p95_px": hole["coarse_center_scatter_p95_px"],
+            "coarse_surface_model": hole.get("coarse_surface_model"),
+            "coarse_surface_selection_policy": hole.get("coarse_surface_selection_policy"),
+            "coarse_front_surface_z_mm": hole.get("coarse_front_surface_z_mm"),
+            "coarse_ring_points_raw_median": hole.get("coarse_ring_points_raw_median"),
+            "coarse_surface_points_selected_median": hole.get(
+                "coarse_surface_points_selected_median"
+            ),
             "coarse_captures": hole["coarse_captures"],
+            "coarse_cache_event": hole.get("coarse_cache_event"),
             "pointcloud_segmentation": hole["pointcloud_segmentation"],
             "fine_plane_intersection_mm": naive_final_point_base,
             "fine_xy_source": (
                 "pointcloud_anchor_locked_yolo_center_on_coarse_local_plane"
             ),
-            "fine_z_source": "coarse_per_hole_center_z",
+            "fine_z_source": "coarse_front_surface_plane_intersection_z",
             "tilt_center_correction": tilt_correction,
             "estimated_height_mm": estimated_height,
             "diameter_estimate_mm": diameter_estimate,
@@ -3922,6 +4924,9 @@ def _run_sequential_hole_workflow(
         "holes": results,
         "final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
     }
+    # 由外层会话在本轮完成后安全回原点，再开始下一轮初始选孔。
+    # 保留在 runtime 中，避免改变现有函数的返回值兼容性。
+    runtime["current_tcp"] = np.asarray(current_tcp, dtype=np.float64).copy()
     if deferred_results:
         report["status"] = (
             "completed_with_deferred_holes_experimental_handeye"
@@ -3941,6 +4946,13 @@ def _run_sequential_hole_workflow(
     print(json.dumps(_jsonable(report["final_result"]), ensure_ascii=False, indent=2))
     print(f"[DONE] 结果目录: {run_dir}")
     return 0
+
+
+def _request_next_cycle_confirmation(cycle_index: int) -> str:
+    return input(
+        f"第{int(cycle_index)}轮已完成且机器人已停稳；"
+        "输入 m 开始下一轮初始拍摄，其他任意键结束："
+    ).strip().lower()
 
 
 def _request_next_cad_hole_confirmation(current_hole_id: str, next_hole_id: str) -> str:
@@ -4095,6 +5107,8 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
         yolo_match_tolerance_px=float(args.cad_yolo_match_tolerance_px),
         settle_discard_frames=int(args.cad_settle_discard_frames),
     )
+    final_target_mode = str(getattr(args, "final_target_mode", DEFAULT_FINAL_TARGET_MODE))
+    final_x_offset_mm, final_z_offset_mm = final_point_offsets_for_mode(final_target_mode)
     model_source, cad_model, previous_registration_report = _load_cad_model_for_fresh_motion(
         args.cad_model_json,
         args.cad_registration_report,
@@ -4136,7 +5150,7 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
             "max_fine_center_scatter_p95_px": float(cfg.max_fine_center_scatter_p95_px),
             "yolo_match_tolerance_px": float(cfg.yolo_match_tolerance_px),
             "settle_discard_frames": int(cfg.settle_discard_frames),
-            "final_target_mode": str(getattr(args, "final_target_mode", DEFAULT_FINAL_TARGET_MODE)),
+            "final_target_mode": final_target_mode,
             "move_final_xy": bool(args.move_final_xy),
             "tcp_xy_offset_mm": None if args.tcp_xy_offset_mm is None else [
                 float(value) for value in args.tcp_xy_offset_mm
@@ -4177,6 +5191,30 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
         report["robot_initial_tcp_pose_m_rad"] = initial_snapshot["pose_values_sdk_m_rad"]
         report["robot_initial_snapshot"] = initial_snapshot
 
+        current_tcp = np.asarray(initial_tcp, dtype=np.float64).copy()
+        home = None
+        if args.execute:
+            # 真实 CAD 运动必须在固定的原点/观察位完成配准，否则当前位置可能看不到整块孔位板。
+            with timing.measure("robot/load_home_point_before_cad_registration"):
+                home = load_home_point()
+            if home is None:
+                raise RuntimeError(
+                    "未找到 aubo_home_point.json；真实 CAD 配准前必须先在机器人控制界面设置原点"
+                )
+            with timing.measure("robot/connect_motion_session_before_cad_registration"):
+                motion_session = AuboMotionSession()
+                motion_session.connect(
+                    ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
+                    ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms,
+                )
+            with timing.measure("robot/move_home_before_cad_registration"):
+                current_tcp = _confirm_and_move_home(home, args, motion_session, pose_session)
+            report["home_point"] = home.to_dict()
+            report["robot_registration_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
+            print("[CAD] 已回到原点并稳定，开始采集实时 CAD 配准帧。", flush=True)
+        else:
+            report["robot_registration_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
+
         # 工件可能在上一次运行后被移动；旧 T_base_cad 只作为历史记录，绝不直接用于本次运动。
         report["cad_registration_report"] = str(
             run_dir / "cad_registration_auto" / "cad_registration_report.json"
@@ -4210,22 +5248,9 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                 raise RuntimeError(message + "；真实运动拒绝")
             print("[CAD][WARN] " + message, flush=True)
 
-        current_tcp = np.asarray(initial_tcp, dtype=np.float64).copy()
         if args.execute:
-            with timing.measure("robot/connect_motion_session"):
-                motion_session = AuboMotionSession()
-                motion_session.connect(
-                    ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
-                    ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms,
-                )
-            home = load_home_point()
-            if home is None:
-                raise RuntimeError("未找到 aubo_home_point.json；请先在机器人控制界面设置原点")
-            with timing.measure("robot/move_home_before_cad_group_selection"):
-                current_tcp = _confirm_and_move_home(home, args, motion_session, pose_session)
-            report["home_point"] = home.to_dict()
             report["robot_selection_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
-            print("[CAD] 已回到原点，准备选择一组 CAD 目标孔。", flush=True)
+            print("[CAD] 准备在原点选择一组 CAD 目标孔。", flush=True)
 
         # 真实运动必须在原点选孔；预览模式保持不运动，使用启动时当前TCP做规划。
         selection_tcp = np.asarray(current_tcp, dtype=np.float64).copy()
@@ -4501,8 +5526,6 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
             # CAD继续提供平面Z；YOLO只把最终XY拉回真实孔中心。
             hole_center_base = np.asarray(observed_point_base, dtype=np.float64).copy()
             hole_center_base[2] = float(np.asarray(hole["point_base_mm"])[2])
-            final_target_mode = str(getattr(args, "final_target_mode", DEFAULT_FINAL_TARGET_MODE))
-            final_x_offset_mm, final_z_offset_mm = final_point_offsets_for_mode(final_target_mode)
             final_target_point_base = apply_final_point_base_offsets(
                 hole_center_base, final_x_offset_mm, final_z_offset_mm,
             )
@@ -4559,6 +5582,7 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                     "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(z_target),
                     "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                     "target_base_z_mm": float(z_target[2, 3]),
+                    "final_point_mode": final_target_mode,
                     "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
                 }
                 y_target = plan_final_tcp_base_y_trim(current_tcp)
@@ -4672,14 +5696,24 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
         timing.print_summary()
 
 
-def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
-    """执行“初始多孔选择 -> 按孔号逐个粗/精定位 -> 逐孔目标点运动”的受确认流程。"""
-    cfg = TwoStageConfig(
-        coarse_height_mm=float(args.coarse_height_mm), fine_height_mm=float(args.fine_height_mm),
-        coarse_frames=int(args.coarse_frames), fine_frames=int(args.fine_frames),
-        fine_settle_discard_frames=int(args.fine_settle_discard_frames),
-        fine_retry_count=int(args.fine_retries),
-    )
+def _new_two_stage_run_dir(cycle_index: int) -> Path:
+    """为可重复选孔会话创建独立的一轮报告目录。"""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = "" if int(cycle_index) == 1 else f"-cycle{int(cycle_index):02d}"
+    stem = f"two-stage-{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffix}"
+    candidate = RUNS_DIR / stem
+    serial = 2
+    while candidate.exists():
+        candidate = RUNS_DIR / f"{stem}-{serial:02d}"
+        serial += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def _new_two_stage_report(
+    args: Any, handeye: Any, cfg: TwoStageConfig, run_dir: Path, cycle_index: int,
+) -> dict[str, Any]:
+    """创建一轮两阶段报告；机器人/相机资源由外层会话共享。"""
     precision_speed_m_s = float(args.speed_m_s)
     precision_acc_m_s2 = float(args.acc_m_s2)
     transit_speed_m_s = float(getattr(args, "transit_speed_m_s", precision_speed_m_s))
@@ -4688,44 +5722,24 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
     approach_acc_m_s2 = float(getattr(args, "approach_acc_m_s2", 0.35))
     final_target_mode = str(getattr(args, "final_target_mode", DEFAULT_FINAL_TARGET_MODE))
     final_x_offset_mm, final_z_offset_mm = final_point_offsets_for_mode(final_target_mode)
-    if precision_speed_m_s <= 0.0 or precision_acc_m_s2 <= 0.0:
-        raise ValueError(
-            f"精确运动速度和加速度必须大于0：speed={precision_speed_m_s}, "
-            f"acc={precision_acc_m_s2}"
-        )
-    if transit_speed_m_s <= 0.0 or transit_acc_m_s2 <= 0.0:
-        raise ValueError(
-            f"安全过渡速度和加速度必须大于0：speed={transit_speed_m_s}, "
-            f"acc={transit_acc_m_s2}"
-        )
-    if approach_speed_m_s <= 0.0 or approach_acc_m_s2 <= 0.0:
-        raise ValueError(
-            f"非接触接近速度和加速度必须大于0：speed={approach_speed_m_s}, "
-            f"acc={approach_acc_m_s2}"
-        )
-    if cfg.fine_settle_discard_frames < 0:
-        raise ValueError("精定位预热丢弃帧数不能小于0")
-    if cfg.fine_retry_count < 0:
-        raise ValueError("精定位重试次数不能小于0")
-    if cfg.fine_height_mm >= cfg.coarse_height_mm:
-        raise ValueError("精定位高度必须小于粗定位高度")
-    if cfg.coarse_frames < cfg.min_coarse_valid:
-        raise ValueError(
-            f"粗定位最大帧数必须不少于最小有效帧数：{cfg.coarse_frames} < {cfg.min_coarse_valid}"
-        )
-    if cfg.fine_frames < cfg.fine_stable_min_frames:
-        raise ValueError(
-            f"精定位最大帧数必须不少于稳定门帧数：{cfg.fine_frames} < {cfg.fine_stable_min_frames}"
-        )
-    run_dir = RUNS_DIR / f"two-stage-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    report: dict[str, Any] = {
-        "status": "running", "mode": "two_stage_hole_localization", "run_dir": str(run_dir),
-        "created_at": datetime.now().isoformat(timespec="seconds"), "configuration": cfg.__dict__,
+    return {
+        "status": "running",
+        "mode": "two_stage_hole_localization",
+        "run_dir": str(run_dir),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "cycle_index": int(cycle_index),
+        "session_reselect_enabled": bool(args.execute),
+        "configuration": cfg.__dict__,
         "hole_count": None,
         "selection_mode": "click_any_count_then_enter",
-        "handeye_path": str(args.handeye), "stages": {}, "motion_executed": bool(args.execute),
+        "handeye_path": str(args.handeye),
+        "stages": {},
+        "motion_executed": bool(args.execute),
         "experimental_handeye_override": bool(args.allow_experimental_handeye),
+        "reuse_coarse_cache": bool(getattr(args, "reuse_coarse_cache", True)),
+        "reuse_persistent_coarse_cache": bool(
+            getattr(args, "reuse_persistent_coarse_cache", True)
+        ),
         "final_target_mode": final_target_mode,
         "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
         "motion_profiles": {
@@ -4758,14 +5772,408 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             }
         ),
     }
+
+
+def _run_two_stage_localization_cycle(
+    args: Any, handeye: Any, model: Any, cfg: TwoStageConfig, run_dir: Path,
+    report: dict[str, Any], timing: TimingRecorder, rows: list[dict[str, Any]],
+    pipeline_runtime: dict[str, Any], pose_session: Any, motion_session: Any,
+    current_tcp: np.ndarray, cycle_index: int,
+) -> int:
+    """执行一轮初始选孔到逐孔完成；相机和机器人会话由外层复用。"""
+    rgbd_pipeline = pipeline_runtime.get("rgbd_pipeline")
+    align = pipeline_runtime.get("align")
+    chain = pipeline_runtime.get("chain")
+    if rgbd_pipeline is None or align is None or chain is None:
+        raise RuntimeError("RGB-D 管线尚未就绪，无法开始新一轮初始选孔")
+
+    if pose_session is not None:
+        with timing.measure(
+            "robot/verify_steady_before_initial_capture",
+            cycle_index=int(cycle_index),
+        ):
+            current_tcp = _wait_robot_steady_before_initial_capture(
+                pose_session,
+            )
+        pipeline_runtime["current_tcp"] = current_tcp.copy()
+        print(
+            f"[CAMERA_READY] cycle={int(cycle_index)} 机器人已完全停止，"
+            "开始采集本轮初始画面。",
+            flush=True,
+        )
+
+    print(
+        f"[INITIAL_SELECTION_REQUIRED] cycle={int(cycle_index)} "
+        "机器人已在原点并完全停止，请选择本轮目标孔后按 Enter；按 Esc 结束会话。",
+        flush=True,
+    )
+    with timing.measure(
+        "initial_selection/yolo_rgbd_pointcloud",
+        selection_mode="click_any_count_then_enter",
+        cycle_index=int(cycle_index),
+    ):
+        (
+            _,
+            initial_selected_holes,
+            selected_point_camera,
+            initial_plane_camera,
+            intrinsics,
+        ) = _capture_initial_multi_hole_selection(
+            rgbd_pipeline, align, chain, model, args.confidence, run_dir,
+            cfg.initial_max_plane_rmse_mm,
+        )
+    report["hole_count"] = len(initial_selected_holes)
+    chosen = initial_selected_holes[0]["initial_detection"]
+    T_base_camera_home = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+    selected_point_base = (
+        T_base_camera_home[:3, :3] @ selected_point_camera
+        + T_base_camera_home[:3, 3]
+    )
+    plane_point_base = (
+        T_base_camera_home[:3, :3] @ initial_plane_camera.point_camera_mm
+        + T_base_camera_home[:3, 3]
+    )
+    camera_origin_home = T_base_camera_home[:3, 3]
+    plane_normal_base = _unit(
+        T_base_camera_home[:3, :3] @ initial_plane_camera.normal_camera,
+        "initial group base normal",
+    )
+    if float(plane_normal_base @ (camera_origin_home - selected_point_base)) < 0.0:
+        plane_normal_base = -plane_normal_base
+    for hole in initial_selected_holes:
+        point_camera = np.asarray(
+            hole["initial_point_camera_mm"], dtype=np.float64,
+        ).reshape(3)
+        plane_point_camera = np.asarray(
+            hole["initial_plane_point_camera_mm"], dtype=np.float64,
+        ).reshape(3)
+        normal_camera = _unit(
+            np.asarray(hole["initial_plane_normal_camera"], dtype=np.float64),
+            f"initial hole {int(hole['hole_id'])} base normal",
+        )
+        point_base = T_base_camera_home[:3, :3] @ point_camera + T_base_camera_home[:3, 3]
+        normal_base = _unit(
+            T_base_camera_home[:3, :3] @ normal_camera,
+            f"initial hole {int(hole['hole_id'])} base normal",
+        )
+        if float(normal_base @ (camera_origin_home - point_base)) < 0.0:
+            normal_base = -normal_base
+        hole.update({
+            "initial_center_base_mm": point_base.tolist(),
+            "initial_plane_point_base_mm": (
+                T_base_camera_home[:3, :3] @ plane_point_camera
+                + T_base_camera_home[:3, 3]
+            ).tolist(),
+            "initial_plane_normal_base": normal_base.tolist(),
+            "tracking_identity": f"initial_selection_hole_{int(hole['hole_id'])}",
+        })
+    report["stages"]["home_selection"] = {
+        "selection_mode": "initial_multi_hole_selection",
+        "hole_count": len(initial_selected_holes),
+        "selected": chosen,
+        "selected_holes": initial_selected_holes,
+        "group_center_camera_mm": selected_point_camera,
+        "group_center_base_mm": selected_point_base,
+        "group_plane_point_base_mm": plane_point_base,
+        "group_plane_normal_base": plane_normal_base,
+        "group_plane_rmse_mm": initial_plane_camera.rmse_mm,
+        "group_ring_points": initial_plane_camera.ring_points,
+        "group_surface_model": initial_plane_camera.surface_model,
+        "initial_geometry_fallback_holes": [
+            int(hole["hole_id"])
+            for hole in initial_selected_holes
+            if bool(hole.get("initial_geometry_fallback"))
+        ],
+        "initial_geometry_fallback_reasons": {
+            str(int(hole["hole_id"])): str(hole.get("initial_geometry_fallback_reason"))
+            for hole in initial_selected_holes
+            if bool(hole.get("initial_geometry_fallback"))
+        },
+        "initial_geometry_policy": (
+            "per_hole_plane_or_shared_plane_fallback_for_safe_340mm_navigation"
+        ),
+    }
+
+    coarse_cache_gates = CacheValidationGates(
+        validation_frames=3,
+        min_valid_frames=2,
+        max_tracking_distance_px=cfg.multi_coarse_tracking_tolerance_px,
+        max_center_offset_px=cfg.center_tolerance_px,
+        max_center_scatter_p95_px=cfg.max_coarse_center_scatter_p95_px,
+        max_plane_rmse_mm=cfg.max_plane_rmse_mm,
+        max_normal_error_deg=cfg.normal_tolerance_deg,
+    )
+    coarse_cache_dir = run_dir / "coarse_cache"
+    persistent_cache_dir = HOLE_LOCALIZATION_COARSE_CACHE_DIR
+    cache_entries: dict[int, CoarseCacheEntry] = {}
+    cache_sources: dict[int, str] = {}
+    cache_source_ids: dict[int, int] = {}
+    cache_failures: dict[int, str] = {}
+    cache_built_ids: set[int] = set()
+    persistent_entries: dict[int, CoarseCacheEntry] = {}
+    persistent_load_errors: dict[int, str] = {}
+    persistent_audit: dict[str, Any] = {
+        "requested_dir": str(persistent_cache_dir),
+        "loaded_count": 0,
+        "match": {},
+    }
+    cache_enabled = bool(args.execute and getattr(args, "reuse_coarse_cache", True))
+    persistent_enabled = bool(
+        cache_enabled and getattr(args, "reuse_persistent_coarse_cache", True)
+    )
+    report["coarse_cache"] = {
+        "enabled": cache_enabled,
+        "cache_scope": "current_run_and_base_persistent",
+        "cache_dir": str(coarse_cache_dir),
+        "persistent_enabled": persistent_enabled,
+        "persistent_cache_dir": str(persistent_cache_dir),
+        "surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+        "surface_model": COARSE_SURFACE_MODEL,
+        "gates": coarse_cache_gates.to_dict(),
+        "cache_built": [],
+        "cache_available": [],
+        "cache_reused": [],
+        "persistent_cache_reused": [],
+        "cache_validation_skipped": [],
+        "cache_validation_failed": [],
+        "full_coarse_fallback": [],
+        "cache_persist_error": None,
+        "persistent_cache_persist_error": None,
+    }
+    if cache_enabled:
+        if persistent_enabled:
+            (
+                persistent_entries,
+                persistent_load_errors,
+                persistent_audit,
+            ) = _load_persistent_coarse_cache_for_run(
+                run_dir=run_dir,
+                camera_serial=str((report.get("camera") or {}).get("serial_number", "")),
+                handeye=handeye,
+                handeye_path=str(args.handeye),
+                intrinsics=intrinsics,
+                persistent_cache_dir=persistent_cache_dir,
+                required_surface_model=COARSE_SURFACE_MODEL,
+            )
+            target_points = {
+                int(hole["hole_id"]): np.asarray(
+                    hole["initial_center_base_mm"], dtype=np.float64,
+                )
+                for hole in initial_selected_holes
+            }
+            (
+                matched_entries,
+                matched_source_ids,
+                match_audit,
+            ) = match_entries_by_base_point(target_points, persistent_entries)
+            persistent_audit["match"] = match_audit
+            cache_entries.update({
+                int(hole_id): rekey_cache_entry(entry, int(hole_id))
+                for hole_id, entry in matched_entries.items()
+            })
+            cache_sources.update({
+                int(hole_id): "persistent_base_cache"
+                for hole_id in matched_entries
+            })
+            cache_source_ids.update({
+                int(hole_id): int(source_id)
+                for hole_id, source_id in matched_source_ids.items()
+            })
+            report["coarse_cache"]["persistent_cache"] = persistent_audit
+            report["coarse_cache"]["persistent_cache_load_errors"] = {
+                str(key): value for key, value in persistent_load_errors.items()
+            }
+
+        build_holes = [
+            hole for hole in initial_selected_holes
+            if int(hole["hole_id"]) not in cache_entries
+        ]
+        if build_holes:
+            with timing.measure(
+                "initial_selection/build_coarse_cache",
+                cycle_index=int(cycle_index),
+            ):
+                built_entries, cache_failures = _build_initial_coarse_cache(
+                    rgbd_pipeline, align, chain, model, args.confidence,
+                    build_holes,
+                    T_base_camera=T_base_camera_home,
+                    current_tcp=current_tcp,
+                    handeye=handeye,
+                    handeye_path=str(args.handeye),
+                    camera_serial=str((report.get("camera") or {}).get("serial_number", "")),
+                    intrinsics=intrinsics,
+                    cfg=cfg,
+                    gates=coarse_cache_gates,
+                    rgb_output_dir=coarse_cache_dir,
+                )
+            cache_entries.update(built_entries)
+            cache_built_ids.update(int(hole_id) for hole_id in built_entries)
+            for hole_id in built_entries:
+                cache_sources[int(hole_id)] = "current_run_initial_cache"
+        try:
+            save_cache_entries(
+                coarse_cache_dir,
+                cache_entries,
+                metadata={
+                    "mode": "two_stage_hole_localization",
+                    "source": "initial_multi_hole_selection",
+                    "handeye_path": str(args.handeye),
+                    "camera_serial": str((report.get("camera") or {}).get("serial_number", "")),
+                    "gates": coarse_cache_gates.to_dict(),
+                    "surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+                    "surface_model": COARSE_SURFACE_MODEL,
+                },
+            )
+        except Exception as exc:
+            report["coarse_cache"]["cache_persist_error"] = f"{type(exc).__name__}:{exc}"
+        if persistent_enabled and cache_entries:
+            try:
+                for hole_id, entry in list(cache_entries.items()):
+                    if int(hole_id) not in cache_source_ids:
+                        cache_source_ids[int(hole_id)] = _upsert_persistent_cache_entry(
+                            entry,
+                            current_hole_id=int(hole_id),
+                            persistent_entries=persistent_entries,
+                            persistent_source_ids=cache_source_ids,
+                        )
+                save_persistent_cache_entries(
+                    persistent_cache_dir,
+                    persistent_entries,
+                    metadata={
+                        "mode": "two_stage_hole_localization",
+                        "source": "base_frame_persistent_coarse_cache",
+                        "handeye_path": str(args.handeye),
+                        "camera_serial": str((report.get("camera") or {}).get("serial_number", "")),
+                        "gates": coarse_cache_gates.to_dict(),
+                        "surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+                        "surface_model": COARSE_SURFACE_MODEL,
+                    },
+                )
+            except Exception as exc:
+                report["coarse_cache"]["persistent_cache_persist_error"] = (
+                    f"{type(exc).__name__}:{exc}"
+                )
+        report["coarse_cache"]["cache_built"] = sorted(cache_built_ids)
+        report["coarse_cache"]["cache_available"] = sorted(cache_entries)
+        report["coarse_cache"]["initial_build_failures"] = cache_failures
+        report["coarse_cache"]["persistent_cache_ids"] = sorted(persistent_entries)
+    report["coarse_cache"]["rgb_snapshot_images"] = [
+        str(path)
+        for path in sorted(coarse_cache_dir.glob("initial_cache_rgb_frame_*.png"))
+        if path.is_file()
+    ]
+    report["stages"]["home_selection"]["coarse_cache_built"] = report[
+        "coarse_cache"
+    ].get("cache_built", [])
+    report["stages"]["home_selection"]["coarse_cache_available"] = sorted(cache_entries)
+    report["stages"]["home_selection"]["coarse_cache_failures"] = cache_failures
+    report["stages"]["home_selection"]["coarse_cache_rgb_images"] = report[
+        "coarse_cache"
+    ]["rgb_snapshot_images"]
+    _write_report(run_dir, report, rows)
+
+    result = _run_sequential_hole_workflow(
+        args, handeye, model, cfg, run_dir, report, timing, rows, pipeline_runtime,
+        pose_session, motion_session, current_tcp,
+        initial_selected_holes, intrinsics,
+        coarse_cache_entries=cache_entries,
+        coarse_cache_sources=cache_sources,
+        coarse_cache_source_ids=cache_source_ids,
+        coarse_cache_dir=coarse_cache_dir,
+        coarse_cache_gates=coarse_cache_gates,
+        coarse_cache_metadata={
+            "mode": "two_stage_hole_localization",
+            "source": "initial_multi_hole_selection_or_fallback_refresh",
+            "handeye_path": str(args.handeye),
+            "camera_serial": str((report.get("camera") or {}).get("serial_number", "")),
+            "gates": coarse_cache_gates.to_dict(),
+            "surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+            "surface_model": COARSE_SURFACE_MODEL,
+        },
+        persistent_cache_entries=persistent_entries,
+        persistent_cache_dir=persistent_cache_dir,
+        persistent_cache_metadata={
+            "mode": "two_stage_hole_localization",
+            "source": "successful_full_coarse_refresh",
+            "handeye_path": str(args.handeye),
+            "camera_serial": str((report.get("camera") or {}).get("serial_number", "")),
+            "gates": coarse_cache_gates.to_dict(),
+            "surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
+            "surface_model": COARSE_SURFACE_MODEL,
+        },
+    )
+    return int(result)
+
+
+
+
+def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
+    """持续运行旧两阶段流程：每轮完成后回原点并重新进入初始选孔。"""
+    cfg = TwoStageConfig(
+        coarse_height_mm=float(args.coarse_height_mm),
+        fine_height_mm=float(args.fine_height_mm),
+        coarse_frames=int(args.coarse_frames),
+        fine_frames=int(args.fine_frames),
+        coarse_settle_delay_s=float(args.coarse_settle_delay_s),
+        fine_settle_discard_frames=int(args.fine_settle_discard_frames),
+        fine_retry_count=int(args.fine_retries),
+    )
+    precision_speed_m_s = float(args.speed_m_s)
+    precision_acc_m_s2 = float(args.acc_m_s2)
+    transit_speed_m_s = float(getattr(args, "transit_speed_m_s", precision_speed_m_s))
+    transit_acc_m_s2 = float(getattr(args, "transit_acc_m_s2", precision_acc_m_s2))
+    approach_speed_m_s = float(getattr(args, "approach_speed_m_s", 0.12))
+    approach_acc_m_s2 = float(getattr(args, "approach_acc_m_s2", 0.35))
+    if precision_speed_m_s <= 0.0 or precision_acc_m_s2 <= 0.0:
+        raise ValueError(
+            f"精确运动速度和加速度必须大于0：speed={precision_speed_m_s}, "
+            f"acc={precision_acc_m_s2}"
+        )
+    if transit_speed_m_s <= 0.0 or transit_acc_m_s2 <= 0.0:
+        raise ValueError(
+            f"安全过渡速度和加速度必须大于0：speed={transit_speed_m_s}, "
+            f"acc={transit_acc_m_s2}"
+        )
+    if approach_speed_m_s <= 0.0 or approach_acc_m_s2 <= 0.0:
+        raise ValueError(
+            f"非接触接近速度和加速度必须大于0：speed={approach_speed_m_s}, "
+            f"acc={approach_acc_m_s2}"
+        )
+    if cfg.fine_settle_discard_frames < 0:
+        raise ValueError("精定位预热丢弃帧数不能小于0")
+    if cfg.coarse_settle_delay_s < 0.0:
+        raise ValueError("粗定位停稳缓冲时间不能小于0")
+    if cfg.fine_retry_count < 0:
+        raise ValueError("精定位重试次数不能小于0")
+    if cfg.fine_height_mm >= cfg.coarse_height_mm:
+        raise ValueError("精定位高度必须小于粗定位高度")
+    if cfg.coarse_frames < cfg.min_coarse_valid:
+        raise ValueError(
+            f"粗定位最大帧数必须不少于最小有效帧数：{cfg.coarse_frames} < {cfg.min_coarse_valid}"
+        )
+    if cfg.fine_frames < cfg.fine_stable_min_frames:
+        raise ValueError(
+            f"精定位最大帧数必须不少于稳定门帧数：{cfg.fine_frames} < {cfg.fine_stable_min_frames}"
+        )
+
+    cycle_index = 1
+    run_dir = _new_two_stage_run_dir(cycle_index)
+    report = _new_two_stage_report(args, handeye, cfg, run_dir, cycle_index)
     timing = TimingRecorder()
     timing.attach_report(report)
     rows: list[dict[str, Any]] = []
-    rgbd_pipeline = align = chain = None
+    rgbd_pipeline = None
     pipeline_runtime: dict[str, Any] = {
-        "rgbd_pipeline": None, "align": None, "chain": None,
+        "rgbd_pipeline": None,
+        "align": None,
+        "chain": None,
+        "current_tcp": None,
     }
     pose_session = motion_session = None
+    current_tcp: np.ndarray | None = None
+    home = None
+    camera_identity: dict[str, Any] = {}
+
     try:
         from aubo_workbench.motion_control import AuboMotionSession, load_home_point
         from aubo_workbench.robot import AuboPoseSession
@@ -4778,6 +6186,7 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             pose_session = AuboPoseSession()
             pose_session.connect()
             initial_snapshot, initial_tcp = _require_safe_snapshot(pose_session)
+        current_tcp = np.asarray(initial_tcp, dtype=np.float64).copy()
         report["robot_initial_tcp_pose_m_rad"] = initial_snapshot["pose_values_sdk_m_rad"]
         report["home_point"] = home.to_dict()
 
@@ -4790,102 +6199,151 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             if not handeye.validated_for_motion:
                 print(
                     "[EXPERIMENTAL] 使用未通过生产验证的当前手眼结果。"
-                    "本次仅可作实验验证，结果不会被标记为生产可用。"
+                    "本次仅可作实验验证，结果不会被标记为生产可用。",
+                    flush=True,
                 )
             with timing.measure("robot/connect_motion_session"):
                 motion_session = AuboMotionSession()
-                motion_session.connect(ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
-                                      ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms)
+                motion_session.connect(
+                    ROBOT_CFG.ip,
+                    ROBOT_CFG.rpc_port,
+                    ROBOT_CFG.user,
+                    ROBOT_CFG.password,
+                    ROBOT_CFG.request_timeout_ms,
+                )
             with timing.measure("robot/move_home"):
-                current_tcp = _confirm_and_move_home(home, args, motion_session, pose_session)
+                current_tcp = _confirm_and_move_home(
+                    home, args, motion_session, pose_session,
+                )
         else:
-            current_tcp = initial_tcp
-            print("[PREVIEW] 未指定 --execute：不会回原点或下发运动；请手动将机器人置于原点后核对规划。")
+            print(
+                "[PREVIEW] 未指定 --execute：不会回原点或下发运动；"
+                "只执行一轮预览。请手动将机器人置于原点后核对规划。",
+                flush=True,
+            )
 
         with timing.measure("camera/start_rgbd_pipeline"):
             report["stages"]["rgbd_startup"] = {"status": "starting"}
             rgbd_pipeline, align, chain = init_pipeline()
             pipeline_runtime.update({
-                "rgbd_pipeline": rgbd_pipeline, "align": align, "chain": chain,
+                "rgbd_pipeline": rgbd_pipeline,
+                "align": align,
+                "chain": chain,
             })
             report["stages"]["rgbd_startup"] = {"status": "ready"}
-            identity = get_device_identity(rgbd_pipeline)
+            camera_identity = get_device_identity(rgbd_pipeline)
             expected = str(handeye.payload.get("camera_serial", "")).strip()
-            actual = str(identity.get("serial_number", "")).strip()
+            actual = str(camera_identity.get("serial_number", "")).strip()
             if expected and actual and expected != actual:
                 raise RuntimeError(f"相机序列号不匹配：手眼={expected}，当前={actual}")
-            report["camera"] = identity
+            report["camera"] = camera_identity
+        report["cycle_start_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
+        _write_report(run_dir, report, rows)
 
-        with timing.measure(
-            "initial_selection/yolo_rgbd_pointcloud",
-            selection_mode="click_any_count_then_enter",
-        ):
-            (
-                _,
-                initial_selected_holes,
-                selected_point_camera,
-                initial_plane_camera,
-                intrinsics,
-            ) = _capture_initial_multi_hole_selection(
-                rgbd_pipeline, align, chain, model, args.confidence, run_dir,
-                cfg.initial_max_plane_rmse_mm,
-            )
-        report["hole_count"] = len(initial_selected_holes)
-        chosen = initial_selected_holes[0]["initial_detection"]
-        T_base_camera_home = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
-        selected_point_base = T_base_camera_home[:3, :3] @ selected_point_camera + T_base_camera_home[:3, 3]
-        plane_point_base = T_base_camera_home[:3, :3] @ initial_plane_camera.point_camera_mm + T_base_camera_home[:3, 3]
-        camera_origin_home = T_base_camera_home[:3, 3]
-        plane_normal_base = _unit(
-            T_base_camera_home[:3, :3] @ initial_plane_camera.normal_camera,
-            "initial group base normal",
-        )
-        if float(plane_normal_base @ (camera_origin_home - selected_point_base)) < 0.0:
-            plane_normal_base = -plane_normal_base
-        for hole in initial_selected_holes:
-            point_camera = np.asarray(hole["initial_point_camera_mm"], dtype=np.float64).reshape(3)
-            plane_point_camera = np.asarray(
-                hole["initial_plane_point_camera_mm"], dtype=np.float64,
-            ).reshape(3)
-            normal_camera = _unit(
-                np.asarray(hole["initial_plane_normal_camera"], dtype=np.float64),
-                f"initial hole {int(hole['hole_id'])} base normal",
-            )
-            point_base = T_base_camera_home[:3, :3] @ point_camera + T_base_camera_home[:3, 3]
-            normal_base = _unit(
-                T_base_camera_home[:3, :3] @ normal_camera,
-                f"initial hole {int(hole['hole_id'])} base normal",
-            )
-            if float(normal_base @ (camera_origin_home - point_base)) < 0.0:
-                normal_base = -normal_base
-            hole.update({
-                "initial_center_base_mm": point_base.tolist(),
-                "initial_plane_point_base_mm": (
-                    T_base_camera_home[:3, :3] @ plane_point_camera + T_base_camera_home[:3, 3]
-                ).tolist(),
-                "initial_plane_normal_base": normal_base.tolist(),
-                "tracking_identity": f"initial_selection_hole_{int(hole['hole_id'])}",
-            })
-        report["stages"]["home_selection"] = {
-            "selection_mode": "initial_multi_hole_selection",
-            "hole_count": len(initial_selected_holes),
-            "selected": chosen,
-            "selected_holes": initial_selected_holes,
-            "group_center_camera_mm": selected_point_camera,
-            "group_center_base_mm": selected_point_base,
-            "group_plane_point_base_mm": plane_point_base,
-            "group_plane_normal_base": plane_normal_base,
-            "group_plane_rmse_mm": initial_plane_camera.rmse_mm,
-            "group_ring_points": initial_plane_camera.ring_points,
-            "group_surface_model": initial_plane_camera.surface_model,
-        }
+        while True:
+            if cycle_index > 1:
+                run_dir = _new_two_stage_run_dir(cycle_index)
+                report = _new_two_stage_report(args, handeye, cfg, run_dir, cycle_index)
+                timing = TimingRecorder()
+                timing.attach_report(report)
+                rows = []
+                report["robot_initial_tcp_pose_m_rad"] = (
+                    transform_to_sdk_pose_m_rad(current_tcp)
+                )
+                report["home_point"] = home.to_dict()
+                report["camera"] = camera_identity
+                report["stages"]["rgbd_startup"] = {
+                    "status": "shared_ready",
+                    "reused_session": True,
+                }
+                report["cycle_start_tcp_pose_m_rad"] = (
+                    transform_to_sdk_pose_m_rad(current_tcp)
+                )
+                _write_report(run_dir, report, rows)
 
-        return _run_sequential_hole_workflow(
-            args, handeye, model, cfg, run_dir, report, timing, rows, pipeline_runtime,
-            pose_session, motion_session, current_tcp,
-            initial_selected_holes, intrinsics,
-        )
+            result = _run_two_stage_localization_cycle(
+                args,
+                handeye,
+                model,
+                cfg,
+                run_dir,
+                report,
+                timing,
+                rows,
+                pipeline_runtime,
+                pose_session,
+                motion_session,
+                np.asarray(current_tcp, dtype=np.float64),
+                cycle_index,
+            )
+            if not args.execute:
+                return int(result)
 
+            current_tcp = np.asarray(
+                pipeline_runtime.get("current_tcp"), dtype=np.float64,
+            ).copy()
+            pipeline_runtime["current_tcp"] = current_tcp.copy()
+            report["return_to_home"] = {
+                "completed": False,
+                "reason": "waiting_for_next_cycle_confirmation_before_return_home",
+                "tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+            }
+            report["final_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
+            report["next_cycle_ready"] = False
+            report["next_cycle_confirmation_required"] = True
+            report["status"] = (
+                "completed_experimental_handeye_waiting_for_next_cycle_confirmation"
+                if not handeye.validated_for_motion else
+                "completed_waiting_for_next_cycle_confirmation"
+            )
+            _write_report(run_dir, report, rows)
+            print(
+                f"[NEXT_CYCLE_CONFIRM_REQUIRED] cycle={int(cycle_index)} 已完成；"
+                "机器人保持当前位置，不会自动回到初始点。"
+                "点击“开始下一轮检测”（命令行输入 m）后才回到初始点；"
+                "回到初始点并完全停止后才会拍摄下一轮画面。",
+                flush=True,
+            )
+            command = _request_next_cycle_confirmation(cycle_index)
+            if command != "m":
+                raise TwoStageSelectionCancelled("用户未确认开始下一轮检测")
+            report["next_cycle_confirmation_required"] = False
+            report["next_cycle_confirmed"] = True
+            report["next_cycle_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
+            report["next_cycle_ready"] = False
+            report["next_cycle_motion"] = "return_home_after_confirmation"
+            _write_report(run_dir, report, rows)
+            with timing.measure(
+                "robot/return_home_after_cycle_confirmation",
+                cycle_index=int(cycle_index),
+            ):
+                current_tcp = _confirm_and_move_home(
+                    home, args, motion_session, pose_session,
+                )
+            with timing.measure(
+                "robot/verify_home_steady_before_next_cycle_capture",
+                cycle_index=int(cycle_index),
+            ):
+                _, current_tcp = _wait_robot_steady(pose_session)
+            pipeline_runtime["current_tcp"] = current_tcp.copy()
+            report["return_to_home"] = {
+                "completed": True,
+                "reason": "next_cycle_confirmation_received",
+                "tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+            }
+            report["next_cycle_ready"] = True
+            report["next_cycle_capture_waits_for_steady"] = True
+            _write_report(run_dir, report, rows)
+            cycle_index += 1
+
+    except TwoStageSelectionCancelled as exc:
+        report["status"] = "stopped_by_user"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        report["next_cycle_ready"] = False
+        report["session_stopped_by_user"] = True
+        _write_report(run_dir, report, rows)
+        print(f"[STOPPED] 用户结束重复选孔会话：{exc}", flush=True)
+        return 0
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
@@ -4919,7 +6377,10 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             try:
                 _write_report(run_dir, report, rows)
             except Exception as exc:
-                print(f"[TIMING] 最终报告写入失败：{type(exc).__name__}: {exc}", flush=True)
+                print(
+                    f"[TIMING] 最终报告写入失败：{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             timing.print_summary()
 
 
@@ -5015,6 +6476,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fine-height-mm", type=float, default=260.0,
                    help="两阶段模式的孔面RGB-Z精定位高度，默认260")
     p.add_argument("--coarse-frames", type=int, default=10, help="两阶段最终粗定位最大有效RGB-D帧数")
+    p.add_argument(
+        "--coarse-settle-delay-s", type=float, default=0.3,
+        help="到达340 mm粗定位位后等待的停稳缓冲时间(秒)，默认0.3",
+    )
     p.add_argument("--fine-frames", type=int, default=20, help="两阶段精定位最大有效RGB帧数")
     p.add_argument("--fine-settle-discard-frames", type=int, default=10,
                    help="每次精定位采集前丢弃的机器人/相机预热RGB帧数，默认10")
@@ -5025,6 +6490,27 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(FINAL_TARGET_MODE_GRIPPER, FINAL_TARGET_MODE_NORMAL),
         default=DEFAULT_FINAL_TARGET_MODE,
         help="最终点模式：gripper=机械爪模式(X+64,Z+50)，normal=平常模式(无X/Z偏置)",
+    )
+    p.add_argument(
+        "--reuse-coarse-cache", dest="reuse_coarse_cache", action="store_true", default=True,
+        help="旧两阶段流程复用本次运行初始多孔局部点云缓存；验证失败自动回退完整粗定位",
+    )
+    p.add_argument(
+        "--no-reuse-coarse-cache", dest="reuse_coarse_cache", action="store_false",
+        help="关闭旧两阶段局部点云缓存复用，保持原始粗定位流程",
+    )
+    p.add_argument(
+        "--reuse-persistent-coarse-cache",
+        dest="reuse_persistent_coarse_cache",
+        action="store_true",
+        default=True,
+        help="旧两阶段按机器人基坐标复用跨运行粗定位缓存；验证失败自动回退",
+    )
+    p.add_argument(
+        "--no-reuse-persistent-coarse-cache",
+        dest="reuse_persistent_coarse_cache",
+        action="store_false",
+        help="关闭跨运行基坐标粗定位缓存，仅使用当前运行缓存",
     )
     p.add_argument("--move-final-xy", dest="move_final_xy", action="store_true", default=DEFAULT_MOVE_FINAL_XY,
                    help="显式启用精定位后的最终 TCP XY 微调")

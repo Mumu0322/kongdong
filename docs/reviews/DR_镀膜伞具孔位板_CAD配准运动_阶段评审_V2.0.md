@@ -23,7 +23,7 @@
 3. 通过平面 PnP/IPPE、畸变投影、正深度和法向方向检查求出 `T_camera_cad`。
 4. 回到选定孔组的共同视野位置，在约 340 mm 处一次性采集深度，用于共同高度修正；深度不再提供孔中心、孔号或法向。
 5. 在约 260 mm 处对每个选定孔采集 RGB/YOLO 帧，CAD 锁定目标中心、法向和孔号，YOLO 只用于最终 XY 精修；保留现有 ChArUco TCP-XY 补偿。
-6. 执行最终 Z、夹爪/工具偏置和基坐标 `+Y 0.3 mm` 逻辑，并将 CAD、YOLO、精定位和运动结果写入报告。
+6. 执行最终 Z、工具/夹爪偏置和基坐标 `+Y 0.3 mm`，并将 CAD、YOLO、精定位和运动结果写入报告。
 
 原有非 CAD 路径仍能完成“初始选孔 → 340 mm 粗定位 → 点云中心/法向闭环 → 260 mm RGB 精定位 → 最终目标点”的多段位移流程；该路径不使用 CAD 孔号来确定孔位，而是保留原来的 YOLO 选孔、RGB-D 局部点云和平面几何计算。
 
@@ -53,6 +53,8 @@
 | 报告目录 | `data\cad_motion_runs\cad-motion-*` | `data\hole_localization_runs\two-stage-*` |
 
 当前 `run_hole_localization_pycharm.py` 默认设置 `CAD_MOTION_MODE=True`；主脚本参数默认仍为 `CAD_MOTION=False`、两阶段模式开启。因此直接运行主脚本或 GUI 旧流程时，旧的多段位移功能仍然会被调用，不能把它误判为删除。
+
+真实 CAD 运动的启动顺序为：连接运动会话 → 回到保存的原点/观察位 → 等待机器人稳定 → 在原点处采集 5 帧 RGB 做实时 CAD 配准 → 选择目标孔。预览模式不自动移动机器人；如果预览时当前位置看不到孔位板，应先人工把机器人放到保存的观察位。
 
 ### 1.3 本版本不包含的结论
 
@@ -144,7 +146,7 @@ CAD JSON 的当前模型版本为 `cad_hole_model_v1`，包含 11 个顶面大�
 7. 最终仍执行 ChArUco TCP-XY 修正、最终 Z、工具/夹爪偏置和基坐标 `+Y 0.3 mm`。
 8. 当前孔完成后等待输入 `m`，再开始下一个孔；未通过精定位质量门的孔会记录为 deferred，不执行最终目标点动作。
 
-这条路径的报告会保留 `pointcloud_center_base_mm`、`pointcloud_center_camera_mm`、`coarse_normal_toward_camera_base`、`coarse_plane_rmse_mm`、`coarse_captures` 和 `fine_z_source=coarse_per_hole_center_z` 等字段，便于和 CAD 路径进行对照。它不是死代码，也不是 CAD 配准报告的组成部分。
+这条路径的报告会保留 `pointcloud_center_base_mm`、`pointcloud_center_camera_mm`、`coarse_normal_toward_camera_base`、`coarse_plane_rmse_mm`、`coarse_captures` 和 `fine_z_source=coarse_front_surface_plane_intersection_z` 等字段，便于和 CAD 路径进行对照。它不是死代码，也不是 CAD 配准报告的组成部分。
 
 ### 3.5 GUI 与夹爪
 
@@ -237,7 +239,7 @@ T_base_cad = T_base_camera_initial @ T_camera_cad
 | 最新注册报告 | `...\cad_registration_auto\cad_registration_report.json` | 运动启动时的实时 CAD 注册证据 |
 | 当前追溯摘要 | 本 DR 第 1、4、5、7、8、9 节 | 旧版三孔追溯矩阵已删除；当前 CAD 与非 CAD 双路径的实现、质量门和证据边界以本 DR 及 README 为准 |
 
-项目当前离线测试套件为 115 项，最近一次整套运行通过。测试通过只说明代码回归正常，不替代真实机器人、相机和手眼的现场验收。
+项目当前离线测试套件为 182 项，最近一次整套运行通过。测试通过只说明代码回归正常，不替代真实机器人、相机和手眼的现场验收。
 
 ## 8. 当前问题、风险和限制
 

@@ -29,9 +29,9 @@ TARGET_SCRIPT = Path(__file__).with_name("run_yolo_eye_in_hand_optimized.py")
 MODEL_PATH = DEFAULT_MODEL_PATH
 HANDEYE_PATH = HANDEYE_CANDIDATE_PATH
 
-# 当前入口默认使用 CAD 预览；改为 False 可回到旧两阶段点云预览流程。
+# 当前入口默认使用 CAD 取代点云粗定位；改为 False 可回到旧两阶段点云流程。
 CAD_MOTION_MODE = True
-CAD_REGISTRATION_REPORT: Path | None = None  # 仅在缺省CAD JSON时备用；运动启动时仍会实时重配准
+CAD_REGISTRATION_REPORT: Path | None = None  # None=自动选择最近一次通过质量门的报告
 CAD_MODEL_JSON = DEFAULT_CAD_MODEL_PATH
 CAD_FINE_HEIGHT_MM = 260.0
 CAD_FINE_FRAMES = 12
@@ -39,22 +39,24 @@ CAD_FINE_MIN_VALID = 6
 CAD_FINE_CENTER_P95_PX = 1.5
 CAD_YOLO_MATCH_TOLERANCE_PX = 70.0
 CAD_SETTLE_DISCARD_FRAMES = 10
-CAD_MOVE_FINAL_XY = False
+CAD_MOVE_FINAL_XY = True
 
 # 两阶段定位：原点选孔 -> 粗定位 -> 精定位。
 TWO_STAGE_MODE = True
+REUSE_COARSE_CACHE = True
+REUSE_PERSISTENT_COARSE_CACHE = True
 COARSE_HEIGHT_MM = 340.0
 FINE_HEIGHT_MM = 260.0
 COARSE_FRAMES = 15
 FINE_FRAMES = 30
 YOLO_CONFIDENCE = 0.35
 
-# 运动配置。默认全部关闭，准备实机时必须逐项显式打开并复核。
+# 运动配置。默认关闭。
 EXECUTE_MOTION = False
 ALLOW_EXPERIMENTAL_HANDEYE = False
 MOVE_FINAL_XY = False
 
-# 只有准备真实运动时才改为 True；此开关不是底层安全校验的替代品。
+# 只有准备真实运动时才改为 True。
 I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE = False
 
 SPEED_M_S = 0.02
@@ -90,8 +92,7 @@ def build_arguments() -> list[str]:
             "--confidence", str(YOLO_CONFIDENCE),
             "--cad-motion",
             "--execute" if EXECUTE_MOTION else "--no-execute",
-            "--cad-allow-experimental-handeye"
-            if ALLOW_EXPERIMENTAL_HANDEYE else "--require-validated-handeye",
+            "--require-validated-handeye",
             "--move-final-xy" if CAD_MOVE_FINAL_XY else "--no-move-final-xy",
             "--cad-model-json", str(CAD_MODEL_JSON),
             "--cad-fine-height-mm", str(CAD_FINE_HEIGHT_MM),
@@ -136,6 +137,9 @@ def build_arguments() -> list[str]:
 
     if TWO_STAGE_MODE:
         args.extend([
+            "--reuse-coarse-cache" if REUSE_COARSE_CACHE else "--no-reuse-coarse-cache",
+            "--reuse-persistent-coarse-cache"
+            if REUSE_PERSISTENT_COARSE_CACHE else "--no-reuse-persistent-coarse-cache",
             "--coarse-height-mm", str(COARSE_HEIGHT_MM),
             "--fine-height-mm", str(FINE_HEIGHT_MM),
             "--coarse-frames", str(COARSE_FRAMES),

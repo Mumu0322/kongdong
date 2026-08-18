@@ -3,6 +3,8 @@ import unittest
 import numpy as np
 
 from run_yolo_eye_in_hand_optimized import (
+    COARSE_SURFACE_MODEL,
+    COARSE_SURFACE_SELECTION_POLICY,
     Observation,
     TwoStageConfig,
     _fuse_fine,
@@ -13,7 +15,9 @@ from run_yolo_eye_in_hand_optimized import (
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
     plan_final_tcp_xy,
+    hole_camera_point,
 )
+from aubo_workbench.camera import CameraIntrinsics
 
 
 class FinalXyPlanningTests(unittest.TestCase):
@@ -74,6 +78,49 @@ class FinalXyPlanningTests(unittest.TestCase):
         np.testing.assert_allclose(target[:2, 3], tcp[:2, 3])
         self.assertAlmostEqual(target[2, 3], 56.7)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
+
+    def test_old_two_stage_surface_policy_rejects_inner_hole_depth_cluster(self):
+        width = height = 220
+        intrinsics = CameraIntrinsics(width, height, 100.0, 100.0, 110.0, 110.0, ())
+        center = np.array([110.0, 110.0])
+        radius = 20.0
+        yy, xx = np.mgrid[:height, :width]
+        rr = np.hypot(xx - center[0], yy - center[1])
+        z = np.full((height, width), 500.0, dtype=np.float32)
+        # 模拟旧1.08R起始环带中占多数的孔壁/孔底深度簇。
+        z[(rr >= radius * 1.08) & (rr < radius * 1.25)] = 550.0
+        xyz = np.column_stack((
+            ((xx - intrinsics.cx) / intrinsics.fx * z).ravel(),
+            ((yy - intrinsics.cy) / intrinsics.fy * z).ravel(),
+            z.ravel(),
+        )).reshape(height, width, 3)
+
+        point, info = hole_camera_point(
+            tuple(center.tolist()), xyz, intrinsics, radius,
+            surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
+            include_points=True,
+        )
+
+        self.assertEqual(info["surface_model"], COARSE_SURFACE_MODEL)
+        self.assertEqual(info["surface_selection_policy"], COARSE_SURFACE_SELECTION_POLICY)
+        self.assertAlmostEqual(info["ring_inner_factor"], 1.25)
+        self.assertLess(float(point[2]), 510.0)
+        self.assertLess(float(info["local_plane_point_camera_mm"][2]), 510.0)
+        self.assertGreaterEqual(info["surface_points_selected"], 80)
+
+    def test_cad_default_surface_policy_remains_legacy(self):
+        width = height = 120
+        intrinsics = CameraIntrinsics(width, height, 100.0, 100.0, 60.0, 60.0, ())
+        yy, xx = np.mgrid[:height, :width]
+        z = np.full((height, width), 500.0, dtype=np.float32)
+        xyz = np.column_stack((
+            ((xx - intrinsics.cx) / intrinsics.fx * z).ravel(),
+            ((yy - intrinsics.cy) / intrinsics.fy * z).ravel(),
+            z.ravel(),
+        )).reshape(height, width, 3)
+        _, info = hole_camera_point((60.0, 60.0), xyz, intrinsics, 12.0)
+        self.assertEqual(info["surface_model"], "local_tangent_plane")
+        self.assertEqual(info["surface_selection_policy"], "legacy")
 
     def test_final_base_y_trim_preserves_x_z_and_orientation(self):
         tcp = np.eye(4)

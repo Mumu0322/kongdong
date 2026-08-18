@@ -25,6 +25,87 @@ class CadMotionPlanningTests(unittest.TestCase):
             distortion=(),
         )
 
+    def test_real_cad_motion_returns_home_before_fresh_registration(self):
+        events = []
+
+        class FakePoseSession:
+            def connect(self):
+                events.append("pose_connect")
+
+            def read_pose_snapshot(self):
+                events.append("pose_snapshot")
+                return {
+                    "power_on": True,
+                    "steady": True,
+                    "collision": False,
+                    "pose_values_sdk_m_rad": [0.0] * 6,
+                }
+
+            @staticmethod
+            def pose_sdk_to_transform_mm(_pose):
+                return np.eye(4, dtype=np.float64)
+
+            def disconnect(self):
+                events.append("pose_disconnect")
+
+        class FakeMotionSession:
+            def connect(self, *_args):
+                events.append("motion_connect")
+
+            def disconnect(self):
+                events.append("motion_disconnect")
+
+        class FakeHome:
+            name = "synthetic_home"
+            created_at = "synthetic"
+            joints_rad = [0.0] * 6
+            tcp_pose_m_rad = [0.0] * 6
+
+            def to_dict(self):
+                return {
+                    "name": self.name,
+                    "created_at": self.created_at,
+                    "joints_rad": self.joints_rad,
+                    "tcp_pose_m_rad": self.tcp_pose_m_rad,
+                }
+
+        def stop_after_registration(**_kwargs):
+            events.append("register")
+            raise RuntimeError("stop after ordering check")
+
+        args = module.build_parser().parse_args(["--cad-motion", "--execute"])
+        handeye = SimpleNamespace(
+            validated_for_motion=True,
+            T_tcp_rgb_camera=np.eye(4, dtype=np.float64),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(module, "CAD_MOTION_RUNS_DIR", Path(directory)), \
+                    patch("aubo_workbench.robot.AuboPoseSession", FakePoseSession), \
+                    patch("aubo_workbench.motion_control.AuboMotionSession", FakeMotionSession), \
+                    patch("aubo_workbench.motion_control.load_home_point", return_value=FakeHome()), \
+                    patch.object(
+                        module,
+                        "_load_cad_model_for_fresh_motion",
+                        return_value=(Path(directory) / "model.json", object(), None),
+                    ), \
+                    patch.object(
+                        module,
+                        "_confirm_and_move_home",
+                        side_effect=lambda *_args, **_kwargs: (
+                            events.append("move_home") or np.eye(4, dtype=np.float64)
+                        ),
+                    ), \
+                    patch.object(
+                        module,
+                        "_register_fresh_cad_at_motion_start",
+                        side_effect=stop_after_registration,
+                    ), \
+                    patch.object(module, "_write_report", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "stop after ordering check"):
+                    module.run_cad_motion_workflow(args, handeye, object())
+
+        self.assertLess(events.index("move_home"), events.index("register"))
+
     def test_cad_entry_plan_hits_260_mm_and_keeps_cad_center(self):
         handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
         hole = {

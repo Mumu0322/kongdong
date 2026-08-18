@@ -168,9 +168,11 @@ class HoleLocalizationPanel(ttk.Frame):
         self.offset_angles_var = tk.StringVar(value="0 45 90 135 180 225 270 315")
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=False)
+        self.final_target_mode_var = tk.StringVar(value="机械爪模式")
+        self.reuse_coarse_cache_var = tk.BooleanVar(value=True)
+        self.reuse_persistent_coarse_cache_var = tk.BooleanVar(value=True)
         self.cad_workspace_checked_var = tk.BooleanVar(value=False)
         self.final_xy_var = tk.BooleanVar(value=False)
-        self.final_target_mode_var = tk.StringVar(value="机械爪模式")
         self.include_final_motion_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="待开始：默认仅预览，不会下发机器人运动")
         self.motion_var = tk.StringVar(value="无待确认运动")
@@ -401,13 +403,19 @@ class HoleLocalizationPanel(ttk.Frame):
         ).grid(row=0, column=1, sticky="w", padx=(0, 18))
         ttk.Checkbutton(options, text="真实运动", variable=self.execute_var).grid(row=0, column=2, sticky="w", padx=(0, 18))
         ttk.Checkbutton(options, text="允许当前实验手眼结果", variable=self.experimental_var).grid(row=0, column=3, sticky="w")
-        ttk.Checkbutton(options, text="精定位后执行 TCP XY → 基坐标 Z → +Y 0.3 mm", variable=self.final_xy_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0),
+        ttk.Checkbutton(
+            options, text="复用本次初始多孔局部点云缓存", variable=self.reuse_coarse_cache_var,
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(
+            options, text="复用历史基坐标局部点云缓存", variable=self.reuse_persistent_coarse_cache_var,
+        ).grid(row=1, column=1, sticky="w")
+        ttk.Checkbutton(options, text="精定位后沿工具 X/Y/Z 方向执行最终移动（慢速）", variable=self.final_xy_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0),
         )
         ttk.Checkbutton(
             options, text="偏移测试执行最终 XY → Z → +Y 0.3 mm（实机）",
             variable=self.include_final_motion_var,
-        ).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=3, sticky="w", pady=(6, 0))
 
         actions = ttk.LabelFrame(parent, text="旧流程操作", padding=8)
         actions.pack(fill=tk.X, pady=(8, 0))
@@ -429,7 +437,9 @@ class HoleLocalizationPanel(ttk.Frame):
             text=("CAD：真实运动启动前自动用当前位置采集5帧 RGB 并重新配准；通过后回原点，在 CAD 画面中点击一个或多个目标孔，按 Enter/Space 确认。\n"
                   "随后整组孔共同移动到 340 mm；单孔测该孔高度，多孔融合共享高度，再逐孔使用 CAD 260 mm 位姿；每个孔完成后点击“开始下一个 CAD 孔”。\n"
                   "每个孔在 260 mm 会保存 CAD 投影圆、YOLO 框、中心误差箭头和多帧中位数图；运行结束后可点“打开最新精定位图”。\n"
-                  "旧流程：相机初始画面中选择孔后按 Enter；每个孔完成后点击继续。如需急停，请使用机械臂示教器。"),
+                  "旧流程：相机初始画面中选择孔后按 Enter；每个孔完成后点击继续。"
+                  "本轮全部完成后机械臂先保持当前位置；点击“开始下一轮检测”后才回到初始点，确认完全停止后再采集第二轮画面。"
+                  "如需急停，请使用机械臂示教器。"),
             justify=tk.LEFT,
             wraplength=1050,
         ).pack(anchor="w")
@@ -713,6 +723,15 @@ class HoleLocalizationPanel(ttk.Frame):
                 raise ValueError("最终点模式必须选择“机械爪模式”或“平常模式”")
             command.extend(["--final-target-mode", final_mode])
             command.append("--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy")
+            command.append(
+                "--reuse-coarse-cache"
+                if self.reuse_coarse_cache_var.get() else "--no-reuse-coarse-cache"
+            )
+            command.append(
+                "--reuse-persistent-coarse-cache"
+                if self.reuse_persistent_coarse_cache_var.get()
+                else "--no-reuse-persistent-coarse-cache"
+            )
         if is_cad:
             final_mode = {
                 "机械爪模式": "gripper",
@@ -786,7 +805,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 "深度只修正整组共享高度，CAD继续提供孔号、XY和法向；每个孔完成后可点击按钮开始下一个孔。\n"
                 "当前手眼结果若未通过生产质量门，本次会标记为实验运动。\n\n确认开始吗？"
                 if mode == "cad_motion" else
-                "将执行回原点及两阶段定位。除开始检测下一个已选孔外，运动会自动执行。\n\n确认开始吗？"
+                "将执行回原点及两阶段定位；每轮完成后会自动回原点并进入下一轮选孔，"
+                "相机和机器人会话保持运行。按选孔窗口 Esc 可结束会话。\n\n确认开始吗？"
             ),
             parent=self,
         ):
@@ -848,6 +868,10 @@ class HoleLocalizationPanel(ttk.Frame):
                     or "[NEXT_HOLE_CONFIRM_REQUIRED]" in line
                 ):
                     self.log_queue.put(("confirm", line.strip()))
+                elif "[INITIAL_SELECTION_REQUIRED]" in line:
+                    self.log_queue.put(("initial_selection", line.strip()))
+                elif "[NEXT_CYCLE_CONFIRM_REQUIRED]" in line:
+                    self.log_queue.put(("next_cycle_confirm", line.strip()))
                 elif "[NEXT_CAD_HOLE_CONFIRM_REQUIRED]" in line:
                     self.log_queue.put(("cad_hole_confirm", line.strip()))
                 elif "[OFFSET_TEST_CONFIRM_REQUIRED]" in line:
@@ -885,6 +909,8 @@ class HoleLocalizationPanel(ttk.Frame):
             self.motion_var.set("已确认，回升并继续偏移测试…")
         elif confirmation_kind == "cad_hole":
             self.motion_var.set("已确认，开始下一个 CAD 孔…")
+        elif confirmation_kind == "next_cycle":
+            self.motion_var.set("已确认，正在回到初始点；到位并完全停止后才采集下一轮画面…")
         else:
             self.motion_var.set("已确认，开始检测下一个孔…")
 
@@ -945,6 +971,21 @@ class HoleLocalizationPanel(ttk.Frame):
                         if self.process_mode == "cad_motion" else
                         "定位流程运行中…"
                     )
+                elif kind == "initial_selection":
+                    self.waiting_confirmation = False
+                    self.confirmation_kind = ""
+                    self.motion_var.set("机器人已在原点，请在相机窗口重新选择目标孔。")
+                    self.status_var.set("已回到原点，等待选择目标孔…")
+                elif kind == "next_cycle_confirm":
+                    self.waiting_confirmation = True
+                    self.confirmation_kind = "next_cycle"
+                    self.confirm_btn.configure(state=tk.NORMAL, text="开始下一轮检测")
+                    self.mark_error_btn.configure(state=tk.DISABLED)
+                    self.cancel_btn.configure(state=tk.NORMAL)
+                    self.motion_var.set(
+                        "上一轮已完成；机器人保持当前位置，请点击“开始下一轮检测”后回到初始点。"
+                    )
+                    self.status_var.set("等待确认开始下一轮检测…")
                 elif kind == "confirm":
                     self.waiting_confirmation = True
                     self.confirmation_kind = "hole"
