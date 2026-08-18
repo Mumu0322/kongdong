@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 DRIVER_PATH = Path(__file__).resolve().parents[2] / "JiaZhua" / "z_erg_20c.py"
 BAUDRATES = (9600, 19200, 38400, 57600, 115200, 153600, 256000)
+CURRENT_POLL_INTERVAL_MS = 250
 
 _driver_module: Any | None = None
 
@@ -72,7 +73,15 @@ class GripperControlPanel(ttk.Frame):
         self.rotation_angle_var = tk.StringVar(value="90")
         self.rotation_relative_var = tk.StringVar(value="360")
         self.status_var = tk.StringVar(value="未连接")
+        self.grip_feedback_var = tk.StringVar(value="夹持实际电流：-- A")
+        self.rotation_feedback_var = tk.StringVar(value="旋转实际电流：-- A")
+        self.current_monitor_var = tk.StringVar(value="电流监视：未连接")
         self.driver_var = tk.StringVar(value=f"驱动：{DRIVER_PATH}")
+
+        self._current_poll_job: str | None = None
+        self._current_poll_inflight = False
+        self._current_poll_token = 0
+        self._last_current_poll_error: str | None = None
 
         self._build()
 
@@ -151,12 +160,28 @@ class GripperControlPanel(ttk.Frame):
         state = ttk.LabelFrame(self, text="状态与日志", padding=8)
         state.grid(row=4, column=0, sticky="nsew")
         state.columnconfigure(0, weight=1)
-        state.rowconfigure(1, weight=1)
-        ttk.Label(state, textvariable=self.status_var, foreground="#1f5f99").grid(
-            row=0, column=0, sticky="w", pady=(0, 5)
+        state.columnconfigure(1, weight=1)
+        state.columnconfigure(2, weight=1)
+        state.rowconfigure(2, weight=1)
+        feedback = ttk.Frame(state)
+        feedback.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+        feedback.columnconfigure(0, weight=1)
+        feedback.columnconfigure(1, weight=1)
+        feedback.columnconfigure(2, weight=1)
+        ttk.Label(feedback, textvariable=self.status_var, foreground="#1f5f99").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(feedback, textvariable=self.grip_feedback_var, foreground="#176b3a").grid(
+            row=0, column=1, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(feedback, textvariable=self.rotation_feedback_var, foreground="#176b3a").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Label(state, textvariable=self.current_monitor_var, foreground="#666666").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, 5)
         )
         self.log_text = ScrolledText(state, height=10, wrap="word", state=tk.DISABLED)
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.grid(row=2, column=0, columnspan=3, sticky="nsew")
 
     @staticmethod
     def _entry(parent: tk.Misc, row: int, label_column: int, label: str,
@@ -211,9 +236,133 @@ class GripperControlPanel(ttk.Frame):
 
     def _show_state(self, state: Any) -> None:
         if isinstance(state, dict):
+            self._update_current_feedback_from_state(state)
             self._append_log(json.dumps(state, ensure_ascii=False, indent=2))
         else:
             self._append_log(str(state))
+
+    @staticmethod
+    def _format_current(value: Any) -> str:
+        try:
+            return f"{float(value):.4f} A"
+        except (TypeError, ValueError):
+            return "-- A"
+
+    def _update_current_feedback_from_state(self, state: dict[str, Any]) -> None:
+        if "grip_current_a" in state:
+            self.grip_feedback_var.set(
+                f"夹持实际电流：{self._format_current(state['grip_current_a'])}"
+            )
+        if "rot_current_a" in state:
+            self.rotation_feedback_var.set(
+                f"旋转实际电流：{self._format_current(state['rot_current_a'])}"
+            )
+
+    def _reset_current_feedback(self, monitor_text: str = "电流监视：未连接") -> None:
+        self.grip_feedback_var.set("夹持实际电流：-- A")
+        self.rotation_feedback_var.set("旋转实际电流：-- A")
+        self.current_monitor_var.set(monitor_text)
+
+    def _schedule_current_poll(self, delay_ms: int = CURRENT_POLL_INTERVAL_MS) -> None:
+        if self.closing or self.gripper is None or self._current_poll_job is not None:
+            return
+        try:
+            self._current_poll_job = self.after(delay_ms, self._poll_current_once)
+        except tk.TclError:
+            self._current_poll_job = None
+
+    def _start_current_polling(self) -> None:
+        self._stop_current_polling()
+        if self.gripper is None or self.closing:
+            self._reset_current_feedback()
+            return
+        self._last_current_poll_error = None
+        self.current_monitor_var.set(
+            f"电流监视：实时更新（{CURRENT_POLL_INTERVAL_MS} ms）"
+        )
+        self._schedule_current_poll(delay_ms=0)
+
+    def _stop_current_polling(self, monitor_text: str | None = None) -> None:
+        self._current_poll_token += 1
+        if self._current_poll_job is not None:
+            try:
+                self.after_cancel(self._current_poll_job)
+            except tk.TclError:
+                pass
+            self._current_poll_job = None
+        if monitor_text is not None:
+            self.current_monitor_var.set(monitor_text)
+
+    def _poll_current_once(self) -> None:
+        self._current_poll_job = None
+        gripper = self.gripper
+        if self.closing or gripper is None:
+            return
+        if self._current_poll_inflight:
+            self._schedule_current_poll()
+            return
+
+        self._current_poll_inflight = True
+        poll_token = self._current_poll_token
+
+        def worker() -> None:
+            grip_current: float | None = None
+            rotation_current: float | None = None
+            error: Exception | None = None
+            try:
+                # 只读两个实际反馈寄存器，避免实时监视反复读取完整状态快照。
+                grip_current = float(gripper.read_grip_current())
+                rotation_current = float(gripper.read_rotation_current())
+            except Exception as exc:
+                error = exc
+            try:
+                self.after(
+                    0,
+                    lambda: self._finish_current_poll(
+                        poll_token, gripper, grip_current, rotation_current, error
+                    ),
+                )
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="gripper-current-poll", daemon=True).start()
+
+    def _finish_current_poll(
+        self,
+        poll_token: int,
+        gripper: Any,
+        grip_current: float | None,
+        rotation_current: float | None,
+        error: Exception | None,
+    ) -> None:
+        self._current_poll_inflight = False
+        if (
+            self.closing
+            or poll_token != self._current_poll_token
+            or self.gripper is not gripper
+        ):
+            return
+
+        if error is not None:
+            self.grip_feedback_var.set("夹持实际电流：读取失败")
+            self.rotation_feedback_var.set("旋转实际电流：读取失败")
+            self.current_monitor_var.set("电流监视：读取失败，正在重试")
+            error_text = f"{type(error).__name__}: {error}"
+            if error_text != self._last_current_poll_error:
+                self._append_log(f"[实时电流] 读取失败：{error_text}")
+                self._last_current_poll_error = error_text
+        else:
+            self.grip_feedback_var.set(
+                f"夹持实际电流：{self._format_current(grip_current)}"
+            )
+            self.rotation_feedback_var.set(
+                f"旋转实际电流：{self._format_current(rotation_current)}"
+            )
+            self.current_monitor_var.set(
+                f"电流监视：实时更新（{CURRENT_POLL_INTERVAL_MS} ms）"
+            )
+            self._last_current_poll_error = None
+        self._schedule_current_poll()
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -262,6 +411,12 @@ class GripperControlPanel(ttk.Frame):
         self._set_busy(False)
         self.status_var.set(f"{label}失败")
         self._append_log(f"[{label}] 失败：{type(error).__name__}: {error}")
+        if label == "断开夹爪" and self.gripper is not None and not self.closing:
+            try:
+                if self.gripper.is_connected():
+                    self._start_current_polling()
+            except Exception:
+                pass
         messagebox.showerror("夹爪操作失败", f"{label}失败：\n{error}", parent=self.winfo_toplevel())
 
     def _require_gripper(self) -> Any:
@@ -302,6 +457,7 @@ class GripperControlPanel(ttk.Frame):
             self.gripper, state = result
             self._append_log(f"驱动已连接：{DRIVER_PATH}")
             self._show_state(state)
+            self._start_current_polling()
 
         self._start_worker("连接夹爪", work, success)
 
@@ -311,13 +467,17 @@ class GripperControlPanel(ttk.Frame):
         gripper = self.gripper
         if gripper is None:
             self.status_var.set("未连接")
+            self._reset_current_feedback()
             return
+
+        self._stop_current_polling("电流监视：停止中")
 
         def work() -> None:
             gripper.close()
 
         def success(_result: Any) -> None:
             self.gripper = None
+            self._reset_current_feedback()
 
         self._start_worker("断开夹爪", work, success)
 
@@ -467,6 +627,7 @@ class GripperControlPanel(ttk.Frame):
 
     def on_close(self) -> None:
         self.closing = True
+        self._stop_current_polling("电流监视：已停止")
         gripper = self.gripper
         self.gripper = None
         if gripper is not None:
