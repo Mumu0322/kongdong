@@ -116,6 +116,8 @@ DEFAULT_FINAL_TARGET_MODE = FINAL_TARGET_MODE_GRIPPER
 GRIPPER_BASE_X_OFFSET_MM = 64.0
 GRIPPER_BASE_Z_OFFSET_MM = 50.0
 FINAL_BASE_Y_AFTER_Z_MM = 0.2
+# 与上面的基坐标Y微调融合为一次移动执行，避免最终Z到位后再做第二次单独的+Y移动。
+FINAL_TOOL_Y_AFTER_Z_MM = 1.0
 # 三孔逐孔安放时，所有低位横移前先抬到该安全余量。
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
 # 机器人到位检测只影响轮询响应，不改变控制器的运动轨迹。
@@ -696,6 +698,25 @@ def plan_final_tcp_base_y_trim(T_base_tcp: np.ndarray, delta_y_mm: float = FINAL
     return target
 
 
+def plan_final_tcp_combined_y_trim(
+    T_base_tcp: np.ndarray,
+    base_delta_y_mm: float = FINAL_BASE_Y_AFTER_Z_MM,
+    tool_delta_y_mm: float = FINAL_TOOL_Y_AFTER_Z_MM,
+) -> np.ndarray:
+    """保持当前 TCP 姿态，把基坐标+Y微调和工具系+Y微调合并成一次平移执行。
+
+    两次平移都不改变姿态（旋转矩阵不变），所以可以直接把基坐标Y分量和
+    工具系Y轴（当前旋转矩阵第2列，在base系下的方向）分量相加成一个
+    位移向量，一次性移动到位，避免拆成两次串行移动。
+    """
+    T_base_tcp = np.asarray(T_base_tcp, dtype=np.float64)
+    target = T_base_tcp.copy()
+    tool_y_axis_base = T_base_tcp[:3, 1]
+    delta_base_mm = np.array([0.0, float(base_delta_y_mm), 0.0]) + tool_y_axis_base * float(tool_delta_y_mm)
+    target[:3, 3] += delta_base_mm
+    return target
+
+
 def fit_hole_ellipse(
     image_bgr: np.ndarray,
     detection: dict[str, Any],
@@ -1164,7 +1185,7 @@ def _annotate_cad_fine_result_overlay(
             lines.append(f"XY correction: [{correction[0]:+.3f}, {correction[1]:+.3f}] mm")
         lines.append(f"Z motion: {'executed' if final_z_motion is not None else 'disabled'}")
         lines.append(
-            f"base +Y {FINAL_BASE_Y_AFTER_Z_MM:.1f} mm: "
+            f"+Y combined (base {FINAL_BASE_Y_AFTER_Z_MM:.1f} + tool {FINAL_TOOL_Y_AFTER_Z_MM:.1f}) mm: "
             f"{'executed' if final_y_trim_motion is not None else 'disabled'}"
         )
         panel_height = 26 + 24 * len(lines)
@@ -4930,16 +4951,17 @@ def _run_sequential_hole_workflow(
                 "delta_base_z_mm": z_delta_mm,
                 "motion_frame": "base_z_only",
             }
-            y_trim_target = plan_final_tcp_base_y_trim(current_tcp)
+            y_trim_target = plan_final_tcp_combined_y_trim(current_tcp)
             with timing.measure(
-                f"hole_{hole_id:02d}/final_motion_y_plus_0_2mm",
+                f"hole_{hole_id:02d}/final_motion_y_plus_combined",
                 hole_id=hole_id,
                 processing_order=order,
             ):
                 current_tcp = _confirm_and_move_line(
-                    f"孔{hole_id}最终基坐标+Y微调",
+                    f"孔{hole_id}最终+Y微调（基坐标+工具系合并一次移动）",
                     current_tcp, y_trim_target, args, motion_session, pose_session,
-                    f"保持X、Z与姿态；基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm",
+                    f"保持姿态；基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm 并叠加工具系+Y "
+                    f"{FINAL_TOOL_Y_AFTER_Z_MM:.3f} mm，合并为一次移动",
                     require_confirmation=False,
                     motion_profile="precision",
                 )
@@ -4947,7 +4969,8 @@ def _run_sequential_hole_workflow(
                 "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(y_trim_target),
                 "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                 "delta_base_y_mm": FINAL_BASE_Y_AFTER_Z_MM,
-                "motion_frame": "base_y_only",
+                "delta_tool_y_mm": FINAL_TOOL_Y_AFTER_Z_MM,
+                "motion_frame": "base_y_plus_tool_y_combined",
             }
         result = dict(fine)
         result.update({
@@ -5308,6 +5331,7 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                 float(value) for value in args.tcp_xy_offset_mm
             ],
             "base_y_trim_mm": float(FINAL_BASE_Y_AFTER_Z_MM),
+            "tool_y_trim_mm": float(FINAL_TOOL_Y_AFTER_Z_MM),
         },
     }
     timing = TimingRecorder()
@@ -5737,16 +5761,17 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                     "final_point_mode": final_target_mode,
                     "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
                 }
-                y_target = plan_final_tcp_base_y_trim(current_tcp)
-                with timing.measure(f"hole_{hole_id}/final_y_plus_0_2mm", hole_id=hole_id, order=order):
+                y_target = plan_final_tcp_combined_y_trim(current_tcp)
+                with timing.measure(f"hole_{hole_id}/final_y_plus_combined", hole_id=hole_id, order=order):
                     current_tcp = _confirm_and_move_line(
-                        f"CAD孔{hole_id}最终基坐标+Y微调",
+                        f"CAD孔{hole_id}最终+Y微调（基坐标+工具系合并一次移动）",
                         current_tcp,
                         y_target,
                         args,
                         motion_session,
                         pose_session,
-                        f"基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm",
+                        f"基坐标Y增加 {FINAL_BASE_Y_AFTER_Z_MM:.3f} mm 并叠加工具系+Y "
+                        f"{FINAL_TOOL_Y_AFTER_Z_MM:.3f} mm，合并为一次移动",
                         require_confirmation=False,
                         motion_profile="precision",
                     )
@@ -5754,6 +5779,7 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                     "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(y_target),
                     "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                     "delta_base_y_mm": FINAL_BASE_Y_AFTER_Z_MM,
+                    "delta_tool_y_mm": FINAL_TOOL_Y_AFTER_Z_MM,
                 }
             fine_visualization = fine.get("visualization")
             if isinstance(fine_visualization, dict):

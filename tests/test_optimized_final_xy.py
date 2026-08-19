@@ -5,6 +5,8 @@ import numpy as np
 from run_yolo_eye_in_hand_optimized import (
     COARSE_SURFACE_MODEL,
     COARSE_SURFACE_SELECTION_POLICY,
+    FINAL_BASE_Y_AFTER_Z_MM,
+    FINAL_TOOL_Y_AFTER_Z_MM,
     Observation,
     TwoStageConfig,
     _fuse_fine,
@@ -14,6 +16,7 @@ from run_yolo_eye_in_hand_optimized import (
     final_point_offsets_for_mode,
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
+    plan_final_tcp_combined_y_trim,
     plan_final_tcp_xy,
     hole_camera_point,
 )
@@ -126,7 +129,29 @@ class FinalXyPlanningTests(unittest.TestCase):
         tcp = np.eye(4)
         tcp[:3, 3] = np.array([631.7, -108.3, 56.7])
         target = plan_final_tcp_base_y_trim(tcp)
-        np.testing.assert_allclose(target[:3, 3], np.array([631.7, -108.0, 56.7]))
+        np.testing.assert_allclose(
+            target[:3, 3], np.array([631.7, -108.3 + FINAL_BASE_Y_AFTER_Z_MM, 56.7])
+        )
+        np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
+
+    def test_combined_y_trim_adds_base_and_tool_frame_y_in_one_move(self):
+        # 工具系绕基坐标Z轴倾斜30度，验证融合后的单次位移等于
+        # base系+0.2mm与工具系Y轴（旋转矩阵第2列）+1mm的向量和。
+        angle = np.radians(30.0)
+        rot_z = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        tcp = np.eye(4)
+        tcp[:3, :3] = rot_z
+        tcp[:3, 3] = np.array([631.7, -108.3, 56.7])
+        target = plan_final_tcp_combined_y_trim(tcp)
+        expected_delta = (
+            np.array([0.0, FINAL_BASE_Y_AFTER_Z_MM, 0.0])
+            + rot_z[:, 1] * FINAL_TOOL_Y_AFTER_Z_MM
+        )
+        np.testing.assert_allclose(target[:3, 3], tcp[:3, 3] + expected_delta)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
 
     def test_fine_fusion_does_not_make_p95_worse_after_outlier_filtering(self):
