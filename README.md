@@ -280,6 +280,15 @@ coarse_cache.rgb_snapshot_images 中。
 参数 --list-holes 可列出缓存孔号。RGB 图片必须和缓存点云来自同一采集位姿，
 否则投影叠加只具有参考意义。
 
+需要使用前端窗口时：
+
+~~~
+python tools\visualize_coarse_cache.py --gui --cache-dir C:\MM\aubo_tools\data\hole_localization_coarse_cache
+~~~
+
+前端支持孔号和帧号切换、相机/基坐标切换、RGB选择或自动快照、点数抽样、
+缓存中心/法向/RGB帧中心开关、三维旋转缩放，以及当前视图PNG导出。
+
 ## 8. 夹爪控制
 
 在主 GUI 点击“夹爪控制”后会打开独立窗口，主工作台不被锁住。夹爪驱动文件为：

@@ -410,6 +410,7 @@ class CoarseCacheTests(unittest.TestCase):
                     return_value=(validation, cache_observations, np.array([640.0, 360.0])),
                 ) as live_validation, \
                 patch.object(localization, "_capture_coarse_burst") as full_coarse, \
+                patch.object(localization, "render_cache_cloud", return_value=None), \
                 patch.object(
                     localization, "_capture_fine_with_recovery",
                     return_value=fine_recovery,
@@ -435,10 +436,16 @@ class CoarseCacheTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         full_coarse.assert_not_called()
-        live_validation.assert_not_called()
+        live_validation.assert_called_once()
         self.assertEqual(report["coarse_cache"]["cache_reused"], [1])
-        self.assertTrue(
+        self.assertFalse(
             report["stages"]["hole_1"]["coarse_cache_event"]["cache_validation_skipped"]
+        )
+        self.assertIn(
+            "cache_validation_result", report["stages"]["hole_1"]["coarse_cache_event"]
+        )
+        self.assertTrue(
+            report["stages"]["hole_1"]["coarse_cache_event"]["cache_validation_result"]["accepted"]
         )
 
     def test_cache_rejection_runs_full_coarse_and_refreshes_entry(self) -> None:
@@ -484,6 +491,7 @@ class CoarseCacheTests(unittest.TestCase):
                     localization, "_cache_entry_from_observations", return_value=refreshed,
                 ), \
                 patch.object(localization, "save_cache_entries") as save_cache, \
+                patch.object(localization, "render_cache_cloud", return_value=None), \
                 patch.object(
                     localization, "_capture_fine_with_recovery",
                     return_value=fine_recovery,
@@ -545,8 +553,9 @@ class CoarseCacheTests(unittest.TestCase):
                 patch.object(
                     localization, "_validate_coarse_cache_at_current_pose",
                     return_value=(validation, cache_observations, np.array([640.0, 360.0])),
-                ), \
+                ) as live_validation, \
                 patch.object(localization, "_capture_coarse_burst") as full_coarse, \
+                patch.object(localization, "render_cache_cloud", return_value=None), \
                 patch.object(
                     localization, "_capture_fine_with_recovery",
                     return_value=fine_recovery,
@@ -577,6 +586,7 @@ class CoarseCacheTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         full_coarse.assert_not_called()
+        live_validation.assert_called_once()
         self.assertEqual(report["coarse_cache"]["persistent_cache_reused"], [1])
         self.assertEqual(
             report["stages"]["hole_1"]["coarse_cache_event"]["cache_source"],

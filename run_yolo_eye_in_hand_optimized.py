@@ -60,6 +60,7 @@ from aubo_workbench.config import (  # noqa: E402
     apply_robot_connection_overrides,
 )
 from aubo_workbench.io_utils import jsonable, write_dict_rows  # noqa: E402
+from tools.visualize_coarse_cache import CacheCloud, render_cache_cloud  # noqa: E402
 from aubo_workbench.fitting import fit_plane, fit_sphere  # noqa: E402
 from aubo_workbench.geometry import (  # noqa: E402
     angle_between_deg,
@@ -114,7 +115,7 @@ FINAL_TARGET_MODE_NORMAL = "normal"
 DEFAULT_FINAL_TARGET_MODE = FINAL_TARGET_MODE_GRIPPER
 GRIPPER_BASE_X_OFFSET_MM = 64.0
 GRIPPER_BASE_Z_OFFSET_MM = 50.0
-FINAL_BASE_Y_AFTER_Z_MM = 0.3
+FINAL_BASE_Y_AFTER_Z_MM = 0.2
 # 三孔逐孔安放时，所有低位横移前先抬到该安全余量。
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
 # 机器人到位检测只影响轮询响应，不改变控制器的运动轨迹。
@@ -3350,6 +3351,156 @@ def _cache_measurements_from_observations(
     return measurements
 
 
+def _cache_cloud_from_coarse_observations(
+    hole_id: int,
+    observations: list[Observation],
+    *,
+    intrinsics: Any,
+    T_base_camera: np.ndarray,
+    point_camera_mm: Any,
+    plane_point_camera_mm: Any,
+    normal_camera: Any,
+    plane_rmse_mm: float | None,
+    center_scatter_p95_px: float | None,
+    source_label: str,
+) -> CacheCloud | None:
+    """把本次实时观测（含每帧局部点云）转换成可视化工具所需的CacheCloud。
+
+    只使用同时具备平面估计和points_camera_mm的有效帧；没有任何有效帧时返回
+    None，交给调用方回退到缓存重投影点云或直接跳过保存。
+    """
+    valid = [
+        item for item in observations
+        if item.error is None
+        and item.plane is not None
+        and item.plane.points_camera_mm is not None
+        and len(item.plane.points_camera_mm) > 0
+    ]
+    if not valid:
+        return None
+    return CacheCloud(
+        hole_id=int(hole_id),
+        points_camera_mm_by_frame=tuple(
+            np.asarray(item.plane.points_camera_mm, dtype=np.float32).reshape(-1, 3)
+            for item in valid
+        ),
+        frame_indices=np.asarray([item.frame_index for item in valid], dtype=np.int64),
+        frame_centers_px=np.asarray(
+            [item.center_px for item in valid], dtype=np.float64
+        ).reshape(-1, 2),
+        frame_plane_rmse_mm=np.asarray([item.plane.rmse_mm for item in valid], dtype=np.float64),
+        intrinsics=_cache_intrinsics_dict(intrinsics),
+        T_base_camera_build=np.asarray(T_base_camera, dtype=np.float64).reshape(4, 4),
+        point_camera_mm=np.asarray(point_camera_mm, dtype=np.float64).reshape(3),
+        plane_point_camera_mm=np.asarray(plane_point_camera_mm, dtype=np.float64).reshape(3),
+        normal_camera=_unit(
+            np.asarray(normal_camera, dtype=np.float64), f"hole {hole_id} pointcloud image normal"
+        ),
+        point_base_mm=None,
+        plane_point_base_mm=None,
+        normal_base=None,
+        plane_rmse_mm=None if plane_rmse_mm is None else float(plane_rmse_mm),
+        center_scatter_p95_px=(
+            None if center_scatter_p95_px is None else float(center_scatter_p95_px)
+        ),
+        source_path=Path(f"live_observations:{source_label}"),
+        cache_scope=source_label,
+    )
+
+
+def _cache_cloud_from_cached_entry_reprojected(
+    cache_entry: CoarseCacheEntry,
+    hole_id: int,
+    *,
+    T_base_camera: np.ndarray,
+    point_camera_mm: Any,
+    plane_point_camera_mm: Any,
+    normal_camera: Any,
+    source_label: str,
+) -> CacheCloud:
+    """当现场观测缺少点云（例如未通过质量门）时，把缓存点重投影到当前相机位。"""
+    points_by_frame = transform_cached_points_to_camera(cache_entry, T_base_camera)
+    return CacheCloud(
+        hole_id=int(hole_id),
+        points_camera_mm_by_frame=points_by_frame,
+        frame_indices=np.asarray(cache_entry.frame_indices, dtype=np.int64),
+        frame_centers_px=np.asarray(cache_entry.frame_centers_px, dtype=np.float64),
+        frame_plane_rmse_mm=np.asarray(cache_entry.frame_plane_rmse_mm, dtype=np.float64),
+        intrinsics=dict(cache_entry.intrinsics),
+        T_base_camera_build=np.asarray(T_base_camera, dtype=np.float64).reshape(4, 4),
+        point_camera_mm=np.asarray(point_camera_mm, dtype=np.float64).reshape(3),
+        plane_point_camera_mm=np.asarray(plane_point_camera_mm, dtype=np.float64).reshape(3),
+        normal_camera=_unit(
+            np.asarray(normal_camera, dtype=np.float64), f"hole {hole_id} cached pointcloud normal"
+        ),
+        point_base_mm=None,
+        plane_point_base_mm=None,
+        normal_base=None,
+        plane_rmse_mm=float(cache_entry.plane_rmse_mm),
+        center_scatter_p95_px=float(cache_entry.center_scatter_p95_px),
+        source_path=Path(f"cache_reprojected:{source_label}"),
+        cache_scope=source_label,
+    )
+
+
+def _save_coarse_pointcloud_image(
+    hole: dict[str, Any],
+    hole_id: int,
+    run_dir: Path,
+    *,
+    observations: list[Observation] | None,
+    cache_entry: CoarseCacheEntry | None,
+    T_base_camera: np.ndarray,
+    intrinsics: Any,
+    rgb_path: Path | None,
+    source_label: str,
+) -> Path | None:
+    """保存单孔340mm粗定位点云PNG，供后续人工复核；任何异常都只警告不中断流程。"""
+    anchor = hole.get("coarse_center_camera_mm")
+    normal = hole.get("coarse_normal_camera")
+    if anchor is None or normal is None:
+        return None
+    plane_anchor = hole.get("coarse_plane_point_camera_mm")
+    if plane_anchor is None:
+        plane_anchor = anchor
+    cloud: CacheCloud | None = None
+    try:
+        if observations is not None:
+            cloud = _cache_cloud_from_coarse_observations(
+                hole_id, observations,
+                intrinsics=intrinsics, T_base_camera=T_base_camera,
+                point_camera_mm=anchor, plane_point_camera_mm=plane_anchor,
+                normal_camera=normal,
+                plane_rmse_mm=hole.get("coarse_plane_rmse_mm"),
+                center_scatter_p95_px=hole.get("coarse_center_scatter_p95_px"),
+                source_label=source_label,
+            )
+        if cloud is None and cache_entry is not None:
+            cloud = _cache_cloud_from_cached_entry_reprojected(
+                cache_entry, hole_id,
+                T_base_camera=T_base_camera,
+                point_camera_mm=anchor, plane_point_camera_mm=plane_anchor,
+                normal_camera=normal,
+                source_label=f"{source_label}_cache_reprojected",
+            )
+    except Exception as exc:
+        print(f"[COARSE_POINTCLOUD_IMAGE_WARNING] hole={hole_id} reason={exc}", flush=True)
+        return None
+    if cloud is None:
+        return None
+    output_path = run_dir / f"hole_{hole_id:02d}_coarse_pointcloud.png"
+    try:
+        return render_cache_cloud(
+            cloud,
+            rgb_path=(rgb_path if rgb_path is not None and rgb_path.is_file() else None),
+            output_path=output_path,
+            show=False,
+        )
+    except Exception as exc:
+        print(f"[COARSE_POINTCLOUD_IMAGE_WARNING] hole={hole_id} reason={exc}", flush=True)
+        return None
+
+
 def _cache_entry_from_observations(
     hole_id: int,
     observations: list[Observation],
@@ -3609,51 +3760,6 @@ def _apply_cached_geometry_to_hole(
     })
 
 
-def _apply_direct_cached_geometry_to_hole(
-    hole: dict[str, Any], entry: CoarseCacheEntry,
-    *, current_T_base_camera: np.ndarray,
-    source: str = "current_run_initial_cache",
-    persistent_hole_id: int | None = None,
-) -> None:
-    """直接使用base坐标缓存，不采现场复核帧、不用现场深度改写Z。"""
-    T_base_camera = np.asarray(current_T_base_camera, dtype=np.float64).reshape(4, 4)
-    T_camera_base = invert_transform(T_base_camera)
-    point_base = np.asarray(entry.point_base_mm, dtype=np.float64).reshape(3)
-    plane_point_base = np.asarray(entry.plane_point_base_mm, dtype=np.float64).reshape(3)
-    point_camera = T_camera_base[:3, :3] @ point_base + T_camera_base[:3, 3]
-    plane_point_camera = T_camera_base[:3, :3] @ plane_point_base + T_camera_base[:3, 3]
-    normal_camera = _unit(
-        T_base_camera[:3, :3].T @ np.asarray(entry.normal_base, dtype=np.float64),
-        "direct cached normal camera",
-    )
-    hole.update({
-        "coarse_center_px": np.asarray(entry.center_px, dtype=np.float64),
-        "coarse_center_camera_mm": point_camera,
-        "coarse_center_base_mm": point_base,
-        "coarse_plane_point_camera_mm": plane_point_camera,
-        "coarse_plane_point_base_mm": plane_point_base,
-        "coarse_normal_camera": normal_camera,
-        "coarse_normal_toward_camera_base": np.asarray(entry.normal_base, dtype=np.float64),
-        "coarse_plane_rmse_mm": float(entry.plane_rmse_mm),
-        "coarse_valid_frames": int(entry.valid_frames),
-        "coarse_total_frames": int(entry.total_frames),
-        "coarse_center_scatter_p95_px": float(entry.center_scatter_p95_px),
-        "coarse_ring_points_median": float(entry.ring_points_median),
-        "coarse_surface_model": f"cached_{entry.surface_model}_direct_base_reuse",
-        "coarse_surface_selection_policy": COARSE_SURFACE_SELECTION_POLICY,
-        "coarse_front_surface_z_mm": None,
-        "coarse_ring_points_raw_median": None,
-        "coarse_surface_points_selected_median": None,
-        "coarse_sphere_center_camera_mm": None,
-        "coarse_sphere_radius_mm": None,
-        "coarse_cache_source": str(source),
-        "coarse_cache_entry_created_at": entry.created_at,
-        "coarse_cache_persistent_hole_id": (
-            None if persistent_hole_id is None else int(persistent_hole_id)
-        ),
-    })
-
-
 def _validate_coarse_cache_at_current_pose(
     hole: dict[str, Any], entry: CoarseCacheEntry, *,
     pipeline: Any, align: Any, chain: Any, model: Any, confidence: float,
@@ -3679,7 +3785,7 @@ def _validate_coarse_cache_at_current_pose(
         tracking_tolerance_px=float(gates.max_tracking_distance_px),
         lock_anchor=True,
         stop_when_stable=False,
-        include_points=False,
+        include_points=True,
     )
     validation = validate_cache_entry(
         entry,
@@ -4257,51 +4363,76 @@ def _run_sequential_hole_workflow(
                     if cache_entry is None:
                         raise FileNotFoundError(f"当前运行缓存缺少孔{hole_id}条目")
                 cache_source = cache_sources.get(hole_id, "current_run_initial_cache")
-                _apply_direct_cached_geometry_to_hole(
+                # 缓存几何落在base坐标系，复用前必须在340mm现场验证
+                # （aubo_workbench/paths.py 的设计约束）；不再直接信任缓存。
+                validation, cache_observations, _expected_anchor = _validate_coarse_cache_at_current_pose(
                     hole, cache_entry,
-                    current_T_base_camera=T_base_camera,
-                    source=cache_source,
-                    persistent_hole_id=cache_source_ids.get(hole_id),
+                    pipeline=rgbd_pipeline, align=align, chain=chain,
+                    model=model, confidence=args.confidence,
+                    run_dir=run_dir, cfg=cfg, gates=cache_gates,
+                    current_T_base_camera=T_base_camera, intrinsics=initial_intrinsics,
                 )
-                if cache_source == "persistent_base_cache":
-                    transformed_points = transform_cached_points_to_camera(
-                        cache_entry, T_base_camera,
+                rows.extend(_observation_rows(cache_observations))
+                cache_event["cache_validation_result"] = validation.to_dict()
+                if not validation.accepted:
+                    cache_event["cache_validation_skipped"] = False
+                    cache_event["cache_validation_failed"] = True
+                    cache_event["failure_reason"] = f"cache_validation_rejected:{validation.reason}"
+                    report["coarse_cache"]["cache_validation_failed"].append({
+                        "hole_id": hole_id, "reason": cache_event["failure_reason"],
+                    })
+                else:
+                    _apply_cached_geometry_to_hole(
+                        hole, cache_entry, validation,
+                        source=cache_source,
+                        persistent_hole_id=cache_source_ids.get(hole_id),
                     )
-                    hole["coarse_cache_transformed_point_count"] = int(
-                        sum(len(points) for points in transformed_points)
+                    if cache_source == "persistent_base_cache":
+                        transformed_points = transform_cached_points_to_camera(
+                            cache_entry, T_base_camera,
+                        )
+                        hole["coarse_cache_transformed_point_count"] = int(
+                            sum(len(points) for points in transformed_points)
+                        )
+                        hole["coarse_cache_transform"] = "T_base_camera_build_to_current_camera"
+                    cache_reused = True
+                    cache_event["cache_reused"] = True
+                    cache_event["cache_validation_skipped"] = False
+                    cache_event["cache_validation_failed"] = False
+                    cache_event["coarse_settle_buffer_s"] = 0.0
+                    report["coarse_cache"]["cache_reused"].append(hole_id)
+                    if cache_source == "persistent_base_cache":
+                        report["coarse_cache"]["persistent_cache_reused"].append(hole_id)
+                    coarse_captures.append({
+                        "capture_index": 0,
+                        "mode": "cache_validated_reuse",
+                        "tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
+                        "summary": {
+                            "reuse_mode": "validated_base_coordinate_cache_live_z",
+                            "validation_skipped": False,
+                            "validation": validation.to_dict(),
+                            "cached_valid_frames": int(cache_entry.valid_frames),
+                            "cached_plane_rmse_mm": float(cache_entry.plane_rmse_mm),
+                            "cached_center_scatter_p95_px": float(
+                                cache_entry.center_scatter_p95_px
+                            ),
+                        },
+                    })
+                    overlay_path = run_dir / f"hole_{hole_id:02d}_coarse_cache_verify_overlay.png"
+                    pointcloud_path = _save_coarse_pointcloud_image(
+                        hole, hole_id, run_dir,
+                        observations=cache_observations,
+                        cache_entry=cache_entry,
+                        T_base_camera=T_base_camera,
+                        intrinsics=initial_intrinsics,
+                        rgb_path=overlay_path,
+                        source_label=f"{cache_source}_validated",
                     )
-                    hole["coarse_cache_transform"] = "T_base_camera_build_to_current_camera"
-                cache_reused = True
-                cache_event["cache_reused"] = True
-                cache_event["cache_validation_skipped"] = True
-                cache_event["cache_validation_skip_reason"] = (
-                    "direct_base_coordinate_reuse_no_live_target_verification"
-                )
-                cache_event["cache_validation_failed"] = False
-                cache_event["coarse_settle_buffer_s"] = 0.0
-                report["coarse_cache"]["cache_reused"].append(hole_id)
-                report["coarse_cache"]["cache_validation_skipped"].append({
-                    "hole_id": hole_id,
-                    "reason": cache_event["cache_validation_skip_reason"],
-                })
-                if cache_source == "persistent_base_cache":
-                    report["coarse_cache"]["persistent_cache_reused"].append(hole_id)
-                coarse_captures.append({
-                    "capture_index": 0,
-                    "mode": "cache_direct_reuse",
-                    "tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
-                    "summary": {
-                        "reuse_mode": "direct_base_coordinate_cache",
-                        "validation_skipped": True,
-                        "cached_valid_frames": int(cache_entry.valid_frames),
-                        "cached_plane_rmse_mm": float(cache_entry.plane_rmse_mm),
-                        "cached_center_scatter_p95_px": float(
-                            cache_entry.center_scatter_p95_px
-                        ),
-                    },
-                })
+                    hole["coarse_pointcloud_image_path"] = (
+                        None if pointcloud_path is None else str(pointcloud_path)
+                    )
             except Exception as exc:
-                cache_event["cache_validation_failed"] = False
+                cache_event["cache_validation_failed"] = True
                 cache_event["failure_reason"] = f"{type(exc).__name__}:{exc}"
                 report["coarse_cache"]["cache_validation_failed"].append({
                     "hole_id": hole_id, "reason": cache_event["failure_reason"],
@@ -4360,7 +4491,7 @@ def _run_sequential_hole_workflow(
                     initial_anchor_px=expected_anchor_px,
                     tracking_tolerance_px=cfg.multi_coarse_tracking_tolerance_px,
                     lock_anchor=True,
-                    include_points=cache_enabled,
+                    include_points=True,
                 )
             rows.extend(_observation_rows(coarse_observations))
             _record_hole_tracking_event(
@@ -4436,6 +4567,27 @@ def _run_sequential_hole_workflow(
                 f"孔{hole_id}粗定位闭环后仍未通过质量门："
                 f"offset={float(final_center_offset or math.inf):.2f}px, "
                 f"normal={float(final_normal_error or math.inf):.3f}deg"
+            )
+        if not cache_reused and last_coarse_observations is not None:
+            last_capture_index = (
+                int(coarse_captures[-1].get("capture_index", 0)) if coarse_captures else 0
+            )
+            overlay_path = run_dir / f"hole_{hole_id:02d}_coarse_{last_capture_index}_overlay.png"
+            pointcloud_path = _save_coarse_pointcloud_image(
+                hole, hole_id, run_dir,
+                observations=last_coarse_observations,
+                cache_entry=None,
+                T_base_camera=(
+                    last_coarse_T_base_camera
+                    if last_coarse_T_base_camera is not None
+                    else camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+                ),
+                intrinsics=initial_intrinsics,
+                rgb_path=overlay_path,
+                source_label="fresh_coarse_capture",
+            )
+            hole["coarse_pointcloud_image_path"] = (
+                None if pointcloud_path is None else str(pointcloud_path)
             )
         if (
             cache_enabled
@@ -4780,7 +4932,7 @@ def _run_sequential_hole_workflow(
             }
             y_trim_target = plan_final_tcp_base_y_trim(current_tcp)
             with timing.measure(
-                f"hole_{hole_id:02d}/final_motion_y_plus_0_3mm",
+                f"hole_{hole_id:02d}/final_motion_y_plus_0_2mm",
                 hole_id=hole_id,
                 processing_order=order,
             ):
@@ -5586,7 +5738,7 @@ def run_cad_motion_workflow(args: Any, handeye: Any, yolo_model: Any) -> int:
                     "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
                 }
                 y_target = plan_final_tcp_base_y_trim(current_tcp)
-                with timing.measure(f"hole_{hole_id}/final_y_plus_0_3mm", hole_id=hole_id, order=order):
+                with timing.measure(f"hole_{hole_id}/final_y_plus_0_2mm", hole_id=hole_id, order=order):
                     current_tcp = _confirm_and_move_line(
                         f"CAD孔{hole_id}最终基坐标+Y微调",
                         current_tcp,
