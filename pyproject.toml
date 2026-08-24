@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aubo-workbench"
 version = "0.1.0"
-description = "AUBO + Gemini 435Le + YOLO/CAD 孔位定位工作台"
+description = "AUBO + Gemini 435Le + YOLO 两阶段孔位定位工作台"
 readme = "README.md"
 
 # 厂商 SDK pyaubo_sdk 只提供 cp310-win_amd64 的二进制扩展
@@ -26,9 +26,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# STEP 解析用的可选依赖。缺失时 aubo_workbench.cad_model 会明确报错，
-# 不会静默生成假 CAD 数据。
-cad = ["cadquery-ocp==7.9.3.1.1"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -49,7 +46,6 @@ packages = ["aubo_workbench"]
 py-modules = [
     "diagnose_hole_precision_pycharm",
     "record_tcp_absolute_xy_model",
-    "run_cad_registration_preview",
     "run_charuco_height_error_experiment",
     "run_coarse_to_fine_offset_test",
     "run_handeye_pose_sequence",

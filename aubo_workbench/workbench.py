@@ -22,6 +22,7 @@ from typing import Any
 from .gui_common import GuiLogWriter
 from .gui_handeye import HandEyeGuiPanel
 from .gui_hole_localization import HoleLocalizationPanel
+from .gui_tools import ResultsCenterPanel, VisualToolsPanel
 from .gripper_control import GripperControlPanel
 from .motion_control import AuboMotionPanel
 from .paths import (
@@ -420,7 +421,11 @@ class AuboWorkbench(tk.Tk):
             btn.pack(fill=X, pady=(0, 8))
             self.nav_buttons[key] = btn
         ttk.Label(nav, text="系统", foreground="#555555").pack(anchor="w", pady=(8, 5))
-        for key, text in [("robot_info", "系统信息")]:
+        for key, text in [
+            ("visual_tools", "视觉与实验"),
+            ("results", "结果中心"),
+            ("robot_info", "系统信息"),
+        ]:
             btn = ttk.Button(nav, text=text, command=lambda page=key: self.show_page(page))
             btn.pack(fill=X, pady=(0, 8))
             self.nav_buttons[key] = btn
@@ -474,6 +479,10 @@ class AuboWorkbench(tk.Tk):
             return panel
         if key == "hole_localization":
             return HoleLocalizationPanel(self.content, self.get_connection)
+        if key == "visual_tools":
+            return VisualToolsPanel(self.content, self.get_connection)
+        if key == "results":
+            return ResultsCenterPanel(self.content)
         raise KeyError(key)
 
     def sync_current_page(self, show_errors: bool = True) -> None:

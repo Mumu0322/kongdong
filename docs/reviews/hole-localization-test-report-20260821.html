@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>孔定位三方案测试报告 | 2026-08-21</title>
+  <style>
+    :root { --ink:#172126; --muted:#5d6a6f; --line:#cad2d1; --paper:#f5f7f5; --panel:#ffffff; --teal:#0e7c78; --cyan:#2795b2; --amber:#c98016; --red:#b44b43; --green:#3d8060; --dark:#173b3a; }
+    @media (prefers-color-scheme: dark) { :root { --ink:#e7eeee; --muted:#adbaba; --line:#4d6260; --paper:#14201f; --panel:#1b2a29; --teal:#5dd0c4; --cyan:#64c7e0; --amber:#f1b95c; --red:#f08d84; --green:#76c799; --dark:#173b3a; } }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font-family:"Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif; line-height:1.55; }
+    .page { max-width:1200px; margin:0 auto; padding:32px 24px 56px; }
+    .report-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:24px; padding:8px 0 28px; border-bottom:4px solid var(--teal); }
+    .eyebrow { color:var(--teal); font-size:13px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 0 8px; }
+    h1,h2,h3,p { margin-top:0; } h1 { font-size:clamp(28px,4vw,43px); line-height:1.16; margin-bottom:12px; letter-spacing:0; } h2 { font-size:23px; margin:38px 0 14px; letter-spacing:0; } h3 { font-size:17px; margin:0 0 8px; }
+    .subtitle { max-width:760px; color:var(--muted); margin-bottom:0; }
+    .stamp { align-self:start; border:1px solid var(--line); padding:12px 15px; background:var(--panel); min-width:178px; font-size:13px; }
+    .stamp b { display:block; font-size:17px; color:var(--teal); }
+    .note { border-left:4px solid var(--amber); padding:12px 16px; background:color-mix(in srgb, var(--amber) 8%, var(--panel)); margin:24px 0; }
+    .grid { display:grid; gap:14px; } .grid.three { grid-template-columns:repeat(3,minmax(0,1fr)); } .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .metric { background:var(--panel); border-top:3px solid var(--teal); padding:16px; min-height:128px; } .metric.amber { border-color:var(--amber); } .metric.cyan { border-color:var(--cyan); }
+    .metric .label { color:var(--muted); font-size:13px; } .metric .value { font-size:31px; font-weight:700; margin:4px 0; } .metric .detail { font-size:13px; color:var(--muted); }
+    .section-lead { color:var(--muted); max-width:900px; }
+    .table-wrap { overflow-x:auto; background:var(--panel); } table { width:100%; min-width:760px; border-collapse:collapse; font-size:14px; } th,td { padding:11px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:12px; font-weight:700; background:color-mix(in srgb, var(--teal) 7%, var(--panel)); } td.num,th.num { text-align:right; font-variant-numeric:tabular-nums; } .baseline { background:color-mix(in srgb, var(--teal) 9%, var(--panel)); } .tag { display:inline-block; font-size:12px; padding:2px 7px; border:1px solid var(--line); color:var(--muted); } .tag.base { color:var(--teal); border-color:var(--teal); font-weight:700; }
+    .chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:22px; margin-top:18px; } figure { margin:0; background:var(--panel); padding:16px; border:1px solid var(--line); } figcaption { font-weight:700; margin-bottom:10px; } .chart-sub { color:var(--muted); font-size:12px; margin:-4px 0 12px; } .bar-row { display:grid; grid-template-columns:80px 1fr 68px; align-items:center; gap:10px; margin:11px 0; font-size:13px; } .bar-track { height:20px; background:color-mix(in srgb, var(--muted) 14%, transparent); position:relative; } .bar { height:100%; min-width:3px; } .bar.teal { background:var(--teal); } .bar.cyan { background:var(--cyan); } .bar.amber { background:var(--amber); } .bar.red { background:var(--red); } .bar-value { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; } .legend { font-size:12px; color:var(--muted); margin-top:13px; } .stack-row { display:grid; grid-template-columns:80px 1fr 68px; gap:10px; align-items:center; margin:11px 0; font-size:13px; } .stack { height:22px; display:flex; background:color-mix(in srgb, var(--muted) 14%, transparent); } .stack i { display:block; height:100%; } .motion { background:var(--teal); } .vision { background:var(--cyan); } .other { background:var(--amber); } .microkey { display:flex; flex-wrap:wrap; gap:10px; color:var(--muted); font-size:12px; margin-top:12px; } .microkey span::before { content:""; display:inline-block; width:10px; height:10px; margin-right:5px; background:var(--teal); } .microkey .k2::before { background:var(--cyan); } .microkey .k3::before { background:var(--amber); } .pose-grid { display:grid; grid-template-columns:repeat(11,minmax(18px,1fr)); align-items:end; gap:5px; height:148px; border-bottom:1px solid var(--line); padding:4px 2px 0; } .pose-col { display:grid; grid-template-rows:1fr auto; gap:5px; min-width:0; height:100%; text-align:center; font-size:11px; color:var(--muted); } .pose-col i { align-self:end; display:block; background:var(--teal); min-height:4px; } .pose-col b { color:var(--ink); font-size:11px; font-weight:500; }
+    .comparison { display:grid; grid-template-columns:150px repeat(3,minmax(0,1fr)); gap:0; background:var(--panel); border:1px solid var(--line); margin-top:18px; } .comparison > div { padding:12px; border-bottom:1px solid var(--line); min-height:64px; } .comparison .head { color:var(--muted); font-size:13px; font-weight:700; background:color-mix(in srgb, var(--teal) 7%, var(--panel)); } .comparison .row-title { font-weight:700; } .comparison .basecell { background:color-mix(in srgb, var(--teal) 8%, var(--panel)); }
+    .risk { border-left:5px solid var(--amber); padding:14px 16px; background:var(--panel); } .risk.high { border-color:var(--red); } .risk strong { display:block; margin-bottom:3px; } .risk p { margin:0; color:var(--muted); font-size:14px; }
+    .test-card { background:var(--panel); padding:16px; border:1px solid var(--line); } .test-card h3 span { color:var(--teal); margin-right:8px; } .test-card p { color:var(--muted); font-size:14px; margin-bottom:9px; } .test-card ul { padding-left:19px; margin:0; font-size:14px; } .priority { color:var(--red); font-weight:700; font-size:12px; }
+    details { background:var(--panel); border-bottom:1px solid var(--line); padding:14px 16px; } summary { font-weight:700; cursor:pointer; } details p { color:var(--muted); margin:10px 0 0; }
+    .footer { margin-top:42px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+    @media (max-width:720px) { .page { padding:22px 14px 40px; } .report-head,.grid.three,.grid.two,.chart-grid { grid-template-columns:1fr; } .stamp { width:100%; } .comparison { grid-template-columns:112px repeat(3,minmax(150px,1fr)); overflow-x:auto; } }
+    @media print { body { background:#fff; } .page { max-width:none; padding:18mm; } figure,.test-card,.metric { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="report-head">
+      <div>
+        <p class="eyebrow">工程验证 / 两阶段孔定位</p>
+        <h1>孔定位三方案当前测试报告</h1>
+        <p class="subtitle">多拍多作为准确度与姿态基准；一拍多用于节拍提速对照；固定点云用于受控工装下的缓存路径验证。</p>
+      </div>
+      <aside class="stamp"><b>工程试验通过</b>量产验证未完成<br>测试日期：2026-08-21<br>工件：11 孔孔位板</aside>
+    </header>
+
+    <section class="note"><strong>结论边界：</strong>三种方案均完成 11/11 孔，但每种仅一个周期。现有日志证明流程和内部稳定性，尚不能替代 CMM/治具真值下的绝对孔位与绝对姿态精度验证。</section>
+
+    <section aria-labelledby="summary-title">
+      <h2 id="summary-title">当前决策</h2>
+      <div class="grid three">
+        <article class="metric"><div class="label">质量基准</div><div class="value">多拍多</div><div class="detail">每孔实时多帧粗定位、局部点云与姿态修正</div></article>
+        <article class="metric cyan"><div class="label">节拍最快</div><div class="value">一拍多</div><div class="detail">175.00 s / 11 孔，较多拍多快 51.60 s</div></article>
+        <article class="metric amber"><div class="label">受控缓存路径</div><div class="value">固定点云</div><div class="detail">必须先关闭缓存错配与失效回退风险</div></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="data-title">
+      <h2 id="data-title">本次运行结果</h2>
+      <p class="section-lead">以下为运行日志的内部质量与执行指标。末端 XY 计划-实到误差代表机器人跟随目标的误差，不等于 TCP 相对真实孔中心的绝对误差。</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>方案</th><th>运行目录</th><th>粗定位来源</th><th class="num">完成孔数</th><th class="num">有效总节拍</th><th class="num">精定位散布 P95</th><th class="num">粗平面 RMSE P95</th><th class="num">末端 XY 跟随 P95</th></tr></thead>
+        <tbody>
+          <tr class="baseline"><td><span class="tag base">基准</span> 多拍多</td><td><code>two-stage-20260821_144256</code></td><td>每孔实时粗定位</td><td class="num">11 / 11</td><td class="num">226.60 s</td><td class="num">0.241 px</td><td class="num">1.686 mm</td><td class="num">0.01149 mm</td></tr>
+          <tr><td>一拍多</td><td><code>two-stage-20260821_141644</code></td><td>批量粗定位</td><td class="num">11 / 11</td><td class="num">175.00 s</td><td class="num">0.201 px</td><td class="num">1.609 mm</td><td class="num">0.01276 mm</td></tr>
+          <tr><td>固定点云</td><td><code>two-stage-20260821_142434-cycle02</code></td><td>持久点云缓存验证</td><td class="num">11 / 11</td><td class="num">191.92 s</td><td class="num">0.231 px</td><td class="num">1.904 mm</td><td class="num">0.00950 mm</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section aria-labelledby="visual-title">
+      <h2 id="visual-title">方案取舍可视化</h2>
+      <div class="chart-grid">
+        <figure aria-label="三方案有效总节拍条形图"><figcaption>有效总节拍</figcaption><p class="chart-sub">数值越低越好，包含运动、视觉计算和其他有效耗时。</p>
+          <div class="bar-row"><span>多拍多</span><div class="bar-track"><div class="bar teal" style="width:100%"></div></div><span class="bar-value">226.60 s</span></div>
+          <div class="bar-row"><span>一拍多</span><div class="bar-track"><div class="bar cyan" style="width:77.2%"></div></div><span class="bar-value">175.00 s</span></div>
+          <div class="bar-row"><span>固定点云</span><div class="bar-track"><div class="bar amber" style="width:84.7%"></div></div><span class="bar-value">191.92 s</span></div>
+          <p class="legend">多拍多相对一拍多增加 51.60 s / 件。当前优先将其用于首件、异常件、换型后和缓存失效后的质量复核。</p>
+        </figure>
+        <figure aria-label="三方案内部质量指标对比"><figcaption>内部质量指标 P95</figcaption><p class="chart-sub">仅用于观察系统内部稳定性，不替代绝对精度真值。</p>
+          <div class="bar-row"><span>精定位散布</span><div class="bar-track"><div class="bar teal" style="width:100%"></div></div><span class="bar-value">0.241 px</span></div>
+          <div class="bar-row"><span>一拍多</span><div class="bar-track"><div class="bar cyan" style="width:83.4%"></div></div><span class="bar-value">0.201 px</span></div>
+          <div class="bar-row"><span>固定点云</span><div class="bar-track"><div class="bar amber" style="width:95.9%"></div></div><span class="bar-value">0.231 px</span></div>
+          <p class="legend">多拍多的工程价值是实时多帧与姿态复核能力。当前没有独立孔位/法向真值，不能根据此图单独判断绝对精度排名。</p>
+        </figure>
+        <figure aria-label="三方案有效节拍构成"><figcaption>节拍构成</figcaption><p class="chart-sub">有效总节拍不包含“排除等待时间”。颜色分解运动、视觉计算和其他有效耗时。</p>
+          <div class="stack-row"><span>多拍多</span><div class="stack"><i class="motion" style="width:73.5%"></i><i class="vision" style="width:17.7%"></i><i class="other" style="width:6.9%"></i></div><span class="bar-value">226.60 s</span></div>
+          <div class="stack-row"><span>一拍多</span><div class="stack"><i class="motion" style="width:59.4%"></i><i class="vision" style="width:11.0%"></i><i class="other" style="width:6.9%"></i></div><span class="bar-value">175.00 s</span></div>
+          <div class="stack-row"><span>固定点云</span><div class="stack"><i class="motion" style="width:69.4%"></i><i class="vision" style="width:7.5%"></i><i class="other" style="width:7.8%"></i></div><span class="bar-value">191.92 s</span></div>
+          <div class="microkey"><span>机器人运动</span><span class="k2">视觉计算</span><span class="k3">其他有效耗时</span></div>
+        </figure>
+        <figure aria-label="多拍多逐孔姿态修正幅度"><figcaption>多拍多逐孔姿态修正幅度</figcaption><p class="chart-sub">过程证据，不是相对真实法向的绝对姿态误差。均值 0.858°，最大 1.820°。</p>
+          <div class="pose-grid">
+            <div class="pose-col"><i style="height:17.5%"></i><b>01<br>0.32°</b></div><div class="pose-col"><i style="height:46.9%"></i><b>02<br>0.85°</b></div><div class="pose-col"><i style="height:44.3%"></i><b>03<br>0.81°</b></div><div class="pose-col"><i style="height:52.4%"></i><b>04<br>0.95°</b></div><div class="pose-col"><i style="height:100%"></i><b>05<br>1.82°</b></div><div class="pose-col"><i style="height:15.8%"></i><b>06<br>0.29°</b></div><div class="pose-col"><i style="height:44.3%"></i><b>07<br>0.81°</b></div><div class="pose-col"><i style="height:70.9%"></i><b>08<br>1.29°</b></div><div class="pose-col"><i style="height:56.5%"></i><b>09<br>1.03°</b></div><div class="pose-col"><i style="height:33.0%"></i><b>10<br>0.60°</b></div><div class="pose-col"><i style="height:36.8%"></i><b>11<br>0.67°</b></div>
+          </div>
+          <p class="legend">这证明多拍多路径本次确实执行了逐孔姿态调整；是否“姿态最准”仍须通过外部真值测量确认。</p>
+        </figure>
+      </div>
+      <div class="comparison" aria-label="三方案适用性矩阵">
+        <div class="head">评估维度</div><div class="head basecell">多拍多</div><div class="head">一拍多</div><div class="head">固定点云</div>
+        <div class="row-title">主要定位方式</div><div class="basecell">每孔实时多帧 + 局部点云</div><div>单次批量粗定位复用</div><div>持久点云缓存校验</div>
+        <div class="row-title">推荐角色</div><div class="basecell">质量基准、首件、异常回退</div><div>常规节拍候选</div><div>受控工装下的受限路径</div>
+        <div class="row-title">主要风险</div><div class="basecell">节拍较长</div><div>共享粗定位对现场变化更敏感</div><div>缓存错配、版本和装夹一致性</div>
+        <div class="row-title">量产前关键验证</div><div class="basecell">绝对精度、姿态真值、节拍长尾</div><div>相对多拍多的偏差边界</div><div>失配拦截与强制回退</div>
+      </div>
+    </section>
+
+    <section aria-labelledby="issues-title">
+      <h2 id="issues-title">当前问题与关闭措施</h2>
+      <div class="grid two">
+        <article class="risk high"><strong>质量状态语义需拆分</strong><p>三次运行的严格椭圆通过帧均为 0；所有有效精定位帧都通过“点云锚定 + 放宽椭圆”接受。必须分别记录 strict pass、degraded pass、retry pass、fail，并统计降级率。</p></article>
+        <article class="risk high"><strong>缺少独立绝对真值</strong><p>现有图像散布、平面 RMSE 和机器人跟随误差均不等于真实孔位/法向误差。使用 CMM、标定治具或外部量具建立 XY、Z、姿态真值。</p></article>
+        <article class="risk"><strong>固定点云错配尚未覆盖</strong><p>缓存必须绑定工件型号、夹具号、相机与手眼标定版本；验证失败时禁止导航并自动回退多拍多。</p></article>
+        <article class="risk"><strong>节拍长尾未量化</strong><p>生产节拍承诺必须使用 P95/P99，并单列重试、等待、人工中断和回退路径，不能只报平均时间。</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="tests-title">
+      <h2 id="tests-title">量产前测试用例</h2>
+      <p class="section-lead">先完成红色优先级用例，再进入跨班次连续运行。每次测试保存 <code>report.json</code>、<code>frames.csv</code>、叠加图、缓存版本和人工真值记录。</p>
+      <div class="grid two">
+        <article class="test-card"><h3><span>TC-01</span>标准件基准 <small class="priority">P0</small></h3><p>多拍多连续运行至少 30 件标准工件。</p><ul><li>输出孔级/工件级成功率和 95% 置信区间</li><li>输出绝对 XY、Z、姿态误差及 P50/P95/P99 节拍</li></ul></article>
+        <article class="test-card"><h3><span>TC-03</span>多拍多姿态恢复 <small class="priority">P0</small></h3><p>施加 0°、1°、2°、3°、5° 已知倾角。</p><ul><li>识别超阈值并修正或安全拒绝</li><li>记录修正后绝对法向误差和恢复成功率</li></ul></article>
+        <article class="test-card"><h3><span>TC-04/05</span>装夹偏移与高度变化 <small class="priority">P0</small></h3><p>施加 XY ±1/±2/±5 mm 与 Z ±1/±2/±3 mm 已知偏移。</p><ul><li>多拍多应重定位</li><li>一拍多/固定点云超阈值时必须拒绝复用并回退</li></ul></article>
+        <article class="test-card"><h3><span>TC-06</span>固定点云失效 <small class="priority">P0</small></h3><p>更换工件、移动夹具、删除或篡改缓存版本。</p><ul><li>必须识别不匹配</li><li>禁止静默沿用并记录回退原因</li></ul></article>
+        <article class="test-card"><h3><span>TC-08/09</span>环境鲁棒性 <small class="priority">P1</small></h3><p>覆盖偏暗、偏亮、反光、阴影、油污、粉尘、水渍和孔边毛刺。</p><ul><li>统计检出率、重试率、严格/放宽接受率</li><li>越界时安全失败，不得输出伪结果</li></ul></article>
+        <article class="test-card"><h3><span>TC-12/14</span>长稳与重启恢复 <small class="priority">P1</small></h3><p>连续运行至少 8 小时，并在运行中重启相机或控制软件。</p><ul><li>统计热机漂移、连接异常和人工干预</li><li>恢复后需缓存校验、回零与首件多拍多复核</li></ul></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="qa-title">
+      <h2 id="qa-title">管理层问答准备</h2>
+      <details open><summary>为什么不直接使用最快的一拍多？</summary><p>一拍多在本次样本中最快，但多拍多是准确度与姿态的现场基准。先用多拍多确认精度边界，再验证一拍多可否在不超过该边界的前提下换取节拍。</p></details>
+      <details><summary>多拍多慢多少，是否值得？</summary><p>本次比一拍多慢 51.60 s/件。它提供每孔实时点云与姿态复核，适合首件、异常和高精度工序；常规路径是否切换一拍多，取决于后续绝对真值与异常测试。</p></details>
+      <details><summary>固定点云为什么不直接量产？</summary><p>它节省采集和计算，但把风险转移到装夹重复性和缓存有效性。偏移、换型、缓存损坏、相机重启等场景未验证前，不能作为唯一定位依据。</p></details>
+      <details><summary>目前是否已经可以量产？</summary><p>当前是工程试验通过。完成多工件、多班次、异常回退、绝对孔位与姿态真值验证，并满足工艺定义的成功率与 P95/P99 节拍后，才能做量产放行决定。</p></details>
+    </section>
+
+    <footer class="footer">数据来源：<code>two-stage-20260821_144256</code>、<code>two-stage-20260821_141644</code>、<code>two-stage-20260821_142434-cycle02</code> 的 <code>report.json</code> 与 <code>frames.csv</code>。版本：2026-08-21。</footer>
+  </main>
+</body>
+</html>

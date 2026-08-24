@@ -5,7 +5,7 @@
 与 run_yolo_eye_in_hand_optimized.py 放在同一目录。
 修改下方配置后直接 Run，不需要填写命令行。
 
-默认进入 CAD 运动路径的目标位姿预览，不连接运动控制。
+默认进入两阶段孔洞定位预览，不连接运动控制。
 启用真实运动前还必须显式确认工作空间安全。
 """
 
@@ -15,11 +15,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from aubo_workbench.paths import (
-    CAD_MODEL_PATH as DEFAULT_CAD_MODEL_PATH,
-    HANDEYE_CANDIDATE_PATH,
-    MODEL_PATH as DEFAULT_MODEL_PATH,
-)
+from aubo_workbench.paths import HANDEYE_CANDIDATE_PATH, MODEL_PATH as DEFAULT_MODEL_PATH
 
 # ============================================================================
 # 用户配置区
@@ -28,18 +24,6 @@ from aubo_workbench.paths import (
 TARGET_SCRIPT = Path(__file__).with_name("run_yolo_eye_in_hand_optimized.py")
 MODEL_PATH = DEFAULT_MODEL_PATH
 HANDEYE_PATH = HANDEYE_CANDIDATE_PATH
-
-# 当前入口默认使用 CAD 取代点云粗定位；改为 False 可回到旧两阶段点云流程。
-CAD_MOTION_MODE = True
-CAD_REGISTRATION_REPORT: Path | None = None  # None=自动选择最近一次通过质量门的报告
-CAD_MODEL_JSON = DEFAULT_CAD_MODEL_PATH
-CAD_FINE_HEIGHT_MM = 260.0
-CAD_FINE_FRAMES = 12
-CAD_FINE_MIN_VALID = 6
-CAD_FINE_CENTER_P95_PX = 1.5
-CAD_YOLO_MATCH_TOLERANCE_PX = 70.0
-CAD_SETTLE_DISCARD_FRAMES = 10
-CAD_MOVE_FINAL_XY = True
 
 # 两阶段定位：原点选孔 -> 粗定位 -> 精定位。
 TWO_STAGE_MODE = True
@@ -85,38 +69,6 @@ def load_module():
 
 
 def build_arguments() -> list[str]:
-    if CAD_MOTION_MODE:
-        args = [
-            "--model", str(MODEL_PATH),
-            "--handeye", str(HANDEYE_PATH),
-            "--confidence", str(YOLO_CONFIDENCE),
-            "--cad-motion",
-            "--execute" if EXECUTE_MOTION else "--no-execute",
-            "--require-validated-handeye",
-            "--move-final-xy" if CAD_MOVE_FINAL_XY else "--no-move-final-xy",
-            "--cad-model-json", str(CAD_MODEL_JSON),
-            "--cad-fine-height-mm", str(CAD_FINE_HEIGHT_MM),
-            "--cad-fine-frames", str(CAD_FINE_FRAMES),
-            "--cad-fine-min-valid", str(CAD_FINE_MIN_VALID),
-            "--cad-fine-center-p95-px", str(CAD_FINE_CENTER_P95_PX),
-            "--cad-yolo-match-tolerance-px", str(CAD_YOLO_MATCH_TOLERANCE_PX),
-            "--cad-settle-discard-frames", str(CAD_SETTLE_DISCARD_FRAMES),
-            "--speed-m-s", str(SPEED_M_S),
-            "--acc-m-s2", str(ACC_M_S2),
-        ]
-        if CAD_REGISTRATION_REPORT is not None:
-            args.extend(["--cad-registration-report", str(CAD_REGISTRATION_REPORT)])
-        if TCP_XY_OFFSET_MM is not None:
-            args.extend([
-                "--tcp-xy-offset-mm", str(TCP_XY_OFFSET_MM[0]), str(TCP_XY_OFFSET_MM[1]),
-            ])
-        if EXECUTE_MOTION and not I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE:
-            raise RuntimeError(
-                "EXECUTE_MOTION=True，但尚未将 "
-                "I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE 设为 True"
-            )
-        return args
-
     args = [
         "--model", str(MODEL_PATH),
         "--handeye", str(HANDEYE_PATH),

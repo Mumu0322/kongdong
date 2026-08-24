@@ -4,11 +4,7 @@
 
 内参对象按属性读取（fx/fy/cx/cy 以及 distortion 或 dist_coeffs），
 因此同时兼容 ``aubo_workbench.camera.CameraIntrinsics``
-与 ``aubo_workbench.cad_registration.CameraIntrinsics`` 两种数据类。
-
-注意：``aubo_workbench.cad_registration`` 里另有一个同名
-``undistort_pixels(points_px, intrinsics)``，参数顺序与本模块相反。
-本模块统一为 intrinsics 在前，混用会静默得到错误结果，不要交叉调用。
+与相机模块提供的内参数据类兼容。
 """
 
 from __future__ import annotations

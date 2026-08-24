@@ -3,7 +3,7 @@
 模块地图
 --------
 config.py           所有可调参数（dataclass 单例）
-paths.py            项目、运行数据、模型和 CAD 资源路径约定
+paths.py            项目、运行数据和模型路径约定
 geometry.py          4x4 变换、旋转、位姿格式转换等纯数学函数
 io_utils.py          文件系统小工具（建目录、时间戳、矩阵<->list）
 camera.py            Gemini 435Le 相机封装（依赖 pyorbbecsdk）

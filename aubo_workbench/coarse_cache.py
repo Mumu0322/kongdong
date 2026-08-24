@@ -19,6 +19,16 @@ import numpy as np
 
 from aubo_workbench.io_utils import atomic_write_json, make_dir
 
+# 延迟导入避免循环依赖
+def _get_cache_config():
+    """延迟获取缓存配置，避免循环导入。"""
+    try:
+        from aubo_workbench.config import COARSE_CACHE_CFG
+        return COARSE_CACHE_CFG
+    except ImportError:
+        # 如果配置未加载，返回默认值
+        return None
+
 
 CACHE_SCHEMA_VERSION = 1
 CURRENT_RUN_CACHE_SCOPE = "current_run_only"
@@ -29,17 +39,22 @@ PERSISTENT_CACHE_SCOPE = "base_frame_persistent"
 class CacheValidationGates:
     """缓存建立和复用使用的质量门。
 
-    tracking/center/plane 门沿用两阶段流程现有门限；验证固定采集三帧，
-    至少两帧有效。法向门用于比较缓存几何与现场观测的物理一致性。
+    tracking/center/plane 门沿用两阶段流程现有门限；验证固定采集5帧（优化后），
+    至少4帧有效。法向门用于比较缓存几何与现场观测的物理一致性。
     """
 
-    validation_frames: int = 3
-    min_valid_frames: int = 2
+    validation_frames: int = 5
+    min_valid_frames: int = 4
     max_tracking_distance_px: float = 70.0
     max_center_offset_px: float = 5.0
     max_center_scatter_p95_px: float = 0.8
     max_plane_rmse_mm: float = 3.5
     max_normal_error_deg: float = 2.0
+    # 新增：自适应匹配距离相关参数
+    adaptive_match_distance: bool = True
+    min_match_distance_mm: float = 10.0
+    max_match_distance_mm: float = 50.0
+    match_distance_ratio: float = 0.25  # 最小孔间距的25%
 
     def __post_init__(self) -> None:
         if int(self.validation_frames) < 1:
@@ -56,6 +71,12 @@ class CacheValidationGates:
             raise ValueError("缓存平面RMSE门限必须大于0")
         if float(self.max_normal_error_deg) <= 0.0:
             raise ValueError("缓存法向门限必须大于0")
+        if float(self.min_match_distance_mm) <= 0.0:
+            raise ValueError("缓存最小匹配距离必须大于0")
+        if float(self.max_match_distance_mm) < float(self.min_match_distance_mm):
+            raise ValueError("缓存最大匹配距离必须不小于最小匹配距离")
+        if float(self.match_distance_ratio) <= 0.0:
+            raise ValueError("缓存匹配距离比例必须大于0")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +87,34 @@ class CacheValidationGates:
             "max_center_scatter_p95_px": float(self.max_center_scatter_p95_px),
             "max_plane_rmse_mm": float(self.max_plane_rmse_mm),
             "max_normal_error_deg": float(self.max_normal_error_deg),
+            "adaptive_match_distance": bool(self.adaptive_match_distance),
+            "min_match_distance_mm": float(self.min_match_distance_mm),
+            "max_match_distance_mm": float(self.max_match_distance_mm),
+            "match_distance_ratio": float(self.match_distance_ratio),
+        }
+
+
+@dataclass(frozen=True)
+class CacheExpiryPolicy:
+    """缓存过期策略配置"""
+
+    max_age_hours: float = 72.0      # 3天后自动失效
+    warn_age_hours: float = 24.0     # 超过1天给警告
+    enabled: bool = True              # 是否启用过期检查
+
+    def __post_init__(self) -> None:
+        if float(self.max_age_hours) <= 0.0:
+            raise ValueError("缓存最大年龄必须大于0")
+        if float(self.warn_age_hours) < 0.0:
+            raise ValueError("缓存警告年龄不能为负")
+        if float(self.warn_age_hours) > float(self.max_age_hours):
+            raise ValueError("缓存警告年龄不能超过最大年龄")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_age_hours": float(self.max_age_hours),
+            "warn_age_hours": float(self.warn_age_hours),
+            "enabled": bool(self.enabled),
         }
 
 
@@ -98,6 +147,11 @@ class CoarseCacheEntry:
     frame_plane_rmse_mm: np.ndarray
     points_camera_mm_by_frame: tuple[np.ndarray, ...]
     created_at: str = ""
+    last_validated_at: str = ""  # 新增：最后验证时间
+    validation_count: int = 0     # 新增：成功验证次数
+    # 缓存来源。正式可复用缓存必须来自340 mm一拍多批量粗定位；
+    # 旧缓存没有该字段时按unknown处理，由运行层拒绝复用。
+    cache_source: str = "unknown"
 
     def __post_init__(self) -> None:
         self.hole_id = int(self.hole_id)
@@ -155,12 +209,17 @@ class CoarseCacheEntry:
                 raise ValueError(f"缓存{name}无效")
         if not self.created_at:
             self.created_at = datetime.now().isoformat(timespec="seconds")
+        if int(self.validation_count) < 0:
+            raise ValueError("缓存验证计数不能为负")
 
     def manifest_dict(self, npz_name: str) -> dict[str, Any]:
         return {
             "hole_id": self.hole_id,
             "npz": npz_name,
             "created_at": self.created_at,
+            "last_validated_at": self.last_validated_at,
+            "validation_count": int(self.validation_count),
+            "cache_source": str(self.cache_source),
             "camera_serial": self.camera_serial,
             "handeye_path": self.handeye_path,
             "intrinsics": dict(self.intrinsics),
@@ -205,6 +264,8 @@ class CacheValidationResult:
     current_point_camera_mm: np.ndarray | None
     current_plane_point_camera_mm: np.ndarray | None
     current_normal_camera: np.ndarray | None
+    freshness_status: str = "unknown"  # 新增：fresh/stale/expired
+    cache_age_hours: float | None = None  # 新增：缓存年龄
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +286,8 @@ class CacheValidationResult:
             "current_point_camera_mm": _list_or_none(self.current_point_camera_mm),
             "current_plane_point_camera_mm": _list_or_none(self.current_plane_point_camera_mm),
             "current_normal_camera": _list_or_none(self.current_normal_camera),
+            "freshness_status": self.freshness_status,
+            "cache_age_hours": self.cache_age_hours,
         }
 
 
@@ -463,23 +526,135 @@ def transform_cached_points_to_camera(
     return tuple(transformed)
 
 
+def compute_adaptive_match_distance(
+    target_points_base_mm: Mapping[int, Any],
+    gates: CacheValidationGates,
+) -> float:
+    """根据孔阵列密度自适应计算匹配距离。
+
+    对于密集孔阵列，使用更小的匹配距离避免误匹配；
+    对于稀疏孔阵列，使用更大的匹配距离容忍微小偏移。
+    """
+    if not gates.adaptive_match_distance or len(target_points_base_mm) < 2:
+        return float(gates.max_match_distance_mm)
+
+    points = np.array([
+        _finite_vector(point, 3, f"hole {hole_id} base point")[:2]
+        for hole_id, point in target_points_base_mm.items()
+    ])
+
+    # 计算所有点对的XY平面距离
+    distances = []
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            dist = float(np.linalg.norm(points[i] - points[j]))
+            distances.append(dist)
+
+    if not distances:
+        return float(gates.max_match_distance_mm)
+
+    min_spacing = float(np.min(distances))
+
+    # 匹配距离 = 最小孔间距 × 比例系数，限制在[min, max]范围内
+    adaptive_distance = min_spacing * float(gates.match_distance_ratio)
+    result = np.clip(
+        adaptive_distance,
+        float(gates.min_match_distance_mm),
+        float(gates.max_match_distance_mm),
+    )
+    return float(result)
+
+
+def check_cache_freshness(
+    entry: CoarseCacheEntry,
+    policy: CacheExpiryPolicy | None = None,
+) -> tuple[str, float]:
+    """检查缓存新鲜度。
+
+    返回: (状态, 年龄小时数)
+    - "fresh": 在警告期内
+    - "stale": 超过警告期但未过期
+    - "expired": 已过期
+    - "unknown": 无法解析时间戳
+    """
+    policy = policy or CacheExpiryPolicy()
+
+    if not policy.enabled:
+        return "fresh", 0.0
+
+    if not entry.created_at:
+        return "unknown", 0.0
+
+    try:
+        created = datetime.fromisoformat(entry.created_at)
+        age_hours = (datetime.now() - created).total_seconds() / 3600.0
+
+        if age_hours > float(policy.max_age_hours):
+            return "expired", age_hours
+        elif age_hours > float(policy.warn_age_hours):
+            return "stale", age_hours
+        else:
+            return "fresh", age_hours
+    except (ValueError, TypeError):
+        return "unknown", 0.0
+
+
+def update_cache_validation_timestamp(
+    entry: CoarseCacheEntry,
+) -> CoarseCacheEntry:
+    """更新缓存的验证时间戳和计数。"""
+    from dataclasses import replace as dataclass_replace
+
+    return dataclass_replace(
+        entry,
+        last_validated_at=datetime.now().isoformat(timespec="seconds"),
+        validation_count=int(entry.validation_count) + 1,
+    )
+
+
 def match_entries_by_base_point(
     target_points_base_mm: Mapping[int, Any],
     entries: Mapping[int, CoarseCacheEntry],
     *,
     max_match_distance_mm: float = 30.0,
     min_match_margin_mm: float = 5.0,
+    gates: CacheValidationGates | None = None,
+    expiry_policy: CacheExpiryPolicy | None = None,
 ) -> tuple[dict[int, CoarseCacheEntry], dict[int, int], dict[int, dict[str, Any]]]:
-    """按 base 坐标 XY 将本次选孔与历史缓存做一对一关联。"""
+    """按 base 坐标 XY 将本次选孔与历史缓存做一对一关联。
 
-    if float(max_match_distance_mm) <= 0.0 or float(min_match_margin_mm) < 0.0:
+    新增：支持自适应匹配距离和过期检查。
+    """
+
+    """按 base 坐标 XY 将本次选孔与历史缓存做一对一关联。
+
+    新增：支持自适应匹配距离和过期检查。
+    """
+    # 使用自适应匹配距离（如果启用）
+    if gates is not None and gates.adaptive_match_distance:
+        effective_match_distance = compute_adaptive_match_distance(target_points_base_mm, gates)
+    else:
+        effective_match_distance = float(max_match_distance_mm)
+
+    if float(effective_match_distance) <= 0.0 or float(min_match_margin_mm) < 0.0:
         raise ValueError("缓存世界坐标匹配门限无效")
+
+    # 过滤过期条目
+    valid_entries: dict[int, CoarseCacheEntry] = {}
+    expired_keys: list[int] = []
+    for key, entry in entries.items():
+        freshness, age_hours = check_cache_freshness(entry, expiry_policy)
+        if freshness == "expired":
+            expired_keys.append(int(key))
+        else:
+            valid_entries[int(key)] = entry
+
     normalized_targets = {
         int(hole_id): _finite_vector(point, 3, f"hole {hole_id} base point")
         for hole_id, point in target_points_base_mm.items()
     }
     normalized_entries = {
-        int(key): entry for key, entry in entries.items()
+        int(key): entry for key, entry in valid_entries.items()
     }
     distances: dict[int, list[tuple[float, int]]] = {}
     for hole_id, point in normalized_targets.items():
@@ -496,7 +671,7 @@ def match_entries_by_base_point(
     order = sorted(
         normalized_targets,
         key=lambda hole_id: (
-            len([item for item in distances[hole_id] if item[0] <= float(max_match_distance_mm)]),
+            len([item for item in distances[hole_id] if item[0] <= float(effective_match_distance)]),
             distances[hole_id][0][0] if distances[hole_id] else math.inf,
             hole_id,
         ),
@@ -508,23 +683,29 @@ def match_entries_by_base_point(
     for hole_id in order:
         candidates = distances[hole_id]
         if not candidates:
-            audit[hole_id] = {"matched": False, "reason": "no_persistent_entries"}
+            audit[hole_id] = {
+                "matched": False,
+                "reason": "no_persistent_entries",
+                "adaptive_match_distance_mm": effective_match_distance,
+            }
             continue
         nearest_distance, nearest_key = candidates[0]
         available = [item for item in candidates if item[1] not in used]
-        in_range = [item for item in available if item[0] <= float(max_match_distance_mm)]
+        in_range = [item for item in available if item[0] <= float(effective_match_distance)]
         if not available:
             audit[hole_id] = {
                 "matched": False, "reason": "persistent_entry_already_matched",
                 "nearest_distance_xy_mm": nearest_distance,
+                "adaptive_match_distance_mm": effective_match_distance,
             }
             continue
         nearest_distance, nearest_key = available[0]
-        if nearest_distance > float(max_match_distance_mm):
+        if nearest_distance > float(effective_match_distance):
             audit[hole_id] = {
                 "matched": False, "reason": "world_distance",
                 "nearest_distance_xy_mm": nearest_distance,
-                "max_match_distance_xy_mm": float(max_match_distance_mm),
+                "max_match_distance_xy_mm": float(effective_match_distance),
+                "adaptive_match_distance_mm": effective_match_distance,
             }
             continue
         if len(in_range) > 1 and in_range[1][0] - nearest_distance < float(min_match_margin_mm):
@@ -533,19 +714,35 @@ def match_entries_by_base_point(
                 "nearest_distance_xy_mm": nearest_distance,
                 "second_distance_xy_mm": in_range[1][0],
                 "min_match_margin_mm": float(min_match_margin_mm),
+                "adaptive_match_distance_mm": effective_match_distance,
             }
             continue
         selected_distance, selected_key = available[0]
+        selected_entry = normalized_entries[int(selected_key)]
+        freshness, age_hours = check_cache_freshness(selected_entry, expiry_policy)
         used.add(int(selected_key))
-        matched[hole_id] = normalized_entries[int(selected_key)]
+        matched[hole_id] = selected_entry
         source_ids[hole_id] = int(selected_key)
         audit[hole_id] = {
             "matched": True,
             "persistent_hole_id": int(selected_key),
             "distance_xy_mm": float(selected_distance),
-            "max_match_distance_xy_mm": float(max_match_distance_mm),
+            "max_match_distance_xy_mm": float(effective_match_distance),
+            "adaptive_match_distance_mm": effective_match_distance,
             "min_match_margin_mm": float(min_match_margin_mm),
+            "cache_freshness": freshness,
+            "cache_age_hours": age_hours,
         }
+
+    # 记录被过滤的过期条目
+    if expired_keys:
+        for key in expired_keys:
+            audit[-(int(key) + 1000)] = {  # 使用负数ID避免冲突
+                "matched": False,
+                "reason": "cache_expired",
+                "persistent_hole_id": int(key),
+            }
+
     return matched, source_ids, audit
 
 
@@ -556,6 +753,7 @@ def validate_cache_entry(
     current_T_base_camera: np.ndarray,
     intrinsics: Any,
     gates: CacheValidationGates,
+    expiry_policy: CacheExpiryPolicy | None = None,
 ) -> CacheValidationResult:
     """用当前340mm少量深度观测验证缓存。
 
@@ -563,6 +761,8 @@ def validate_cache_entry(
     plane_rmse_mm、tracking_distance_px 和 error；surface_plane_point_camera_mm
     可选，缺失时退回孔中心平面交点。
     """
+    # 检查缓存新鲜度
+    freshness_status, cache_age_hours = check_cache_freshness(entry, expiry_policy)
 
     total = len(measurements)
     valid: list[Mapping[str, Any]] = []
@@ -603,14 +803,14 @@ def validate_cache_entry(
     if total != int(gates.validation_frames):
         return _rejected(
             f"validation_frames:{total}/{int(gates.validation_frames)}",
-            total, valid, tracking_values,
+            total, valid, tracking_values, freshness_status, cache_age_hours,
         )
     if len(valid) < int(gates.min_valid_frames):
         reason = f"valid_frames:{len(valid)}/{int(gates.min_valid_frames)}"
         if rejected_reasons:
             reason += ";" + ";".join(sorted(set(rejected_reasons)))
         return _rejected(
-            reason, total, valid, tracking_values,
+            reason, total, valid, tracking_values, freshness_status, cache_age_hours,
         )
 
     centers = np.asarray([item["center_px"] for item in valid], dtype=np.float64)
@@ -647,8 +847,8 @@ def validate_cache_entry(
             normal_base = -normal_base
         current_normals_base.append(normal_base)
         normal_errors.append(_angle_deg(normal_base, entry.normal_base))
-    current_normal_base = _fuse_normals(current_normals_base)
-    current_normal_camera = _fuse_normals([item["normal_camera"] for item in valid])
+    current_normal_base = _fuse_normals_robust(current_normals_base)
+    current_normal_camera = _fuse_normals_robust([item["normal_camera"] for item in valid])
     max_normal_error = max(normal_errors)
     point_delta = float(np.linalg.norm(current_point_base - entry.point_base_mm))
 
@@ -669,6 +869,11 @@ def validate_cache_entry(
         failure_reasons.append("plane_quality")
     if max_normal_error > float(gates.max_normal_error_deg):
         failure_reasons.append("normal_error")
+
+    # 过期缓存自动拒绝
+    if freshness_status == "expired":
+        failure_reasons.append("cache_expired")
+
     return CacheValidationResult(
         accepted=not failure_reasons,
         reason="ok" if not failure_reasons else ";".join(failure_reasons),
@@ -689,6 +894,8 @@ def validate_cache_entry(
         ),
         current_plane_point_camera_mm=np.median(np.asarray(surface_points_camera), axis=0),
         current_normal_camera=current_normal_camera,
+        freshness_status=freshness_status,
+        cache_age_hours=cache_age_hours,
     )
 
 
@@ -783,6 +990,9 @@ def _entry_from_manifest(raw: Mapping[str, Any], npz_path: Path) -> CoarseCacheE
         frame_plane_rmse_mm=frame_rmse,
         points_camera_mm_by_frame=points_by_frame,
         created_at=str(raw.get("created_at", "")),
+        last_validated_at=str(raw.get("last_validated_at", "")),
+        validation_count=int(raw.get("validation_count", 0)),
+        cache_source=str(raw.get("cache_source", "unknown")),
     )
 
 
@@ -791,6 +1001,8 @@ def _rejected(
     total: int,
     valid: Sequence[Mapping[str, Any]],
     tracking_values: Sequence[float],
+    freshness_status: str = "unknown",
+    cache_age_hours: float | None = None,
 ) -> CacheValidationResult:
     return CacheValidationResult(
         accepted=False,
@@ -810,7 +1022,42 @@ def _rejected(
         current_point_camera_mm=None,
         current_plane_point_camera_mm=None,
         current_normal_camera=None,
+        freshness_status=freshness_status,
+        cache_age_hours=cache_age_hours,
     )
+
+
+def _fuse_normals_robust(normals: Sequence[Any]) -> np.ndarray:
+    """基于主成分的法向融合，对异常值更鲁棒。"""
+    if not normals:
+        raise ValueError("法向融合至少需要一个输入")
+
+    reference = _unit(normals[0], "normal")
+    aligned = []
+    for n in normals:
+        unit_n = _unit(n, "normal")
+        # 确保所有法向方向一致（同半球）
+        aligned.append(unit_n if float(unit_n @ reference) >= 0.0 else -unit_n)
+
+    aligned_array = np.array(aligned, dtype=np.float64)
+
+    # 如果只有1-2个法向，直接用中位数
+    if len(aligned) <= 2:
+        fused = np.median(aligned_array, axis=0)
+        return _unit(fused, "fused normal")
+
+    # 使用PCA提取主方向（更鲁棒）
+    # 计算协方差矩阵的最大特征向量
+    cov_matrix = aligned_array.T @ aligned_array
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    # 最大特征值对应的特征向量
+    principal_direction = eigenvectors[:, -1]
+
+    # 确保方向与参考一致
+    if float(principal_direction @ reference) < 0.0:
+        principal_direction = -principal_direction
+
+    return _unit(principal_direction, "fused normal")
 
 
 def _finite_matrix(value: Any, name: str) -> np.ndarray:

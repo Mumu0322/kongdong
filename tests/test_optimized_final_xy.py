@@ -111,7 +111,7 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertLess(float(info["local_plane_point_camera_mm"][2]), 510.0)
         self.assertGreaterEqual(info["surface_points_selected"], 80)
 
-    def test_cad_default_surface_policy_remains_legacy(self):
+    def test_legacy_surface_policy_remains_legacy(self):
         width = height = 120
         intrinsics = CameraIntrinsics(width, height, 100.0, 100.0, 60.0, 60.0, ())
         yy, xx = np.mgrid[:height, :width]

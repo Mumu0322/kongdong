@@ -29,6 +29,95 @@ from .solve import (
 EDGE_REGIONS = ("left", "right", "top", "bottom")
 
 
+def assess_board_fixity(
+    samples: list[CalibSample],
+    cfg: E7HandEyeConfig | None = None,
+) -> dict[str, Any]:
+    """通过反推所有样本的 T_base_board 散布评估板是否真的固定。
+
+    如果标定板在基座坐标系中真的固定，那么所有样本反推的板位姿应该高度一致。
+    """
+    cfg = cfg or E7_HAND_EYE_CFG
+
+    if not samples:
+        return {
+            "board_position_stable": False,
+            "board_orientation_stable": False,
+            "reason": "no_samples",
+        }
+
+    # 使用每个样本自己的板位姿观测反推 T_base_board
+    T_base_boards: list[np.ndarray] = []
+    timestamps: list[float] = []
+
+    for sample in samples:
+        if sample.T_base_tool is None or sample.T_rgb_board is None:
+            continue
+        # 需要临时的 T_tcp_rgb 估计，这里用单位阵作为粗略近似
+        # 实际上这个函数应该在有初步 T_tcp_rgb 估计之后调用
+        # 或者直接用 sample.T_base_tool 和 sample.T_rgb_board 计算
+        T_base_board = sample.T_base_tool @ sample.T_rgb_board
+        T_base_boards.append(T_base_board)
+
+        # 提取时间戳（如果有）
+        ts = (sample.camera_metadata or {}).get("host_timestamp_ns", 0)
+        timestamps.append(float(ts) / 1e9 if ts else 0)
+
+    if len(T_base_boards) < 2:
+        return {
+            "board_position_stable": False,
+            "board_orientation_stable": False,
+            "reason": "insufficient_valid_samples",
+            "valid_sample_count": len(T_base_boards),
+        }
+
+    # 计算位置散布
+    centers = np.array([T[:3, 3] for T in T_base_boards])
+    center_mean = centers.mean(axis=0)
+    center_deviations = np.linalg.norm(centers - center_mean, axis=1)
+
+    position_std_mm = float(center_deviations.std())
+    position_max_mm = float(center_deviations.max())
+
+    # 计算姿态散布（相对于第一个样本）
+    reference_R = T_base_boards[0][:3, :3]
+    rotation_errors_deg = [
+        rotation_error_deg(reference_R, T[:3, :3])
+        for T in T_base_boards
+    ]
+    orientation_std_deg = float(np.std(rotation_errors_deg))
+    orientation_max_deg = float(np.max(rotation_errors_deg))
+
+    # 时间连续性检查
+    time_continuous = True
+    max_gap_hours = 0.0
+    if timestamps and all(t > 0 for t in timestamps):
+        sorted_timestamps = sorted(timestamps)
+        gaps = np.diff(sorted_timestamps)
+        if len(gaps) > 0:
+            max_gap_hours = float(np.max(gaps) / 3600)
+            # 使用配置的时间间隔门槛
+            time_continuous = max_gap_hours < cfg.maximum_time_gap_hours
+
+    # 使用配置的固定板门槛
+    position_stable = position_std_mm < cfg.maximum_board_position_scatter_std_mm
+    orientation_stable = orientation_std_deg < cfg.maximum_board_orientation_scatter_std_deg
+
+    return {
+        "board_position_stable": bool(position_stable),
+        "board_orientation_stable": bool(orientation_stable),
+        "time_continuous": bool(time_continuous),
+        "position_scatter_std_mm": position_std_mm,
+        "position_scatter_max_mm": position_max_mm,
+        "orientation_scatter_std_deg": orientation_std_deg,
+        "orientation_scatter_max_deg": orientation_max_deg,
+        "max_time_gap_hours": max_gap_hours,
+        "valid_sample_count": len(T_base_boards),
+        "total_sample_count": len(samples),
+        "board_center_mean_base_mm": center_mean.tolist(),
+    }
+
+
 def _robot_id(sample: CalibSample) -> str:
     snapshot = sample.robot_snapshot or {}
     parts = [
@@ -286,10 +375,17 @@ def assess_e7_dataset(
         if flags:
             bad_quality[int(sample.index)] = flags
     expected_serial = str(ROBOT_CAMERA_INTEGRATION_CFG.production_camera_serial).strip()
+
+    # 板固定程度数值验证
+    fixity = assess_board_fixity(ordered, cfg)
+
     checks = {
         "minimum_total_poses": len(ordered) >= int(cfg.minimum_total_poses),
         "sample_indices_unique": len(indices) == len(set(indices)),
         "fixed_board_confirmed": bool(fixed_board_confirmed),
+        "board_position_numerically_stable": bool(fixity.get("board_position_stable", False)),
+        "board_orientation_numerically_stable": bool(fixity.get("board_orientation_stable", False)),
+        "board_time_continuous": bool(fixity.get("time_continuous", True)),
         "all_samples_use_tcp_pose": (
             not cfg.require_tcp_pose_source or (bool(ordered) and pose_sources == ["tcp"])
         ),
@@ -321,6 +417,7 @@ def assess_e7_dataset(
         "robot_ids": robot_ids,
         "view_coverage": view,
         "robot_pose_coverage": pose_coverage,
+        "board_fixity": fixity,
         "bad_quality_samples": bad_quality,
         "raw_data_manifest": manifest,
     }

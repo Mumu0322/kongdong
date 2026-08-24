@@ -87,8 +87,7 @@ def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
 def jsonable(value: Any) -> Any:
     """把 numpy 标量/数组、Path、带 to_dict 的对象递归转成可 json 序列化的值。
 
-    原来 ``run_yolo_eye_in_hand_optimized``、``record_tcp_absolute_xy_model`` 和
-    ``cad_registration`` 各有一份，此处取三者的并集作为唯一实现。
+    统一处理定位、标定和报告模块中的常见数据类型。
     """
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return jsonable(value.to_dict())

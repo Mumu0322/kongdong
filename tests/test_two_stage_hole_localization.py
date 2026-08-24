@@ -262,6 +262,27 @@ class TwoStageGeometryTests(unittest.TestCase):
         sleep.assert_called_once_with(0.5)
         self.assertTrue(np.allclose(actual, second))
 
+    def test_coarse_recapture_settle_uses_rgbd_pipeline_and_discards_frames(self) -> None:
+        settled = np.eye(4)
+        with patch.object(
+            module,
+            "_wait_robot_steady_before_initial_capture",
+            return_value=settled,
+        ) as wait_steady, patch.object(
+            module,
+            "get_aligned_frame_bundle",
+            return_value=object(),
+        ) as get_frame:
+            actual, discarded = module._settle_and_discard_coarse_recapture_frames(
+                object(), "rgbd-pipeline", "align", "chain",
+                settle_delay_s=0.3, discard_frames=3,
+            )
+        wait_steady.assert_called_once()
+        self.assertEqual(get_frame.call_count, 3)
+        self.assertEqual(get_frame.call_args.args[:3], ("rgbd-pipeline", "align", "chain"))
+        self.assertEqual(discarded, 3)
+        self.assertTrue(np.allclose(actual, settled))
+
     def test_timing_recorder_persists_completed_and_failed_events(self) -> None:
         report: dict[str, object] = {}
         output = StringIO()
@@ -391,6 +412,395 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertTrue(np.allclose(group_center, [0.0, 0.0, 1000.0]))
         self.assertAlmostEqual(group_plane.rmse_mm, 1.0)
 
+    def test_coarse_burst_reanchors_after_initial_projection(self) -> None:
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            xyz_map_mm=np.zeros((720, 1280, 3), dtype=np.float32),
+            intrinsics=self.intrinsics,
+            host_timestamp_ns=123,
+        )
+        plane = module.PlaneEstimate(
+            point_camera_mm=np.array([0.0, 0.0, 340.0]),
+            normal_camera=np.array([0.0, 0.0, 1.0]),
+            rmse_mm=1.0,
+            ring_points=100,
+            surface_model="ring",
+        )
+        detections = [
+            {"box": [620.0, 340.0, 660.0, 380.0], "center": [655.0, 360.0], "class_id": 0},
+            {"box": [621.0, 340.0, 661.0, 380.0], "center": [656.0, 360.0], "class_id": 0},
+            {"box": [620.5, 340.0, 660.5, 380.0], "center": [655.5, 360.0], "class_id": 0},
+        ]
+        cfg = module.TwoStageConfig(
+            coarse_frames=3,
+            min_coarse_valid=3,
+            coarse_settle_frames=0,
+            coarse_max_attempt_multiplier=1,
+            max_coarse_center_scatter_p95_px=0.8,
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_aligned_frame_bundle", return_value=bundle), \
+                patch.object(module, "detect", side_effect=[[item] for item in detections]), \
+                patch.object(module, "hole_camera_point", return_value=(np.array([0.0, 0.0, 340.0]), {})), \
+                patch.object(module, "_plane_estimate_from_info", return_value=plane), \
+                patch.object(module.cv2, "imwrite", return_value=True):
+            observations, _ = module._capture_coarse_burst(
+                pipeline=object(), align=object(), chain=object(), model=object(),
+                confidence=0.5, chosen={"class_id": 0}, cfg=cfg,
+                run_dir=Path(directory), name="coarse",
+                initial_anchor_px=np.array([640.0, 360.0]),
+                tracking_tolerance_px=70.0,
+                lock_anchor=False,
+                include_points=True,
+            )
+
+        self.assertEqual(len(observations), 3)
+        self.assertAlmostEqual(float(observations[0].tracking_distance_px), 15.0)
+        self.assertAlmostEqual(float(observations[1].tracking_distance_px), 1.0)
+        self.assertAlmostEqual(float(observations[2].tracking_distance_px), 0.5)
+
+    def test_batch_coarse_captures_all_holes_from_each_rgbd_frame(self) -> None:
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        xyz = np.zeros((720, 1280, 3), dtype=np.float32)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            xyz_map_mm=xyz,
+            intrinsics=self.intrinsics,
+            host_timestamp_ns=123,
+        )
+        selected = [
+            {
+                "hole_id": 1,
+                "initial_center_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "initial_detection": {"class_id": 0},
+            },
+            {
+                "hole_id": 2,
+                "initial_center_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "initial_detection": {"class_id": 0},
+            },
+        ]
+        detections = [
+            {"box": [620.0, 340.0, 660.0, 380.0], "center": [640.0, 360.0], "class_id": 0},
+            {"box": [700.0, 340.0, 740.0, 380.0], "center": [720.0, 360.0], "class_id": 0},
+        ]
+        plane_info = {
+            "plane_point_camera_mm": [0.0, 0.0, 1000.0],
+            "plane_normal_camera": [0.0, 0.0, 1.0],
+            "plane_rmse_mm": 1.0,
+            "ring_points": 30,
+            "local_plane_point_camera_mm": [0.0, 0.0, 1000.0],
+            "points_camera_mm": [[0.0, 0.0, 1000.0], [1.0, 0.0, 1000.0]],
+            "surface_model": "front_surface_outer_ring_v2",
+            "surface_selection_policy": module.COARSE_SURFACE_SELECTION_POLICY,
+            "front_surface_z_mm": 1000.0,
+            "ring_points_raw": 40,
+            "surface_points_selected": 30,
+        }
+        cfg = module.TwoStageConfig(
+            batch_coarse_frames=3,
+            batch_coarse_min_valid=2,
+            batch_coarse_min_holes_per_frame=2,
+            batch_coarse_settle_discard_frames=2,
+            multi_coarse_tracking_tolerance_px=80.0,
+        )
+        handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_aligned_frame_bundle", return_value=bundle) as get_frame, \
+                patch.object(module, "detect", return_value=detections), \
+                patch.object(module, "hole_camera_point", return_value=(np.array([0.0, 0.0, 1000.0]), plane_info)), \
+                patch.object(module.cv2, "imwrite", return_value=True), \
+                patch.object(module, "_save_coarse_pointcloud_image", return_value=Path(directory) / "cloud.png"):
+            result = module._batch_coarse_localization_at_340mm(
+                selected, np.eye(4, dtype=np.float64), handeye,
+                object(), object(), object(), object(), 0.5, cfg,
+                self.intrinsics, Path(directory), module.TimingRecorder(), [],
+            )
+            archive_created = (
+                Path(directory) / "batch_coarse_340_all_holes_pointcloud.npz"
+            ).is_file()
+
+        self.assertEqual(get_frame.call_count, 5)
+        self.assertTrue(result[1]["success"])
+        self.assertTrue(result[2]["success"])
+        self.assertEqual(result[1]["valid_frames"], 3)
+        self.assertEqual(result[2]["valid_frames"], 3)
+        self.assertTrue(archive_created)
+        self.assertIn("_batch_metadata", result)
+        self.assertEqual(len(result["_batch_metadata"]["frame_records"]), 3)
+        self.assertEqual(result["_batch_metadata"]["discarded_frame_count"], 2)
+
+    def test_batch_coarse_per_hole_fusion_keeps_valid_shared_cache_hole(self) -> None:
+        """A missing peer must not discard another hole's shared-pose frames."""
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            xyz_map_mm=np.zeros((720, 1280, 3), dtype=np.float32),
+            intrinsics=self.intrinsics,
+            host_timestamp_ns=123,
+        )
+        selected = [
+            {
+                "hole_id": 1,
+                "initial_center_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "initial_detection": {"class_id": 0},
+            },
+            {
+                "hole_id": 2,
+                "initial_center_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "initial_detection": {"class_id": 0},
+            },
+        ]
+        plane_info = {
+            "plane_point_camera_mm": [0.0, 0.0, 1000.0],
+            "plane_normal_camera": [0.0, 0.0, 1.0],
+            "plane_rmse_mm": 1.0,
+            "ring_points": 30,
+            "local_plane_point_camera_mm": [0.0, 0.0, 1000.0],
+            "points_camera_mm": [[0.0, 0.0, 1000.0], [1.0, 0.0, 1000.0]],
+            "surface_model": "front_surface_outer_ring_v2",
+            "surface_selection_policy": module.COARSE_SURFACE_SELECTION_POLICY,
+            "front_surface_z_mm": 1000.0,
+            "ring_points_raw": 40,
+            "surface_points_selected": 30,
+        }
+        first_hole = {
+            "box": [620.0, 340.0, 660.0, 380.0],
+            "center": [640.0, 360.0],
+            "class_id": 0,
+        }
+        cfg = module.TwoStageConfig(
+            batch_coarse_frames=3,
+            batch_coarse_min_valid=2,
+            # Shared cache validation uses this setting so each hole can be
+            # fused from its own valid observations at the common pose.
+            batch_coarse_min_holes_per_frame=1,
+            batch_coarse_settle_discard_frames=0,
+            multi_coarse_tracking_tolerance_px=80.0,
+        )
+        handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_aligned_frame_bundle", return_value=bundle), \
+                patch.object(module, "detect", side_effect=[[first_hole], [first_hole], []]), \
+                patch.object(
+                    module, "hole_camera_point",
+                    return_value=(np.array([0.0, 0.0, 1000.0]), plane_info),
+                ), \
+                patch.object(module.cv2, "imwrite", return_value=True), \
+                patch.object(module, "_save_coarse_pointcloud_image", return_value=None):
+            result = module._batch_coarse_localization_at_340mm(
+                selected, np.eye(4, dtype=np.float64), handeye,
+                object(), object(), object(), object(), 0.5, cfg,
+                self.intrinsics, Path(directory), module.TimingRecorder(), [],
+            )
+
+        self.assertTrue(result[1]["success"])
+        self.assertEqual(result[1]["valid_frames"], 2)
+        self.assertFalse(result[2]["success"])
+        self.assertEqual(result[2]["valid_frames"], 0)
+        self.assertEqual(result["_batch_metadata"]["required_holes_per_frame"], 1)
+
+    def test_batch_anchor_correction_removes_systematic_projection_error(self) -> None:
+        projected = {
+            "1": np.array([500.0, 250.0]),
+            "2": np.array([650.0, 250.0]),
+            "3": np.array([500.0, 450.0]),
+            "4": np.array([650.0, 450.0]),
+        }
+        detections = [
+            {"center": [517.0, 242.0], "box": [500.0, 225.0, 534.0, 259.0]},
+            {"center": [661.0, 238.0], "box": [644.0, 221.0, 678.0, 255.0]},
+            {"center": [517.0, 434.0], "box": [500.0, 417.0, 534.0, 451.0]},
+            {"center": [661.0, 430.0], "box": [644.0, 413.0, 678.0, 447.0]},
+        ]
+
+        corrected, info = module._fit_batch_projected_anchor_correction(
+            detections, projected, max_distance_px=70.0, min_matches=4,
+        )
+
+        self.assertTrue(info["enabled"])
+        self.assertEqual(info["match_count"], 4)
+        np.testing.assert_allclose(corrected["1"], [517.0, 242.0], atol=1e-6)
+        np.testing.assert_allclose(corrected["4"], [661.0, 430.0], atol=1e-6)
+        self.assertLess(info["residual_p95_px"], 1e-6)
+
+    def test_comparison_diagnostics_excludes_wait_and_preserves_path(self) -> None:
+        result = {
+            "status": "completed",
+            "coarse_source": "batch_coarse_localization",
+            "batch_coarse_requested": True,
+            "coarse_cache_event": {"cache_reused": False, "cache_validation_failed": False},
+            "initial_center_base_mm": [0.0, 0.0, 0.0],
+            "coarse_center_base_mm": [3.0, 4.0, 0.0],
+            "hole_center_base_naive_mm": [3.0, 4.0, 2.0],
+            "hole_center_base_mm": [3.0, 4.0, 2.1],
+            "coarse_normal_toward_camera_base": [0.0, 0.0, 1.0],
+            "plane_normal_toward_camera_base": [0.0, 0.0, 1.0],
+            "estimated_height_mm": 260.2,
+            "timing": {"events": [
+                {"name": "hole_01/navigate_to_coarse", "elapsed_s": 2.0},
+                {"name": "hole_01/coarse_capture_1", "elapsed_s": 1.0},
+                {"name": "hole_01/coarse_settle_buffer", "elapsed_s": 9.0},
+                {"name": "hole_01/wait_next_hole_confirmation", "elapsed_s": 20.0},
+            ]},
+        }
+
+        diagnostics = module._build_comparison_hole_diagnostics(result)
+
+        self.assertTrue(diagnostics["coarse_path"]["batch_used"])
+        self.assertEqual(diagnostics["geometry_change"]["initial_to_coarse"]["norm_mm"], 5.0)
+        self.assertAlmostEqual(
+            diagnostics["motion_quality"]["effective_timing"]["effective_total_s"], 3.0,
+        )
+        self.assertAlmostEqual(
+            diagnostics["motion_quality"]["effective_timing"]["excluded_wait_s"], 29.0,
+        )
+
+    def test_batch_coarse_fusion_rejects_unstable_centers(self) -> None:
+        cfg = module.TwoStageConfig(min_coarse_valid=3)
+        observations = [
+            module.Observation(
+                "batch_coarse",
+                index,
+                np.asarray(center, dtype=np.float64),
+                plane=module.PlaneEstimate(
+                    point_camera_mm=np.array([0.0, 0.0, 340.0]),
+                    normal_camera=np.array([0.0, 0.0, 1.0]),
+                    rmse_mm=1.0,
+                    ring_points=100,
+                ),
+                tracking_distance_px=float(distance),
+            )
+            for index, (center, distance) in enumerate(
+                [([640.0, 360.0], 1.0), ([650.0, 360.0], 2.0), ([660.0, 360.0], 3.0)]
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "中心稳定性失败"):
+            module._fuse_coarse(
+                observations,
+                cfg,
+                min_valid_frames=3,
+                max_center_scatter_p95_px=0.8,
+                max_tracking_distance_p95_px=12.0,
+            )
+
+    def test_sequential_coarse_geometry_does_not_accept_unstable_capture(self) -> None:
+        cfg = module.TwoStageConfig(min_coarse_valid=3)
+        observations = [
+            module.Observation(
+                "coarse",
+                index,
+                np.asarray([640.0 + index * 3.0, 360.0], dtype=np.float64),
+                plane=module.PlaneEstimate(
+                    point_camera_mm=np.array([0.0, 0.0, 340.0]),
+                    normal_camera=np.array([0.0, 0.0, 1.0]),
+                    rmse_mm=1.0,
+                    ring_points=100,
+                ),
+                tracking_distance_px=float(index + 1),
+            )
+            for index in range(3)
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "中心稳定性失败"):
+            module._apply_coarse_geometry_to_hole(
+                {"hole_id": 1}, observations, np.eye(4, dtype=np.float64), cfg,
+            )
+
+    def test_batch_success_skips_per_hole_340_capture_and_moves_to_fine_pose(self) -> None:
+        class StopAfterBatchFine(RuntimeError):
+            pass
+
+        selected = []
+        for hole_id, x_mm in ((1, 0.0), (2, 100.0)):
+            selected.append({
+                "hole_id": hole_id,
+                "initial_center_base_mm": np.array([x_mm, 0.0, 0.0]),
+                "initial_plane_normal_base": np.array([0.0, 0.0, 1.0]),
+                "initial_detection": {"class_id": 0},
+            })
+        batch_result = {
+            "success": True,
+            "center_px": [640.0, 360.0],
+            "center_camera_mm": [0.0, 0.0, 340.0],
+            "center_base_mm": [0.0, 0.0, 0.0],
+            "plane_point_camera_mm": [0.0, 0.0, 340.0],
+            "plane_point_base_mm": [0.0, 0.0, 0.0],
+            "normal_camera": [0.0, 0.0, -1.0],
+            "normal_base": [0.0, 0.0, 1.0],
+            "plane_rmse_mm": 1.0,
+            "valid_frames": 15,
+            "total_frames": 15,
+            "center_scatter_p95_px": 0.2,
+            "coarse_captures": [{"capture_index": 0, "mode": "batch_coarse_at_340mm"}],
+            "pointcloud_image_path": "cloud.png",
+            "batch_pointcloud_archive_path": "batch.npz",
+        }
+        batch_results = {
+            1: dict(batch_result),
+            2: {**batch_result, "center_base_mm": [100.0, 0.0, 0.0]},
+            "_batch_metadata": {},
+        }
+        plan = {
+            "hole_order": [1, 2],
+            "target_tcp_pose_m_rad": [0.0] * 6,
+            "group_point_base_mm": np.zeros(3),
+            "group_normal_toward_camera_base": np.array([0.0, 0.0, 1.0]),
+            "projected_holes_px": {1: np.array([640.0, 360.0]), 2: np.array([720.0, 360.0])},
+            "group_bbox_px": [640.0, 360.0, 720.0, 360.0],
+            "group_center_px": np.array([680.0, 360.0]),
+            "view_margin_px": 50.0,
+        }
+        args = SimpleNamespace(
+            execute=True,
+            reuse_coarse_cache=False,
+            reuse_persistent_coarse_cache=False,
+            confidence=0.5,
+            speed_m_s=0.08,
+            acc_m_s2=0.25,
+            transit_speed_m_s=0.15,
+            transit_acc_m_s2=0.45,
+            approach_speed_m_s=0.12,
+            approach_acc_m_s2=0.35,
+            move_final_xy=False,
+            tcp_xy_offset_mm=None,
+            final_target_mode="normal",
+            handeye="handeye.json",
+        )
+        cfg = module.TwoStageConfig(
+            batch_coarse_localization=True,
+            batch_coarse_frames=15,
+            batch_coarse_min_valid=10,
+        )
+        report = {"stages": {}, "camera": {}}
+        runtime = {"rgbd_pipeline": object(), "align": object(), "chain": object()}
+        handeye = SimpleNamespace(
+            T_tcp_rgb_camera=np.eye(4, dtype=np.float64),
+            validated_for_motion=True,
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "_plan_batch_coarse_group_pose", return_value=(np.eye(4), plan)), \
+                patch.object(module, "_confirm_and_move_line", side_effect=lambda _label, _current, target, *_args, **_kwargs: target), \
+                patch.object(module, "_batch_coarse_localization_at_340mm", return_value=batch_results), \
+                patch.object(module, "_plan_hole_tcp_pose_fixed_rz", return_value=(np.eye(4), {})), \
+                patch.object(module, "_move_to_fine_pose", return_value=np.eye(4)) as move_fine, \
+                patch.object(module, "_require_safe_snapshot", return_value=({}, np.eye(4))), \
+                patch.object(module, "camera_height_to_plane_mm", return_value=260.0), \
+                patch.object(module, "_project_base_point_to_pixel", return_value=np.array([640.0, 360.0])), \
+                patch.object(module, "_capture_coarse_burst") as capture_coarse, \
+                patch.object(module, "_capture_fine_with_recovery", side_effect=StopAfterBatchFine("reached fine capture")):
+            with self.assertRaisesRegex(StopAfterBatchFine, "reached fine capture"):
+                module._run_sequential_hole_workflow(
+                    args, handeye, object(), cfg, Path(directory), report,
+                    module.TimingRecorder(), [], runtime, object(), object(),
+                    np.eye(4), selected, self.intrinsics,
+                )
+
+        capture_coarse.assert_not_called()
+        move_fine.assert_called_once()
+
     def test_diameter_categories_cover_all_supported_holes(self) -> None:
         for diameter in (64.6, 70.2, 74.7):
             self.assertEqual(min(module.HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter)), round(diameter / 5.0) * 5.0)
@@ -415,6 +825,8 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(parser.parse_args([]).transit_acc_m_s2, 0.45)
         self.assertAlmostEqual(parser.parse_args([]).approach_speed_m_s, 0.12)
         self.assertAlmostEqual(parser.parse_args([]).approach_acc_m_s2, 0.35)
+        self.assertEqual(parser.parse_args([]).coarse_recapture_settle_discard_frames, 10)
+        self.assertEqual(parser.parse_args([]).coarse_max_corrections, 2)
         self.assertEqual(parser.parse_args([]).fine_settle_discard_frames, 10)
         self.assertEqual(parser.parse_args([]).fine_retries, 2)
 

@@ -9,7 +9,6 @@ import cv2
 import numpy as np
 
 from aubo_workbench.camera import CameraIntrinsics as RgbIntrinsics
-from aubo_workbench.cad_registration import CameraIntrinsics as CadIntrinsics
 from aubo_workbench.fitting import fit_plane, fit_sphere
 from aubo_workbench.geometry import (
     angle_between_deg,
@@ -77,11 +76,6 @@ class DistortionCoeffsTests(unittest.TestCase):
         coeffs = distortion_coeffs(_rgb_intrinsics((0.1, -0.2, 0.0, 0.0, 0.05)))
         np.testing.assert_allclose(coeffs, [0.1, -0.2, 0.0, 0.0, 0.05])
 
-    def test_reads_cad_intrinsics_dist_coeffs_field(self):
-        cad = CadIntrinsics(1280, 720, 1000.0, 1000.0, 640.0, 360.0,
-                            dist_coeffs=np.array([0.3, 0.0, 0.0, 0.0, 0.0]))
-        np.testing.assert_allclose(distortion_coeffs(cad), [0.3, 0.0, 0.0, 0.0, 0.0])
-
     def test_empty_distortion_means_no_distortion(self):
         self.assertEqual(distortion_coeffs(_rgb_intrinsics(())).size, 0)
 
@@ -107,8 +101,7 @@ class DistortionCoeffsTests(unittest.TestCase):
             undistort_pixels(intr, np.asarray([[640.0, 360.0]]))
 
     def test_swapped_arguments_fail_loudly(self):
-        # cad_registration.undistort_pixels 的参数顺序与本模块相反。
-        # 传错顺序必须立刻抛错，而不是把畸变静默当成 0 —— 后者会让结果
+        # 传错参数顺序必须立刻抛错，而不是把畸变静默当成 0 —— 后者会让结果
         # 偏移零点几毫米却看不出任何异常。
         with self.assertRaises((TypeError, AttributeError)):
             undistort_pixels(np.asarray([[640.0, 360.0]]), _rgb_intrinsics((0.2, 0.0, 0.0, 0.0, 0.0)))
