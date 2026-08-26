@@ -48,7 +48,6 @@ from aubo_workbench.motion_control import (
 )
 from aubo_workbench.motion_guards import (
     angular_delta_rad,
-    pose_error,
     validate_robot_ready,
     wait_for_target,
 )
@@ -212,7 +211,6 @@ def _finite(values: Iterable[Any]) -> np.ndarray:
 
 # 兼容原有下划线命名的模块内调用点；实现已统一到 aubo_workbench.motion_guards。
 _angular_delta_rad = angular_delta_rad
-_pose_error = pose_error
 
 
 def scalar_statistics(values: Iterable[Any]) -> dict[str, Any]:

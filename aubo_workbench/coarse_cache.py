@@ -19,16 +19,6 @@ import numpy as np
 
 from aubo_workbench.io_utils import atomic_write_json, make_dir
 
-# 延迟导入避免循环依赖
-def _get_cache_config():
-    """延迟获取缓存配置，避免循环导入。"""
-    try:
-        from aubo_workbench.config import COARSE_CACHE_CFG
-        return COARSE_CACHE_CFG
-    except ImportError:
-        # 如果配置未加载，返回默认值
-        return None
-
 
 CACHE_SCHEMA_VERSION = 1
 CURRENT_RUN_CACHE_SCOPE = "current_run_only"
@@ -343,23 +333,6 @@ def _save_cache_entries(
     return atomic_write_json(directory / "manifest.json", manifest)
 
 
-def upsert_cache_entry(
-    cache_dir: str | Path,
-    entry: CoarseCacheEntry,
-    *,
-    metadata: Mapping[str, Any] | None = None,
-) -> Path:
-    """更新当前运行目录中的单个缓存，不读取任何历史运行目录。"""
-
-    directory = Path(cache_dir)
-    existing: dict[int, CoarseCacheEntry] = {}
-    manifest_path = directory / "manifest.json"
-    if manifest_path.is_file():
-        existing = load_cache_entries(directory)
-    existing[int(entry.hole_id)] = entry
-    return save_cache_entries(directory, existing, metadata=metadata)
-
-
 def load_cache_entries(
     cache_dir: str | Path,
     hole_ids: Sequence[int] | None = None,
@@ -599,19 +572,6 @@ def check_cache_freshness(
         return "unknown", 0.0
 
 
-def update_cache_validation_timestamp(
-    entry: CoarseCacheEntry,
-) -> CoarseCacheEntry:
-    """更新缓存的验证时间戳和计数。"""
-    from dataclasses import replace as dataclass_replace
-
-    return dataclass_replace(
-        entry,
-        last_validated_at=datetime.now().isoformat(timespec="seconds"),
-        validation_count=int(entry.validation_count) + 1,
-    )
-
-
 def match_entries_by_base_point(
     target_points_base_mm: Mapping[int, Any],
     entries: Mapping[int, CoarseCacheEntry],
@@ -621,11 +581,6 @@ def match_entries_by_base_point(
     gates: CacheValidationGates | None = None,
     expiry_policy: CacheExpiryPolicy | None = None,
 ) -> tuple[dict[int, CoarseCacheEntry], dict[int, int], dict[int, dict[str, Any]]]:
-    """按 base 坐标 XY 将本次选孔与历史缓存做一对一关联。
-
-    新增：支持自适应匹配距离和过期检查。
-    """
-
     """按 base 坐标 XY 将本次选孔与历史缓存做一对一关联。
 
     新增：支持自适应匹配距离和过期检查。
@@ -689,7 +644,7 @@ def match_entries_by_base_point(
                 "adaptive_match_distance_mm": effective_match_distance,
             }
             continue
-        nearest_distance, nearest_key = candidates[0]
+        nearest_distance, _ = candidates[0]
         available = [item for item in candidates if item[1] not in used]
         in_range = [item for item in available if item[0] <= float(effective_match_distance)]
         if not available:
@@ -699,7 +654,7 @@ def match_entries_by_base_point(
                 "adaptive_match_distance_mm": effective_match_distance,
             }
             continue
-        nearest_distance, nearest_key = available[0]
+        nearest_distance, _ = available[0]
         if nearest_distance > float(effective_match_distance):
             audit[hole_id] = {
                 "matched": False, "reason": "world_distance",
@@ -1049,7 +1004,7 @@ def _fuse_normals_robust(normals: Sequence[Any]) -> np.ndarray:
     # 使用PCA提取主方向（更鲁棒）
     # 计算协方差矩阵的最大特征向量
     cov_matrix = aligned_array.T @ aligned_array
-    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    _, eigenvectors = np.linalg.eigh(cov_matrix)
     # 最大特征值对应的特征向量
     principal_direction = eigenvectors[:, -1]
 

@@ -17,7 +17,7 @@ import numpy as np
 from aubo_workbench.calibration_readiness import assess_handeye_cross_validation
 from aubo_workbench.capture import board_view_metadata, pose_bracket_report
 from aubo_workbench.charuco_detect import estimate_rgb_board_pose
-from aubo_workbench.config import AUTO_PRUNE_CFG, CAMERA_CFG, E7HandEyeConfig, ROBOT_CAMERA_INTEGRATION_CFG, SOLVE_CFG
+from aubo_workbench.config import AUTO_PRUNE_CFG, CAMERA_CFG, ROBOT_CAMERA_INTEGRATION_CFG, SOLVE_CFG
 from aubo_workbench.e7_handeye import (
     assess_e7_dataset,
     deterministic_e7_split,

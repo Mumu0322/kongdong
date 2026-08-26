@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -76,6 +77,25 @@ class TwoStageGeometryTests(unittest.TestCase):
         assert ellipse is not None
         self.assertLess(np.linalg.norm(np.asarray(ellipse["center_px"]) - [640.0, 360.0]), 2.0)
         self.assertGreater(ellipse["roundness"], 0.9)
+
+    def test_robust_circle_refinement_rejects_horizontal_line_edges(self) -> None:
+        rng = np.random.default_rng(4)
+        angles = np.linspace(0.0, 2.0 * np.pi, 360, endpoint=False)
+        circle = np.column_stack((
+            100.0 + 40.0 * np.cos(angles),
+            80.0 + 40.0 * np.sin(angles),
+        )) + rng.normal(0.0, 0.15, (360, 2))
+        horizontal_reflection = np.column_stack((
+            np.linspace(55.0, 145.0, 500),
+            np.full(500, 80.0),
+        ))
+        center, radius = module._robust_refine_circle_from_edges(
+            np.vstack((circle, horizontal_reflection)),
+            np.array([101.5, 79.0]),
+            40.8,
+        )
+        self.assertLess(float(np.linalg.norm(center - [100.0, 80.0])), 0.1)
+        self.assertAlmostEqual(radius, 40.0, delta=0.1)
 
     def test_fine_capture_uses_yolo_center_even_when_ellipse_is_valid(self) -> None:
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -334,6 +354,142 @@ class TwoStageGeometryTests(unittest.TestCase):
             [(0.05, 0.15), (0.04, 0.12), (0.03, 0.10)],
         )
 
+    def test_position_move_waits_for_motion_session_after_pose_session(self) -> None:
+        class FakeMotion:
+            def __init__(self) -> None:
+                self.steady_reads: list[bool] = []
+                self._states = [False, True, True]
+                self.move_calls = 0
+
+            def snapshot(self) -> dict[str, object]:
+                steady = self._states.pop(0) if self._states else True
+                self.steady_reads.append(steady)
+                return {"power_on": True, "steady": steady, "collision": False}
+
+            def move_line(self, _pose: list[float], _speed: float, _acc: float) -> list[int]:
+                self.move_calls += 1
+                self.assert_last_state_was_steady()
+                return [0, 0]
+
+            def assert_last_state_was_steady(self) -> None:
+                if not self.steady_reads[-1]:
+                    raise AssertionError("moveLine 在运动会话判稳前被调用")
+
+        args = SimpleNamespace(speed_m_s=0.03, acc_m_s2=0.10)
+        motion = FakeMotion()
+        with patch.object(module, "_wait_robot_steady", return_value=({}, np.eye(4))), \
+                patch.object(module.time, "sleep") as sleep:
+            module._confirm_and_move_line(
+                "synthetic handoff", np.eye(4), np.eye(4), args,
+                motion, object(), require_confirmation=False,
+            )
+
+        self.assertEqual(motion.move_calls, 1)
+        self.assertEqual(motion.steady_reads, [False, True, True])
+        sleep.assert_called_once_with(module.ROBOT_STEADY_POLL_INTERVAL_S)
+
+    def test_shared_fine_motion_has_pure_lift_and_pure_descent_clearance(self) -> None:
+        current = make_transform(np.eye(3), np.array([0.0, 0.0, 120.0]))
+        target = make_transform(np.eye(3), np.array([100.0, 50.0, 90.0]))
+        args = SimpleNamespace(
+            speed_m_s=0.08, acc_m_s2=0.25,
+            transit_speed_m_s=0.15, transit_acc_m_s2=0.45,
+            approach_speed_m_s=0.12, approach_acc_m_s2=0.35,
+        )
+        calls: list[tuple[np.ndarray, str]] = []
+
+        def fake_move(_label, _current, destination, *_args, **kwargs):
+            calls.append((np.asarray(destination).copy(), kwargs["motion_profile"]))
+            return np.asarray(destination).copy()
+
+        with patch.object(module, "_confirm_and_move_line", side_effect=fake_move):
+            result = module._move_to_shared_fine_pose(
+                "共享精定位", 1, current, target, args, object(), object(),
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(
+            [item[1] for item in calls],
+            ["transit", "transit", "approach", "approach"],
+        )
+        # 第一段必须只抬Z，且至少抬10 mm。
+        self.assertTrue(np.allclose(calls[0][0][:2, 3], current[:2, 3]))
+        self.assertTrue(np.allclose(calls[0][0][:3, :3], current[:3, :3]))
+        self.assertGreaterEqual(
+            float(calls[0][0][2, 3] - current[2, 3]),
+            module.SHARED_OBSERVATION_MIN_LIFT_MM,
+        )
+        # 第二段才允许横移/调姿态，仍保持在抬升后的高度。
+        self.assertTrue(np.allclose(calls[1][0][2, 3], calls[0][0][2, 3]))
+        # 第三段先下降到目标上方10 mm，仍保持XY和姿态不变。
+        self.assertTrue(np.allclose(calls[2][0][:2, 3], target[:2, 3]))
+        self.assertTrue(np.allclose(calls[2][0][:3, :3], target[:3, :3]))
+        self.assertAlmostEqual(
+            float(calls[2][0][2, 3]),
+            float(target[2, 3] + module.SHARED_OBSERVATION_MIN_DESCENT_MM),
+        )
+        # 第四段才穿过最后10 mm纯Z安全下降空间到观察位。
+        self.assertTrue(np.allclose(calls[3][0][:2, 3], target[:2, 3]))
+        self.assertTrue(np.allclose(calls[3][0][:3, :3], target[:3, :3]))
+        self.assertGreaterEqual(
+            float(calls[1][0][2, 3] - calls[2][0][2, 3]),
+            module.SHARED_OBSERVATION_MIN_DESCENT_MM,
+        )
+        self.assertAlmostEqual(
+            float(calls[2][0][2, 3] - calls[3][0][2, 3]),
+            module.SHARED_OBSERVATION_MIN_DESCENT_MM,
+        )
+        self.assertTrue(np.allclose(result, target))
+
+    def test_shared_coarse_motion_has_pure_lift_and_pure_descent_clearance(self) -> None:
+        current = make_transform(np.eye(3), np.array([-20.0, 30.0, 140.0]))
+        target = make_transform(np.eye(3), np.array([80.0, -40.0, 100.0]))
+        args = SimpleNamespace(
+            speed_m_s=0.08, acc_m_s2=0.25,
+            transit_speed_m_s=0.15, transit_acc_m_s2=0.45,
+            approach_speed_m_s=0.12, approach_acc_m_s2=0.35,
+        )
+        calls: list[tuple[np.ndarray, str]] = []
+
+        def fake_move(_label, _current, destination, *_args, **kwargs):
+            calls.append((np.asarray(destination).copy(), kwargs["motion_profile"]))
+            return np.asarray(destination).copy()
+
+        with patch.object(module, "_confirm_and_move_line", side_effect=fake_move):
+            result = module._move_to_shared_coarse_pose(
+                1, 1, current, target, args, object(), object(),
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(
+            [item[1] for item in calls],
+            ["transit", "transit", "transit", "transit"],
+        )
+        self.assertTrue(np.allclose(calls[0][0][:2, 3], current[:2, 3]))
+        self.assertTrue(np.allclose(calls[0][0][:3, :3], current[:3, :3]))
+        self.assertGreaterEqual(
+            float(calls[0][0][2, 3] - current[2, 3]),
+            module.SHARED_OBSERVATION_MIN_LIFT_MM,
+        )
+        self.assertTrue(np.allclose(calls[1][0][2, 3], calls[0][0][2, 3]))
+        self.assertTrue(np.allclose(calls[2][0][:2, 3], target[:2, 3]))
+        self.assertTrue(np.allclose(calls[2][0][:3, :3], target[:3, :3]))
+        self.assertAlmostEqual(
+            float(calls[2][0][2, 3]),
+            float(target[2, 3] + module.SHARED_OBSERVATION_MIN_DESCENT_MM),
+        )
+        self.assertTrue(np.allclose(calls[3][0][:2, 3], target[:2, 3]))
+        self.assertTrue(np.allclose(calls[3][0][:3, :3], target[:3, :3]))
+        self.assertGreaterEqual(
+            float(calls[1][0][2, 3] - calls[2][0][2, 3]),
+            module.SHARED_OBSERVATION_MIN_DESCENT_MM,
+        )
+        self.assertAlmostEqual(
+            float(calls[2][0][2, 3] - calls[3][0][2, 3]),
+            module.SHARED_OBSERVATION_MIN_DESCENT_MM,
+        )
+        self.assertTrue(np.allclose(result, target))
+
     def test_choose_boxes_uses_clicked_count_when_count_is_omitted(self) -> None:
         image = np.zeros((120, 160, 3), dtype=np.uint8)
         detections = [
@@ -530,6 +686,321 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertIn("_batch_metadata", result)
         self.assertEqual(len(result["_batch_metadata"]["frame_records"]), 3)
         self.assertEqual(result["_batch_metadata"]["discarded_frame_count"], 2)
+
+    def test_batch_defaults_use_stable_bursts_for_all_selected_holes(self) -> None:
+        cfg = module.TwoStageConfig()
+        self.assertEqual(cfg.batch_coarse_frames, 15)
+        self.assertEqual(cfg.batch_coarse_min_valid, 10)
+        self.assertEqual(cfg.batch_fine_frames, 8)
+        self.assertEqual(cfg.batch_fine_min_valid, 5)
+        self.assertEqual(cfg.batch_fine_stable_min_frames, 5)
+        self.assertEqual(cfg.batch_fine_supplement_rounds, 1)
+        args = module.build_parser().parse_args([])
+        self.assertEqual(args.batch_coarse_frames, 15)
+        self.assertEqual(args.batch_coarse_min_valid, 10)
+        self.assertEqual(args.batch_fine_frames, 8)
+        self.assertEqual(args.batch_fine_min_valid, 5)
+        self.assertEqual(args.batch_fine_stable_min_frames, 5)
+        self.assertEqual(args.batch_fine_supplement_rounds, 1)
+
+    def test_current_initial_pointcloud_overrides_stale_cache_geometry(self) -> None:
+        hole = {
+            "hole_id": 2,
+            "initial_center_px": [720.0, 360.0],
+            "initial_center_base_mm": [100.0, 20.0, 900.0],
+            "initial_point_camera_mm": [80.0, 0.0, 900.0],
+            "initial_plane_point_base_mm": [100.0, 20.0, 901.0],
+            "initial_plane_point_camera_mm": [80.0, 0.0, 901.0],
+            "initial_plane_normal_base": [0.0, 0.0, -1.0],
+            "initial_plane_normal_camera": [0.0, 0.0, -1.0],
+            "initial_shared_plane_point_base_mm": [0.0, 0.0, 905.0],
+            "initial_shared_plane_point_camera_mm": [0.0, 0.0, 905.0],
+            "initial_shared_plane_normal_base": [0.0, -0.1, -0.995],
+            "initial_shared_plane_normal_camera": [0.0, -0.1, -0.995],
+            "initial_plane_rmse_mm": 0.5,
+            "initial_ring_points": 80,
+            "coarse_center_base_mm": [999.0, 999.0, 999.0],
+            "coarse_normal_toward_camera_base": [1.0, 0.0, 0.0],
+            "coarse_source": "persistent_base_cache",
+        }
+
+        reused = module._reuse_initial_pointcloud_geometry_for_batch_fine(hole)
+
+        self.assertTrue(reused)
+        np.testing.assert_allclose(hole["coarse_center_base_mm"], [100.0, 20.0, 900.0])
+        np.testing.assert_allclose(
+            hole["coarse_normal_toward_camera_base"], [0.0, -0.1, -0.995]
+        )
+        np.testing.assert_allclose(hole["coarse_plane_point_base_mm"], [0.0, 0.0, 905.0])
+        self.assertEqual(
+            hole["coarse_source"], "initial_selection_shared_pointcloud_reuse"
+        )
+        self.assertEqual(
+            hole["coarse_geometry_type"],
+            "shared_workpiece_plane_with_per_hole_center_ray",
+        )
+        self.assertTrue(hole["initial_pointcloud_reused_for_batch_fine"])
+        self.assertEqual(
+            hole["coarse_captures"][0]["source_frame"],
+            "current_cycle_initial_rgbd_selection",
+        )
+
+    def test_batch_fine_captures_and_fuses_all_holes_from_one_260mm_view(self) -> None:
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            intrinsics=self.intrinsics,
+            host_timestamp_ns=456,
+        )
+        selected = [
+            {
+                "hole_id": 1,
+                "initial_center_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "initial_detection": {
+                    "class_id": 0, "box": [620.0, 340.0, 660.0, 380.0],
+                },
+            },
+            {
+                "hole_id": 2,
+                "initial_center_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "initial_detection": {
+                    "class_id": 0, "box": [700.0, 340.0, 740.0, 380.0],
+                },
+            },
+        ]
+        detections = [
+            {"box": [620.0, 340.0, 660.0, 380.0], "center": [640.0, 360.0], "class_id": 0, "confidence": 0.9},
+            {"box": [700.0, 340.0, 740.0, 380.0], "center": [720.0, 360.0], "class_id": 0, "confidence": 0.8},
+        ]
+        def geometric_fit(_image, detection, _intrinsics):
+            return {
+                "center_px": np.asarray(detection["center"], dtype=np.float64)
+                + np.array([1.25, -0.75]),
+                "axes_px": np.array([40.0, 40.0]),
+                "residual_px": 0.2,
+                "coverage_deg": 300.0,
+                "roundness": 0.98,
+                "fit_method": "hough_circle",
+            }
+        cfg = module.TwoStageConfig(
+            fine_frames=3,
+            min_fine_valid=2,
+            fine_stable_min_frames=2,
+            batch_fine_frames=2,
+            batch_fine_min_valid=2,
+            batch_fine_stable_min_frames=2,
+            fine_stable_center_scatter_p95_px=1.0,
+            max_fine_center_scatter_p95_px=1.0,
+            fine_settle_discard_frames=1,
+            fine_pointcloud_anchor_tolerance_px=30.0,
+        )
+        handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_rgb_frame_bundle", return_value=bundle) as get_frame, \
+                patch.object(module, "detect", return_value=detections), \
+                patch.object(module, "fit_hole_ellipse", side_effect=geometric_fit), \
+                patch.object(module.cv2, "imwrite", return_value=True):
+            result = module._batch_fine_localization_at_260mm(
+                selected, np.eye(4, dtype=np.float64), handeye,
+                object(), object(), 0.5, cfg, self.intrinsics,
+                Path(directory), module.TimingRecorder(), [],
+            )
+
+        self.assertGreaterEqual(get_frame.call_count, 3)
+        self.assertTrue(result[1]["success"])
+        self.assertTrue(result[2]["success"])
+        self.assertEqual(result[1]["fine"]["valid_frames"], 2)
+        self.assertEqual(result[2]["fine"]["valid_frames"], 2)
+        self.assertTrue(np.allclose(result[1]["fine"]["center_px"], [641.25, 359.25]))
+        self.assertTrue(np.allclose(result[2]["fine"]["center_px"], [721.25, 359.25]))
+        self.assertEqual(result[1]["fine"]["center_source"], "hough_circle")
+        self.assertEqual(result[1]["fine"]["yolo_frames"], 0)
+        self.assertEqual(len(result[1]["observations"]), 2)
+        self.assertEqual(len(result[2]["observations"]), 2)
+
+    def test_batch_fine_flushes_fast_queue_until_two_fresh_frame_intervals(self) -> None:
+        timestamps_ns = [
+            1_000_000_000,
+            1_001_000_000,
+            1_002_000_000,
+            1_020_000_000,
+            1_040_000_000,
+        ]
+        bundles = [
+            SimpleNamespace(
+                host_timestamp_ns=timestamp,
+                color_frame_index=index,
+                color_timestamp_us=timestamp // 1000,
+            )
+            for index, timestamp in enumerate(timestamps_ns, start=1)
+        ]
+        with patch.object(module, "get_rgb_frame_bundle", side_effect=bundles) as get_frame:
+            result = module._flush_rgb_queue_until_fresh(
+                object(), 3,
+                maximum_extra_frames=5,
+                fresh_host_interval_ms=10.0,
+                required_fresh_intervals=2,
+            )
+
+        self.assertEqual(get_frame.call_count, 5)
+        self.assertEqual(result["discarded_frame_count"], 5)
+        self.assertTrue(result["fresh_frame_confirmed"])
+        self.assertEqual(result["reason"], "minimum_and_fresh_intervals_reached")
+        self.assertEqual(result["records"][-1]["fresh_interval_streak"], 2)
+
+    def test_projection_matching_is_one_to_one_and_respects_class(self) -> None:
+        detections = [
+            {"center": [100.0, 100.0], "box": [90.0, 90.0, 110.0, 110.0], "class_id": 0, "confidence": 0.9},
+            {"center": [104.0, 100.0], "box": [94.0, 90.0, 114.0, 110.0], "class_id": 1, "confidence": 0.9},
+        ]
+        assignments = module._assign_detections_to_projection(
+            detections,
+            {"1": np.array([101.0, 100.0]), "2": np.array([104.0, 100.0])},
+            10.0,
+            expected_metadata={"1": {"class_id": 0}, "2": {"class_id": 1}},
+        )
+        self.assertEqual(set(assignments), {"1", "2"})
+        self.assertNotEqual(
+            assignments["1"]["detection_index"],
+            assignments["2"]["detection_index"],
+        )
+
+    def test_projection_matching_without_scipy_keeps_maximum_cardinality(self) -> None:
+        cost = np.array([[1.0, 2.0], [1.0, np.inf]], dtype=np.float64)
+        pairs = module._minimum_cost_maximum_assignment_without_scipy(cost)
+        self.assertEqual(set(pairs), {(0, 1), (1, 0)})
+        with patch.dict(sys.modules, {"scipy": None, "scipy.optimize": None}):
+            assignments = module._assign_detections_to_projection(
+                [
+                    {"center": [0.0, 0.0], "class_id": 0, "confidence": 0.0},
+                    {"center": [2.0, 0.0], "class_id": 0, "confidence": 0.0},
+                ],
+                {"1": np.array([0.0, 0.0]), "2": np.array([2.0, 0.0])},
+                3.0,
+            )
+        self.assertEqual(set(assignments), {"1", "2"})
+
+    def test_batch_fine_caps_frames_and_locks_stable_holes(self) -> None:
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        bundle = SimpleNamespace(
+            color_bgr=image,
+            intrinsics=self.intrinsics,
+            host_timestamp_ns=789,
+        )
+        selected = [
+            {
+                "hole_id": 1,
+                "initial_center_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "initial_detection": {
+                    "class_id": 0, "box": [620.0, 340.0, 660.0, 380.0],
+                },
+            },
+            {
+                "hole_id": 2,
+                "initial_center_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "initial_detection": {
+                    "class_id": 0, "box": [700.0, 340.0, 740.0, 380.0],
+                },
+            },
+        ]
+        detections = [
+            {"box": [620.0, 340.0, 660.0, 380.0], "center": [640.0, 360.0], "class_id": 0, "confidence": 0.9},
+            {"box": [700.0, 340.0, 740.0, 380.0], "center": [720.0, 360.0], "class_id": 0, "confidence": 0.8},
+        ]
+        good_ellipse = {
+            "center_px": np.array([640.0, 360.0]), "axes_px": np.array([40.0, 40.0]),
+            "residual_px": 0.2, "coverage_deg": 300.0, "roundness": 0.98,
+        }
+        # 可通过旧“放宽椭圆门”，但不能通过严格门；共享精定位必须拒绝，
+        # 不允许再用YOLO框中心把这一帧计为有效。
+        bad_ellipse = {
+            "center_px": np.array([720.0, 360.0]), "axes_px": np.array([40.0, 40.0]),
+            "residual_px": 1.8, "coverage_deg": 300.0, "roundness": 1.0,
+        }
+        cfg = module.TwoStageConfig(
+            batch_fine_frames=3,
+            batch_fine_min_valid=2,
+            batch_fine_stable_min_frames=2,
+            batch_fine_settle_discard_frames=0,
+            fine_pointcloud_anchor_tolerance_px=30.0,
+        )
+        handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "get_rgb_frame_bundle", return_value=bundle) as get_frame, \
+                patch.object(module, "detect", return_value=detections) as detect, \
+                patch.object(module, "fit_hole_ellipse", side_effect=[good_ellipse, bad_ellipse, good_ellipse, bad_ellipse, bad_ellipse]) as fit_ellipse, \
+                patch.object(module.cv2, "imwrite", return_value=True):
+            result = module._batch_fine_localization_at_260mm(
+                selected, np.eye(4, dtype=np.float64), handeye,
+                object(), object(), 0.5, cfg, self.intrinsics,
+                Path(directory), module.TimingRecorder(), [],
+            )
+
+        self.assertEqual(get_frame.call_count, 3)
+        self.assertEqual(detect.call_count, 3)
+        self.assertEqual(fit_ellipse.call_count, 5)
+        self.assertTrue(result[1]["success"])
+        self.assertEqual(result[1]["fine"]["valid_frames"], 2)
+        self.assertFalse(result[2]["success"])
+        self.assertEqual(result["_batch_metadata"]["max_attempts"], 3)
+        self.assertEqual(result["_batch_metadata"]["locked_holes"], [1])
+
+    def test_batch_fine_final_result_overlay_projects_fine_target_and_tcp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            source = run_dir / "shared_fine.png"
+            self.assertTrue(cv2.imwrite(str(source), np.zeros((720, 1280, 3), dtype=np.uint8)))
+            batch_results = {
+                1: {
+                    "success": True,
+                    "fine_capture_overlay_path": str(source),
+                    "capture_tcp": np.eye(4, dtype=np.float64),
+                    "intrinsics": self.intrinsics,
+                },
+            }
+            final_results = [{
+                "status": "completed",
+                "hole_id": 1,
+                "batch_fine_source": "batch_fine_at_260mm",
+                "hole_center_base_mm": [0.0, 0.0, 1000.0],
+                "target_point_base_mm": [10.0, 0.0, 1000.0],
+                "final_tcp_pose_m_rad": [0.020, 0.0, 1.0, 0.0, 0.0, 0.0],
+                "final_xy_motion": {},
+            }]
+            handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
+            overlay = module._save_batch_fine_final_result_overlay(
+                run_dir, batch_results, final_results, handeye,
+            )
+
+            self.assertIsNotNone(overlay)
+            assert overlay is not None
+            self.assertTrue(Path(overlay["image_path"]).is_file())
+            self.assertEqual(overlay["holes"][0]["hole_id"], 1)
+            self.assertGreater(
+                float(overlay["holes"][0]["final_tcp_px"][0]),
+                float(overlay["holes"][0]["fine_point_px"][0]),
+            )
+
+    def test_batch_fine_final_motion_restores_coarse_reference_pose_safely(self) -> None:
+        current = make_transform(np.eye(3), np.array([300.0, 0.0, 120.0]))
+        captured = make_transform(self.R_down, np.array([100.0, 40.0, 260.0]))
+        args = SimpleNamespace(
+            speed_m_s=0.08, acc_m_s2=0.25,
+            transit_speed_m_s=0.15, transit_acc_m_s2=0.45,
+            approach_speed_m_s=0.12, approach_acc_m_s2=0.35,
+        )
+        with patch.object(module, "_move_to_fine_pose", return_value=captured) as move_fine:
+            result = module._restore_batch_fine_pose_for_final_motion(
+                "2", 1, current, captured, args, object(), object(),
+                target_height_mm=255.0,
+            )
+        move_fine.assert_called_once()
+        self.assertEqual(
+            move_fine.call_args.kwargs["descent_guard_mm"],
+            module.SHARED_OBSERVATION_MIN_DESCENT_MM,
+        )
+        self.assertEqual(move_fine.call_args.kwargs["target_height_mm"], 255.0)
+        self.assertTrue(np.allclose(result, captured))
 
     def test_batch_coarse_per_hole_fusion_keeps_valid_shared_cache_hole(self) -> None:
         """A missing peer must not discard another hole's shared-pose frames."""
@@ -773,6 +1244,7 @@ class TwoStageGeometryTests(unittest.TestCase):
             batch_coarse_localization=True,
             batch_coarse_frames=15,
             batch_coarse_min_valid=10,
+            batch_fine_localization=False,
         )
         report = {"stages": {}, "camera": {}}
         runtime = {"rgbd_pipeline": object(), "align": object(), "chain": object()}
@@ -801,6 +1273,99 @@ class TwoStageGeometryTests(unittest.TestCase):
         capture_coarse.assert_not_called()
         move_fine.assert_called_once()
 
+    def test_multi_hole_two_capture_mode_never_splits_selected_holes(self) -> None:
+        selected = []
+        for hole_id, x_mm in ((1, -40.0), (2, 0.0), (3, 50.0)):
+            selected.append({
+                "hole_id": hole_id,
+                "initial_center_px": [640.0 + x_mm, 360.0],
+                "initial_center_base_mm": [x_mm, 0.0, 0.0],
+                "initial_point_camera_mm": [x_mm, 0.0, 900.0],
+                "initial_plane_point_base_mm": [0.0, 0.0, 0.0],
+                "initial_plane_point_camera_mm": [0.0, 0.0, 900.0],
+                "initial_plane_normal_base": [0.0, 0.0, 1.0],
+                "initial_plane_normal_camera": [0.0, 0.0, -1.0],
+                "initial_shared_plane_point_base_mm": [0.0, 0.0, 0.0],
+                "initial_shared_plane_point_camera_mm": [0.0, 0.0, 900.0],
+                "initial_shared_plane_normal_base": [0.0, 0.0, 1.0],
+                "initial_shared_plane_normal_camera": [0.0, 0.0, -1.0],
+                "initial_detection": {"class_id": 0, "center": [640.0 + x_mm, 360.0]},
+                "pointcloud_segmentation": "test",
+            })
+        coarse_results = {
+            hole["hole_id"]: {
+                "success": True,
+                "center_base_mm": hole["initial_center_base_mm"],
+                "normal_base": [0.0, 0.0, 1.0],
+            }
+            for hole in selected
+        }
+        coarse_results["_batch_metadata"] = {}
+        fine_results = {
+            hole["hole_id"]: {"success": False, "error": "test_stop_after_shared_capture"}
+            for hole in selected
+        }
+        fine_results["_batch_metadata"] = {}
+        planning_calls = []
+
+        def plan_all(group, _current, _handeye, _rz, _intrinsics, height, _margin):
+            planning_calls.append((
+                [int(hole["hole_id"]) for hole in group],
+                float(height),
+                [np.asarray(hole["initial_center_base_mm"]).tolist() for hole in group],
+            ))
+            return np.eye(4), {
+                "target_tcp_pose_m_rad": [0.0] * 6,
+                "projected_holes_px": {
+                    int(hole["hole_id"]): np.array([640.0, 360.0]) for hole in group
+                },
+                "group_bbox_px": [600.0, 340.0, 680.0, 380.0],
+                "group_center_px": np.array([640.0, 360.0]),
+            }
+
+        args = SimpleNamespace(
+            execute=True, reuse_coarse_cache=False, reuse_persistent_coarse_cache=False,
+            shared_cache_validation=False, confidence=0.5, speed_m_s=0.08,
+            acc_m_s2=0.25, transit_speed_m_s=0.15, transit_acc_m_s2=0.45,
+            approach_speed_m_s=0.12, approach_acc_m_s2=0.35,
+            move_final_xy=False, tcp_xy_offset_mm=None, final_target_mode="normal",
+            handeye="handeye.json", optimize_hole_order=False,
+        )
+        cfg = module.TwoStageConfig(
+            batch_coarse_frames=1, batch_coarse_min_valid=1,
+            batch_fine_localization=True, batch_fine_frames=1,
+            batch_fine_min_valid=1, batch_fine_stable_min_frames=1,
+        )
+        report = {"stages": {}, "camera": {}, "coarse_cache": {}}
+        runtime = {"rgbd_pipeline": object(), "align": object(), "chain": object()}
+        handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4), validated_for_motion=True)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(module, "_split_shared_cache_validation_groups") as split_groups, \
+                patch.object(module, "_plan_batch_coarse_group_pose", side_effect=plan_all), \
+                patch.object(module, "_confirm_and_move_line", side_effect=lambda _l, _c, target, *_a, **_k: target), \
+                patch.object(module, "_move_to_shared_fine_pose", side_effect=lambda _l, _o, _c, target, *_a, **_k: target), \
+                patch.object(module, "_batch_coarse_localization_at_340mm", return_value=coarse_results) as coarse_capture, \
+                patch.object(module, "_batch_fine_localization_at_260mm", return_value=fine_results) as fine_capture:
+            result = module._run_sequential_hole_workflow(
+                args, handeye, object(), cfg, Path(directory), report,
+                module.TimingRecorder(), [], runtime, object(), object(),
+                np.eye(4), selected, self.intrinsics,
+            )
+
+        self.assertEqual(result, 0)
+        split_groups.assert_not_called()
+        coarse_capture.assert_called_once()
+        self.assertEqual(fine_capture.call_count, 2)
+        self.assertEqual(
+            [call[0] for call in planning_calls],
+            [[1, 2, 3], [1, 2, 3], [1, 2, 3]],
+        )
+        self.assertEqual([call[1] for call in planning_calls], [340.0, 260.0, 260.0])
+        self.assertEqual(planning_calls[1][2], [[-40.0, 0.0, 0.0], [0.0, 0.0, 0.0], [50.0, 0.0, 0.0]])
+        self.assertTrue(report["stages"]["batch_coarse_plan"]["all_selected_holes_single_group"])
+        self.assertTrue(report["stages"]["batch_fine_plan"]["all_selected_holes_single_group"])
+
     def test_diameter_categories_cover_all_supported_holes(self) -> None:
         for diameter in (64.6, 70.2, 74.7):
             self.assertEqual(min(module.HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter)), round(diameter / 5.0) * 5.0)
@@ -828,6 +1393,7 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertEqual(parser.parse_args([]).coarse_recapture_settle_discard_frames, 10)
         self.assertEqual(parser.parse_args([]).coarse_max_corrections, 2)
         self.assertEqual(parser.parse_args([]).fine_settle_discard_frames, 10)
+        self.assertEqual(parser.parse_args([]).batch_fine_settle_discard_frames, 10)
         self.assertEqual(parser.parse_args([]).fine_retries, 2)
 
 

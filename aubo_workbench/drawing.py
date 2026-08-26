@@ -134,16 +134,6 @@ def clamp_score(value: float) -> float:
     return float(np.clip(value, 0.0, 100.0))
 
 
-def draw_metric_bar(img: np.ndarray, x: int, y: int, w: int, h: int, name: str, value_text: str, score: float) -> None:
-    score = clamp_score(score)
-    color = (0, 220, 0) if score >= 85 else (0, 180, 255) if score >= 65 else (0, 0, 255)
-    draw_unicode_text(img, name, (x, y - 6), (230, 230, 230), 16, 1)
-    cv2.rectangle(img, (x, y), (x + w, y + h), (70, 70, 70), -1)
-    cv2.rectangle(img, (x, y), (x + int(w * score / 100.0), y + h), color, -1)
-    cv2.rectangle(img, (x, y), (x + w, y + h), (130, 130, 130), 1)
-    draw_unicode_text(img, value_text, (x + w + 10, y + h - 1), (245, 245, 245), 16, 1)
-
-
 def ellipsis_text(text: str, max_chars: int) -> str:
     text = str(text)
     if len(text) <= max_chars:

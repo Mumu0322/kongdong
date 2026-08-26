@@ -300,7 +300,7 @@ def main():
         print(f"  镜片 {i+1}: 中心坐标 ({x}, {y})")
 
     # 方式2: 获取带标注的调试图像
-    centers, inference_time, debug_image = detector.detect_with_debug(
+    centers, inference_time, _ = detector.detect_with_debug(
         image,
         save_path=str(args.output)
     )

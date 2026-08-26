@@ -34,7 +34,6 @@ from aubo_workbench.camera import (  # noqa: E402
     get_aligned_frame_bundle,
     get_device_identity,
     get_rgb_frame_bundle,
-    init_rgb_handeye_pipeline,
     init_pipeline,
 )
 from aubo_workbench.charuco_point_experiment import load_handeye_experiment_result  # noqa: E402
@@ -112,6 +111,8 @@ FINAL_BASE_Y_AFTER_Z_MM = 0.2
 FINAL_TOOL_Y_AFTER_Z_MM = 1.0
 # 三孔逐孔安放时，所有低位横移前先抬到该安全余量。
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
+SHARED_OBSERVATION_MIN_LIFT_MM = 10.0
+SHARED_OBSERVATION_MIN_DESCENT_MM = 10.0
 # 机器人到位检测只影响轮询响应，不改变控制器的运动轨迹。
 ROBOT_STEADY_POLL_INTERVAL_S = 0.10
 # 回到原点后，开始下一轮初始拍摄前再留出一小段静止缓冲，避免相机抓到末端
@@ -309,6 +310,18 @@ class TwoStageConfig:
     batch_coarse_settle_discard_frames: int = 10
     # 所有340mm粗定位（批量和逐孔）共用同一套稳定性门。
     max_coarse_tracking_distance_p95_px: float = 15.0
+    # 260mm批量精定位：在同一视野内一次采集并精定位全部已选孔。
+    batch_fine_localization: bool = True
+    batch_fine_frames: int = 8
+    batch_fine_min_valid: int = 5
+    batch_fine_stable_min_frames: int = 5
+    # 260mm下降后RGB pipeline里会残留运动过程帧。现场实测丢3帧只耗时
+    # 3.7ms，仍未清空队列；默认与可靠的逐孔精定位一致，至少丢10帧。
+    batch_fine_settle_discard_frames: int = 10
+    # 共享精拍某些孔的严格几何有效帧不足时，允许移动到失败孔的共同
+    # 260mm观察位补拍；补拍仍按孔集合共享，不退化为逐孔精拍。
+    batch_fine_supplement_rounds: int = 1
+    batch_fine_view_margin_px: float = 50.0
 
 
 @dataclass
@@ -395,9 +408,12 @@ def hole_camera_point(
     h, w = xyz_map_mm.shape[:2]
     policy = str(surface_selection_policy).strip().lower()
     if policy == COARSE_SURFACE_SELECTION_POLICY:
-        # YOLO框可能略小于真实孔口；把内圈再向外收，避免孔壁/孔底进入拟合。
-        ring_inner_factor = 1.25
-        ring_outer_factor = 1.50
+        # 当前工件孔距较密，旧1.25R～1.50R环带会越过孔口附近曲面，
+        # 接近相邻孔边和凸起结构，使局部Z/法向变成大范围曲面平均值。
+        # 收回到孔口外侧的窄环；仍保留0.10R安全距离，并继续由前景深度
+        # 簇过滤孔壁/孔底，不依靠把环带无限外移来规避无效深度。
+        ring_inner_factor = 1.10
+        ring_outer_factor = 1.30
         front_percentile = 5.0
         surface_band_mm = 8.0
         min_surface_fraction = 0.03
@@ -629,6 +645,16 @@ def plan_final_tcp_base_z(T_base_tcp: np.ndarray, hole_center_base: np.ndarray) 
     return target
 
 
+def compose_batch_fine_xy_with_coarse_z(
+    fine_point_base: np.ndarray,
+    coarse_point_base: np.ndarray,
+) -> np.ndarray:
+    """共享精定位只提供XY；最终点Z继续采用该孔的粗定位结果。"""
+    target = np.asarray(fine_point_base, dtype=np.float64).reshape(3).copy()
+    target[2] = float(np.asarray(coarse_point_base, dtype=np.float64).reshape(3)[2])
+    return target
+
+
 def apply_final_point_base_offsets(
     point_base: np.ndarray,
     delta_x_mm: float = GRIPPER_BASE_X_OFFSET_MM,
@@ -845,6 +871,11 @@ def fit_hole_ellipse(
                     break
                 refined_center = local_center + np.array([xa, ya], dtype=np.float64)
                 refined_radius = math.sqrt(radius_sq)
+            # 最小二乘初值之后再做确定性的鲁棒圆拟合。反光横线会贡献
+            # 大量非圆边缘；只用与同一圆一致的径向内点重新求解亚像素圆心。
+            refined_center, refined_radius = _robust_refine_circle_from_edges(
+                raw_edge_points, refined_center, refined_radius,
+            )
             raw_center = refined_center
             radius = refined_radius
             raw_center_offset = float(np.linalg.norm(raw_center - expected_distorted))
@@ -888,10 +919,110 @@ def fit_hole_ellipse(
             }
             if hough_best is None or item["score"] < hough_best["score"]:
                 hough_best = item
-    # 只要霍夫圆具有足够的真实边缘覆盖，它优先作为精拍圆心；否则沿用轮廓椭圆。
-    if hough_best is not None and hough_best["coverage_deg"] >= 80.0 and hough_best["residual_px"] <= 2.5:
+    # 霍夫圆只有达到与正式精定位一致的严格几何质量时才优先。旧的
+    # 80deg/2.5px放宽门会让反光横线污染的圆覆盖掉更可靠的轮廓椭圆。
+    if (
+        hough_best is not None
+        and hough_best["coverage_deg"] >= 200.0
+        and hough_best["residual_px"] <= 0.9
+    ):
         return hough_best
     return best
+
+
+def _robust_refine_circle_from_edges(
+    edge_points: np.ndarray,
+    initial_center: np.ndarray,
+    initial_radius: float,
+    *,
+    iterations: int = 180,
+    inlier_threshold_px: float = 1.5,
+) -> tuple[np.ndarray, float]:
+    """在霍夫圆附近用RANSAC径向内点抑制横线、反光和缺口。"""
+    points = np.asarray(edge_points, dtype=np.float64).reshape(-1, 2)
+    center0 = np.asarray(initial_center, dtype=np.float64).reshape(2)
+    radius0 = float(initial_radius)
+    if len(points) < 30 or not np.isfinite(center0).all() or radius0 <= 0.0:
+        return center0.copy(), radius0
+
+    radial0 = np.linalg.norm(points - center0, axis=1)
+    candidate = points[np.abs(radial0 - radius0) <= max(4.0, 0.10 * radius0)]
+    if len(candidate) < 30:
+        return center0.copy(), radius0
+
+    def circle_from_three(sample: np.ndarray) -> tuple[np.ndarray, float] | None:
+        a = 2.0 * (sample[1:] - sample[0])
+        b = np.sum(sample[1:] * sample[1:], axis=1) - float(sample[0] @ sample[0])
+        if abs(float(np.linalg.det(a))) < 1.0e-6:
+            return None
+        try:
+            center = np.linalg.solve(a, b)
+        except np.linalg.LinAlgError:
+            return None
+        radius = float(np.linalg.norm(sample[0] - center))
+        if not np.isfinite(center).all() or not math.isfinite(radius) or radius <= 0.0:
+            return None
+        return center, radius
+
+    rng = np.random.default_rng(0)
+    best_mask: np.ndarray | None = None
+    best_key: tuple[int, int, float] | None = None
+    for _ in range(max(1, int(iterations))):
+        sample = candidate[rng.choice(len(candidate), size=3, replace=False)]
+        fitted = circle_from_three(sample)
+        if fitted is None:
+            continue
+        center, radius = fitted
+        if (
+            np.linalg.norm(center - center0) > max(6.0, 0.08 * radius0)
+            or abs(radius - radius0) > max(6.0, 0.12 * radius0)
+        ):
+            continue
+        residual = np.abs(np.linalg.norm(candidate - center, axis=1) - radius)
+        mask = residual <= float(inlier_threshold_px)
+        if int(np.count_nonzero(mask)) < 24:
+            continue
+        inlier_points = candidate[mask]
+        angles = np.mod(
+            np.degrees(np.arctan2(
+                inlier_points[:, 1] - center[1], inlier_points[:, 0] - center[0],
+            )),
+            360.0,
+        )
+        coverage_bins = int(len(np.unique(np.floor(angles / 10.0).astype(int))))
+        key = (
+            coverage_bins,
+            int(np.count_nonzero(mask)),
+            -float(np.median(residual[mask])),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_mask = mask
+
+    if best_mask is None:
+        return center0.copy(), radius0
+
+    inliers = candidate[best_mask]
+    center = center0.copy()
+    radius = radius0
+    for _ in range(3):
+        A = np.column_stack((2.0 * inliers[:, 0], 2.0 * inliers[:, 1], np.ones(len(inliers))))
+        b = np.sum(inliers * inliers, axis=1)
+        try:
+            solution, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except np.linalg.LinAlgError:
+            break
+        center = np.asarray(solution[:2], dtype=np.float64)
+        radius_sq = float(solution[2] + center @ center)
+        if not math.isfinite(radius_sq) or radius_sq <= 0.0:
+            return center0.copy(), radius0
+        radius = math.sqrt(radius_sq)
+        residual = np.abs(np.linalg.norm(candidate - center, axis=1) - radius)
+        next_inliers = candidate[residual <= float(inlier_threshold_px)]
+        if len(next_inliers) < 24:
+            break
+        inliers = next_inliers
+    return center, radius
 
 
 def _nearest_detection(detections: list[dict[str, Any]], anchor_px: np.ndarray,
@@ -1000,6 +1131,36 @@ def _wait_robot_steady(pose_session: Any, timeout_s: float = 45.0) -> tuple[dict
     raise RuntimeError(f"等待机器人稳定超时：{last_reason}")
 
 
+def _wait_motion_session_steady(
+    motion_session: Any,
+    timeout_s: float = 45.0,
+) -> dict[str, Any] | None:
+    """用真正下发运动命令的会话确认控制器已停稳。
+
+    ``pose_session`` 和 ``motion_session`` 是两条独立的 AUBO RPC 连接。
+    只读位姿会话先读到 ``steady=True`` 时，运动会话的状态对象可能还保留
+    一个短暂的 ``steady=False``，从而在下一次 ``moveLine`` 的底层安全门处
+    被拒绝。位置运动前后都检查运动会话自身的状态，消除这段交接竞争。
+    不具备 ``snapshot`` 接口的离线替身保持原有行为。
+    """
+    snapshot_fn = getattr(motion_session, "snapshot", None)
+    if not callable(snapshot_fn):
+        return None
+    deadline = time.monotonic() + float(timeout_s)
+    last_reason = ""
+    while time.monotonic() < deadline:
+        snapshot = snapshot_fn()
+        if bool(snapshot.get("collision")):
+            raise RuntimeError("运动会话检测到碰撞标志，拒绝继续位置运动")
+        power_on = bool(snapshot.get("power_on"))
+        steady = bool(snapshot.get("steady"))
+        if power_on and steady:
+            return snapshot
+        last_reason = f"power={power_on} steady={steady}"
+        time.sleep(ROBOT_STEADY_POLL_INTERVAL_S)
+    raise RuntimeError(f"等待运动会话稳定超时：{last_reason}")
+
+
 def _wait_robot_steady_before_initial_capture(
     pose_session: Any,
     *,
@@ -1103,14 +1264,24 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
         f"acc={acc_m_s2:.4f} m/s^2",
         flush=True,
     )
+    _wait_motion_session_steady(motion_session)
     from aubo_workbench.motion_control import sdk_ok
-    response = motion_session.move_line(
-        transform_to_sdk_pose_m_rad(target), speed_m_s, acc_m_s2,
-    )
+    sdk_pose = transform_to_sdk_pose_m_rad(target)
+    try:
+        response = motion_session.move_line(sdk_pose, speed_m_s, acc_m_s2)
+    except RuntimeError as exc:
+        # 在“状态检查”和真正下发之间仍可能发生一次很短的控制器状态竞争。
+        # move_line 的底层 steady 门在下发前检查，不会在这里已经执行半段运动。
+        if "尚未静止" not in str(exc):
+            raise
+        print("[MOTION] 运动会话仍在收敛，等待稳定后重试一次 moveLine", flush=True)
+        _wait_motion_session_steady(motion_session)
+        response = motion_session.move_line(sdk_pose, speed_m_s, acc_m_s2)
     print("[MOTION]", response)
     if not response or not sdk_ok(response[-1]):
         raise RuntimeError(f"{label} moveLine 下发失败：{response}")
     _, actual = _wait_robot_steady(pose_session)
+    _wait_motion_session_steady(motion_session)
     return actual
 
 
@@ -1140,10 +1311,19 @@ def _confirm_and_move_home(home: Any, args: Any, motion_session: Any, pose_sessi
     print("[MOTION] 自动执行回原点，无需输入 m", flush=True)
     speed = math.radians(20.0)
     acc = math.radians(40.0)
-    response = motion_session.move_joint(home.joints_rad, speed, acc)
+    _wait_motion_session_steady(motion_session)
+    try:
+        response = motion_session.move_joint(home.joints_rad, speed, acc)
+    except RuntimeError as exc:
+        if "尚未静止" not in str(exc):
+            raise
+        print("[MOTION] 运动会话仍在收敛，等待稳定后重试一次 moveJoint", flush=True)
+        _wait_motion_session_steady(motion_session)
+        response = motion_session.move_joint(home.joints_rad, speed, acc)
     print("[MOTION]", response)
     from aubo_workbench.motion_control import sdk_ok
     settled_snapshot, actual = _wait_robot_steady(pose_session)
+    _wait_motion_session_steady(motion_session)
     if not response or not sdk_ok(response[-1]):
         settled_joints = np.asarray(settled_snapshot.get("joints_rad", []), dtype=np.float64)
         reached_home = (
@@ -1848,35 +2028,295 @@ def _project_base_point_to_pixel(
     return np.asarray(projected, dtype=np.float64).reshape(2)
 
 
+def _save_batch_fine_final_result_overlay(
+    run_dir: Path,
+    batch_fine_results: dict[int, dict[str, Any]],
+    final_results: list[dict[str, Any]],
+    handeye: Any,
+) -> dict[str, Any] | None:
+    """把共享精拍测量点、孔级目标和最终TCP画回同一张260图像。"""
+    capture = next((
+        item for item in batch_fine_results.values()
+        if item.get("success")
+        and item.get("fine_capture_overlay_path")
+        and item.get("capture_tcp") is not None
+        and item.get("intrinsics") is not None
+    ), None)
+    if capture is None:
+        return None
+    source_path = Path(str(capture["fine_capture_overlay_path"]))
+    view = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+    if view is None:
+        return None
+
+    T_base_camera = camera_transform(
+        np.asarray(capture["capture_tcp"], dtype=np.float64).reshape(4, 4),
+        handeye.T_tcp_rgb_camera,
+    )
+    intrinsics = capture["intrinsics"]
+    records: list[dict[str, Any]] = []
+
+    def projected(point: Any) -> np.ndarray | None:
+        if point is None:
+            return None
+        try:
+            value = np.asarray(point, dtype=np.float64).reshape(3)
+            if not np.isfinite(value).all():
+                return None
+            return _project_base_point_to_pixel(value, T_base_camera, intrinsics)
+        except Exception:
+            return None
+
+    for result in final_results:
+        if (
+            result.get("status") != "completed"
+            or not str(result.get("batch_fine_source", "")).startswith("batch_fine")
+        ):
+            continue
+        hole_id = int(result["hole_id"])
+        fine_point = np.asarray(result["hole_center_base_mm"], dtype=np.float64).reshape(3)
+        target_point = np.asarray(result["target_point_base_mm"], dtype=np.float64).reshape(3)
+        final_pose = result.get("final_tcp_pose_m_rad")
+        final_tcp_point = (
+            np.asarray(final_pose[:3], dtype=np.float64) * 1000.0
+            if final_pose is not None and len(final_pose) >= 3
+            and result.get("final_xy_motion") is not None else None
+        )
+        fine_px = projected(fine_point)
+        target_px = projected(target_point)
+        final_tcp_px = projected(final_tcp_point)
+
+        if fine_px is not None:
+            p = tuple(np.rint(fine_px).astype(int))
+            cv2.drawMarker(view, p, (0, 0, 255), cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
+            cv2.putText(view, f"H{hole_id} FINE", (p[0] + 8, p[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 1, cv2.LINE_AA)
+        if target_px is not None:
+            p = tuple(np.rint(target_px).astype(int))
+            cv2.drawMarker(view, p, (255, 255, 0), cv2.MARKER_DIAMOND, 22, 2, cv2.LINE_AA)
+            cv2.putText(view, f"H{hole_id} TARGET", (p[0] + 8, p[1] + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1, cv2.LINE_AA)
+        if final_tcp_px is not None:
+            p = tuple(np.rint(final_tcp_px).astype(int))
+            cv2.drawMarker(view, p, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 22, 2, cv2.LINE_AA)
+            cv2.putText(view, f"H{hole_id} TCP", (p[0] + 8, p[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+            if fine_px is not None:
+                cv2.arrowedLine(
+                    view, tuple(np.rint(fine_px).astype(int)), p,
+                    (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.15,
+                )
+
+        records.append({
+            "hole_id": hole_id,
+            "fine_point_base_mm": fine_point,
+            "fine_point_px": fine_px,
+            "target_point_base_mm": target_point,
+            "target_point_px": target_px,
+            "final_tcp_base_mm": final_tcp_point,
+            "final_tcp_px": final_tcp_px,
+            "fine_to_final_tcp_xy_mm": (
+                None if final_tcp_point is None else
+                np.asarray(final_tcp_point[:2] - fine_point[:2], dtype=np.float64)
+            ),
+        })
+
+    if not records:
+        return None
+    cv2.rectangle(view, (8, 8), (700, 72), (0, 0, 0), -1)
+    cv2.putText(view, "FINAL RESULT ON SHARED 260mm IMAGE", (18, 31),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        view, "red+=FINE  cyan diamond=TARGET  yellow x=FINAL TCP  orange arrow=compensation",
+        (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    output_path = run_dir / "batch_fine_260_final_result_overlay.png"
+    if not cv2.imwrite(str(output_path), view):
+        return None
+    return {
+        "image_path": str(output_path),
+        "source_image_path": str(source_path),
+        "coordinate_frame": "shared_260mm_capture_rgb",
+        "legend": {
+            "red_cross": "fine_3d_hole_center_reprojected",
+            "cyan_diamond": "final_hole_target_fine_xy_with_coarse_z",
+            "yellow_tilted_cross": "actual_final_tcp_after_xy_compensation_and_y_trim",
+            "orange_arrow": "fine_center_to_actual_final_tcp",
+        },
+        "holes": records,
+    }
+
+
 
 
 def _assign_detections_to_projection(
     detections: list[dict[str, Any]],
     projected_holes_px: dict[str, np.ndarray],
     max_distance_px: float,
+    expected_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """按预期像素锚点最近邻分配检测框，保证一个检测不会被多个孔复用。"""
+    """将检测框与预计孔位做带门限的一对一全局匹配。
 
-    pairs: list[tuple[float, str, int]] = []
+    代价以预计像素位置为主，并可选叠加类别、框尺寸和置信度信息。
+    优先使用 scipy 的匈牙利算法；现场环境没有 scipy 时回退到确定性的
+    距离排序算法，仍保证一个检测框只会分配给一个孔。
+    """
+
+    hole_ids = [str(value) for value in projected_holes_px]
+    if not hole_ids or not detections:
+        return {}
+    metadata = expected_metadata or {}
+    max_distance = float(max_distance_px)
+    cost = np.full((len(hole_ids), len(detections)), np.inf, dtype=np.float64)
     for hole_id, expected in projected_holes_px.items():
         expected_value = np.asarray(expected, dtype=np.float64).reshape(2)
         for detection_index, detection in enumerate(detections):
             center = np.asarray(detection["center"], dtype=np.float64).reshape(2)
             distance = float(np.linalg.norm(center - expected_value))
-            if distance <= float(max_distance_px):
-                pairs.append((distance, str(hole_id), int(detection_index)))
+            if distance > max_distance:
+                continue
+            hole_metadata = metadata.get(str(hole_id), {})
+            expected_class = hole_metadata.get("class_id")
+            if expected_class is not None and int(detection.get("class_id", -1)) != int(expected_class):
+                continue
+            value = distance
+            expected_box = hole_metadata.get("box")
+            detection_box = detection.get("box")
+            if expected_box is not None and detection_box is not None:
+                expected_size = max(
+                    float(expected_box[2]) - float(expected_box[0]),
+                    float(expected_box[3]) - float(expected_box[1]),
+                    1.0,
+                )
+                detected_size = max(
+                    float(detection_box[2]) - float(detection_box[0]),
+                    float(detection_box[3]) - float(detection_box[1]),
+                    1.0,
+                )
+                value += 4.0 * abs(math.log(detected_size / expected_size))
+            value -= 2.0 * float(detection.get("confidence", 0.0))
+            cost[hole_ids.index(str(hole_id)), detection_index] = value
+
+    assignments: dict[str, dict[str, Any]] = {}
+    finite_pairs = np.argwhere(np.isfinite(cost))
+    if finite_pairs.size == 0:
+        return assignments
+
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        safe_cost = np.where(np.isfinite(cost), cost, 1.0e9)
+        row_indices, column_indices = linear_sum_assignment(safe_cost)
+        selected_pairs = [
+            (int(row), int(column))
+            for row, column in zip(row_indices, column_indices)
+            if np.isfinite(cost[row, column])
+        ]
+    except Exception:
+        # 机器人现场可能只部署最小依赖；无 scipy 时使用纯 Python/Numpy
+        # 的最大匹配、最小代价回退，不能退化为简单的逐边贪心。
+        selected_pairs = _minimum_cost_maximum_assignment_without_scipy(cost)
+
+    used_rows: set[int] = set()
     assigned: dict[str, dict[str, Any]] = {}
     used_detection_indices: set[int] = set()
-    for distance, hole_id, detection_index in sorted(pairs, key=lambda item: item[0]):
-        if hole_id in assigned or detection_index in used_detection_indices:
+    for row, detection_index in selected_pairs:
+        if row in used_rows or detection_index in used_detection_indices:
             continue
+        hole_id = hole_ids[row]
+        expected_value = np.asarray(projected_holes_px[hole_id], dtype=np.float64).reshape(2)
+        distance = float(np.linalg.norm(
+            np.asarray(detections[detection_index]["center"], dtype=np.float64).reshape(2)
+            - expected_value
+        ))
         assigned[hole_id] = {
             "detection": detections[detection_index],
             "detection_index": detection_index,
             "distance_px": distance,
         }
+        used_rows.add(row)
         used_detection_indices.add(detection_index)
     return assigned
+
+
+def _minimum_cost_maximum_assignment_without_scipy(
+    cost: np.ndarray,
+) -> list[tuple[int, int]]:
+    """无 scipy 时计算最大基数、最小代价的一对一匹配。
+
+    通过虚拟未匹配行/列把“最大匹配数量”编码为主目标，再用方阵
+    Hungarian 算法优化有限边代价。有限边代价按当前匹配代价范围设置，
+    因此任何合法匹配都优先于把孔位留空，非法边永远不会被选中。
+    """
+    matrix = np.asarray(cost, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.size == 0:
+        return []
+    row_count, column_count = matrix.shape
+    finite_values = matrix[np.isfinite(matrix)]
+    if finite_values.size == 0:
+        return []
+
+    unmatched_cost = max(1.0, float(np.max(np.abs(finite_values))) + 1.0)
+    forbidden_cost = unmatched_cost * 3.0
+    size = row_count + column_count
+    padded = np.zeros((size, size), dtype=np.float64)
+    padded[:row_count, :column_count] = np.where(
+        np.isfinite(matrix), matrix, forbidden_cost,
+    )
+    # 真实孔位匹配虚拟列表示“不匹配”；虚拟行匹配真实检测框表示
+    # “该检测框未被选中”。两者的配对代价分别是 unmatched_cost 和0。
+    padded[:row_count, column_count:] = unmatched_cost
+
+    # 方阵 Hungarian 最小化实现，兼容负代价。
+    u = np.zeros(size + 1, dtype=np.float64)
+    v = np.zeros(size + 1, dtype=np.float64)
+    p = np.zeros(size + 1, dtype=np.int32)
+    way = np.zeros(size + 1, dtype=np.int32)
+    for row in range(1, size + 1):
+        p[0] = row
+        min_value = np.full(size + 1, np.inf, dtype=np.float64)
+        used = np.zeros(size + 1, dtype=bool)
+        column0 = 0
+        while True:
+            used[column0] = True
+            row0 = int(p[column0])
+            delta = math.inf
+            column1 = 0
+            for column in range(1, size + 1):
+                if used[column]:
+                    continue
+                current = padded[row0 - 1, column - 1] - u[row0] - v[column]
+                if current < min_value[column]:
+                    min_value[column] = current
+                    way[column] = column0
+                if min_value[column] < delta:
+                    delta = float(min_value[column])
+                    column1 = column
+            for column in range(size + 1):
+                if used[column]:
+                    u[int(p[column])] += delta
+                    v[column] -= delta
+                else:
+                    min_value[column] -= delta
+            column0 = column1
+            if p[column0] == 0:
+                break
+        while True:
+            previous = int(way[column0])
+            p[column0] = p[previous]
+            column0 = previous
+            if column0 == 0:
+                break
+
+    assigned_columns = np.full(size, -1, dtype=np.int32)
+    for column in range(1, size + 1):
+        if p[column] > 0:
+            assigned_columns[int(p[column]) - 1] = column - 1
+    return [
+        (row, int(column))
+        for row, column in enumerate(assigned_columns[:row_count])
+        if 0 <= int(column) < column_count and np.isfinite(matrix[row, int(column)])
+    ]
 
 
 def _fit_batch_projected_anchor_correction(
@@ -2661,157 +3101,6 @@ def _cache_entry_from_observations(
     )
 
 
-def _build_initial_coarse_cache(
-    pipeline: Any,
-    align: Any,
-    chain: Any,
-    model: Any,
-    confidence: float,
-    holes: list[dict[str, Any]],
-    *,
-    T_base_camera: np.ndarray,
-    current_tcp: np.ndarray,
-    handeye: Any,
-    handeye_path: str,
-    camera_serial: str,
-    intrinsics: Any,
-    cfg: TwoStageConfig,
-    gates: CacheValidationGates,
-    rgb_output_dir: Path | None = None,
-) -> tuple[dict[int, CoarseCacheEntry], dict[int, str]]:
-    """在初始选孔位置追加三帧，为每个选中孔建立局部缓存。
-
-    rgb_output_dir 只保存每个缓存采集帧一张共享RGB图，便于之后用
-    NPZ可视化工具做同位姿投影检查；不把整幅RGB图塞进NPZ。
-    """
-    observations_by_hole: dict[int, list[Observation]] = {
-        int(hole["hole_id"]): [] for hole in holes
-    }
-    for frame_index in range(int(gates.validation_frames)):
-        bundle = get_aligned_frame_bundle(pipeline, align, chain)
-        if bundle is None or bundle.intrinsics is None:
-            for hole in holes:
-                hole_id = int(hole["hole_id"])
-                observations_by_hole[hole_id].append(Observation(
-                    "initial_cache", frame_index,
-                    np.asarray(hole["initial_center_px"], dtype=np.float64),
-                    timestamp_ns=None, error="frame_missing",
-                ))
-            continue
-        if rgb_output_dir is not None:
-            try:
-                rgb_output_dir.mkdir(parents=True, exist_ok=True)
-                written = cv2.imwrite(
-                    str(rgb_output_dir / f"initial_cache_rgb_frame_{frame_index:02d}.png"),
-                    bundle.color_bgr,
-                )
-                if not written:
-                    raise RuntimeError("cv2.imwrite返回False")
-            except Exception as exc:
-                print(
-                    f"[CACHE_RGB_SNAPSHOT_WARNING] frame={frame_index} reason={exc}",
-                    flush=True,
-                )
-        detections = detect(model, bundle.color_bgr, confidence)
-        available = set(range(len(detections)))
-        ordered_holes = sorted(holes, key=lambda item: int(item["hole_id"]))
-        assignments: dict[int, tuple[dict[str, Any] | None, float | None]] = {}
-        for hole in ordered_holes:
-            hole_id = int(hole["hole_id"])
-            anchor = np.asarray(hole["initial_center_px"], dtype=np.float64).reshape(2)
-            candidates = [
-                index for index in available
-                if int(detections[index].get("class_id", -1)) == int(hole["class_id"])
-            ]
-            if not candidates:
-                assignments[hole_id] = (None, None)
-                continue
-            index = min(
-                candidates,
-                key=lambda candidate: float(
-                    np.linalg.norm(np.asarray(detections[candidate]["center"], dtype=np.float64) - anchor)
-                ),
-            )
-            available.remove(index)
-            detection = detections[index]
-            distance = float(
-                np.linalg.norm(np.asarray(detection["center"], dtype=np.float64) - anchor)
-            )
-            assignments[hole_id] = (detection, distance)
-        for hole in holes:
-            hole_id = int(hole["hole_id"])
-            anchor = np.asarray(hole["initial_center_px"], dtype=np.float64).reshape(2)
-            detection, tracking_distance = assignments[hole_id]
-            if detection is None:
-                observations_by_hole[hole_id].append(Observation(
-                    "initial_cache", frame_index, anchor,
-                    timestamp_ns=bundle.host_timestamp_ns, error="yolo_missing",
-                ))
-                continue
-            center = np.asarray(detection["center"], dtype=np.float64)
-            if tracking_distance is None or tracking_distance > float(gates.max_tracking_distance_px):
-                observations_by_hole[hole_id].append(Observation(
-                    "initial_cache", frame_index, center,
-                    timestamp_ns=bundle.host_timestamp_ns, error="tracking_distance",
-                    tracking_distance_px=tracking_distance,
-                ))
-                continue
-            radius = max(
-                float(detection["box"][2] - detection["box"][0]),
-                float(detection["box"][3] - detection["box"][1]),
-            ) / 2.0
-            try:
-                _, info = hole_camera_point(
-                    tuple(center.tolist()), bundle.xyz_map_mm, bundle.intrinsics, radius,
-                    ray_center_xy=center, ray_center_is_undistorted=False,
-                    include_points=True,
-                    surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
-                )
-                plane = _plane_estimate_from_info(info, f"初始缓存孔{hole_id}法向")
-                error = None if plane.rmse_mm <= float(gates.max_plane_rmse_mm) else "plane_quality"
-                observations_by_hole[hole_id].append(Observation(
-                    "initial_cache", frame_index, center, None, plane,
-                    bundle.host_timestamp_ns, error, tracking_distance_px=tracking_distance,
-                ))
-            except Exception as exc:
-                observations_by_hole[hole_id].append(Observation(
-                    "initial_cache", frame_index, center,
-                    timestamp_ns=bundle.host_timestamp_ns,
-                    error=f"plane_error:{exc}", tracking_distance_px=tracking_distance,
-                ))
-
-    entries: dict[int, CoarseCacheEntry] = {}
-    failures: dict[int, str] = {}
-    tcp_pose = transform_to_sdk_pose_m_rad(current_tcp)
-    for hole in holes:
-        hole_id = int(hole["hole_id"])
-        observations = observations_by_hole[hole_id]
-        valid = [item for item in observations if item.error is None and item.plane is not None]
-        if len(valid) < int(gates.min_valid_frames):
-            failures[hole_id] = f"valid_frames:{len(valid)}/{int(gates.min_valid_frames)}"
-            continue
-        try:
-            entry = _cache_entry_from_observations(
-                hole_id, observations,
-                T_base_camera=T_base_camera,
-                T_tcp_camera=handeye.T_tcp_rgb_camera,
-                tcp_pose_m_rad=tcp_pose,
-                camera_serial=camera_serial,
-                handeye_path=handeye_path,
-                intrinsics=intrinsics,
-                cfg=cfg,
-                min_valid_frames=int(gates.min_valid_frames),
-            )
-            if entry.center_scatter_p95_px > float(gates.max_center_scatter_p95_px):
-                raise RuntimeError(
-                    f"center_scatter:{entry.center_scatter_p95_px:.3f}px"
-                )
-            entries[hole_id] = entry
-        except Exception as exc:
-            failures[hole_id] = f"{type(exc).__name__}:{exc}"
-    return entries, failures
-
-
 def _apply_cached_geometry_to_hole(
     hole: dict[str, Any], entry: CoarseCacheEntry, validation: Any,
     *, source: str = "current_run_initial_cache",
@@ -2848,6 +3137,98 @@ def _apply_cached_geometry_to_hole(
             None if persistent_hole_id is None else int(persistent_hole_id)
         ),
     })
+
+
+def _reuse_initial_pointcloud_geometry_for_batch_fine(
+    hole: dict[str, Any],
+) -> bool:
+    """把本轮选孔RGB-D帧的逐孔点云几何直接提升为粗几何。
+
+    该数据与用户点击选择来自同一帧，不依赖跨运行缓存的base坐标匹配；
+    批量精定位模式下以它覆盖历史缓存几何，保证所有已选孔来源一致。
+    """
+    required = {
+        "center_base": hole.get("initial_center_base_mm"),
+        "center_camera": hole.get("initial_point_camera_mm"),
+        "plane_normal_base": hole.get(
+            "initial_shared_plane_normal_base",
+            hole.get("initial_plane_normal_base"),
+        ),
+        "plane_normal_camera": hole.get(
+            "initial_shared_plane_normal_camera",
+            hole.get("initial_plane_normal_camera"),
+        ),
+    }
+    arrays: dict[str, np.ndarray] = {}
+    for name, value in required.items():
+        if value is None:
+            return False
+        array = np.asarray(value, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(array)):
+            return False
+        arrays[name] = array.copy()
+
+    plane_point_base = np.asarray(
+        hole.get(
+            "initial_shared_plane_point_base_mm",
+            hole.get("initial_plane_point_base_mm", arrays["center_base"]),
+        ),
+        dtype=np.float64,
+    ).reshape(3)
+    plane_point_camera = np.asarray(
+        hole.get(
+            "initial_shared_plane_point_camera_mm",
+            hole.get("initial_plane_point_camera_mm", arrays["center_camera"]),
+        ),
+        dtype=np.float64,
+    ).reshape(3)
+    if not np.all(np.isfinite(plane_point_base)) or not np.all(np.isfinite(plane_point_camera)):
+        return False
+
+    hole.update({
+        "coarse_center_px": hole.get("initial_center_px"),
+        "coarse_center_camera_mm": arrays["center_camera"],
+        "coarse_center_base_mm": arrays["center_base"],
+        "coarse_plane_point_camera_mm": plane_point_camera.copy(),
+        "coarse_plane_point_base_mm": plane_point_base.copy(),
+        "coarse_normal_camera": arrays["plane_normal_camera"],
+        "coarse_normal_toward_camera_base": arrays["plane_normal_base"],
+        "coarse_plane_rmse_mm": hole.get(
+            "initial_shared_plane_rmse_mm", hole.get("initial_plane_rmse_mm")
+        ),
+        "coarse_valid_frames": 1,
+        "coarse_total_frames": 1,
+        "coarse_center_scatter_p95_px": 0.0,
+        "coarse_tracking_distance_p95_px": 0.0,
+        "coarse_ring_points_median": hole.get(
+            "initial_shared_ring_points", hole.get("initial_ring_points")
+        ),
+        "coarse_surface_model": hole.get(
+            "initial_shared_surface_model", hole.get("initial_surface_model")
+        ),
+        "coarse_surface_selection_policy": hole.get(
+            "initial_shared_surface_selection_policy",
+            hole.get("initial_surface_selection_policy"),
+        ),
+        "coarse_front_surface_z_mm": hole.get(
+            "initial_shared_front_surface_z_mm", hole.get("initial_front_surface_z_mm")
+        ),
+        "coarse_ring_points_raw_median": hole.get("initial_ring_points_raw"),
+        "coarse_surface_points_selected_median": hole.get(
+            "initial_surface_points_selected"
+        ),
+        "coarse_sphere_center_camera_mm": None,
+        "coarse_sphere_radius_mm": None,
+        "coarse_source": "initial_selection_shared_pointcloud_reuse",
+        "coarse_geometry_type": "shared_workpiece_plane_with_per_hole_center_ray",
+        "initial_pointcloud_reused_for_batch_fine": True,
+        "coarse_captures": [{
+            "capture_index": 0,
+            "mode": "initial_selection_pointcloud_reuse",
+            "source_frame": "current_cycle_initial_rgbd_selection",
+        }],
+    })
+    return True
 
 
 def _validate_coarse_cache_at_current_pose(
@@ -3157,14 +3538,22 @@ def _fuse_fine(observations: list[Observation], cfg: TwoStageConfig,
             f"原始有效帧={len(raw_valid)}，原始P95={summary['center_scatter_p95_px_raw']:.3f}px，"
             f"严格门槛={scatter_gate:.3f}px"
         )
-    # 当前精定位的有效中心全部按 YOLO 来源统计。兼容旧观测记录中的
-    # ellipse / yolo_fallback 标签，但不再让它们改变实际中心来源。
-    center_source_counts = {"yolo": len(valid)}
+    center_source_counts: dict[str, int] = {}
+    for item in valid:
+        source = str(item.center_source or "unknown")
+        center_source_counts[source] = center_source_counts.get(source, 0) + 1
     relaxed_yolo_frames = sum(
         "strict_ellipse_rejected" in str(item.quality_note or "") for item in valid
     )
-    strict_ellipse_frames = len(valid) - relaxed_yolo_frames
-    center_source = "yolo"
+    strict_ellipse_frames = sum(
+        str(item.center_source or "unknown")
+        in {"ellipse", "hough_circle", "geometric_circle"}
+        for item in valid
+    )
+    center_source = (
+        next(iter(center_source_counts))
+        if len(center_source_counts) == 1 else "mixed"
+    )
     summary.update({
         "valid_frames": len(valid), "rejected_outlier_frames": len(raw_valid) - len(valid),
         "outlier_rule": "choose lower P95 of raw and MAD-filtered sets; strict gate unchanged",
@@ -3180,7 +3569,7 @@ def _fuse_fine(observations: list[Observation], cfg: TwoStageConfig,
         "axes_px_median": np.median(np.asarray([item.ellipse["axes_px"] for item in valid]), axis=0),
         "center_source": center_source,
         "center_source_counts": center_source_counts,
-        "yolo_frames": len(valid),
+        "yolo_frames": int(center_source_counts.get("yolo", 0)),
         "strict_ellipse_frames": int(strict_ellipse_frames),
         "yolo_relaxed_ellipse_frames": int(relaxed_yolo_frames),
         # 保留旧字段，便于已有报告解析器读取；它表示放宽椭圆质量门后
@@ -3309,6 +3698,122 @@ def _move_to_sequential_coarse_pose(
     )
 
 
+def _move_to_shared_observation_pose(
+    label: str,
+    current_tcp: np.ndarray,
+    target: np.ndarray,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+    *,
+    target_height_mm: float,
+    descent_profile: str,
+) -> np.ndarray:
+    """共享粗/精定位共同观察位的安全移动路径。
+
+    共享模式也必须先做纯基坐标Z抬升，再允许XY和姿态变化；横移完成后，
+    最后至少保留 ``SHARED_OBSERVATION_MIN_DESCENT_MM`` 的纯基坐标Z下降段。
+    抬升量至少为 ``SHARED_OBSERVATION_MIN_LIFT_MM``，同时继续使用原有的
+    60 mm安全高度余量，避免把“至少10 mm”误解成只抬10 mm就横移。正式
+    采集前的steady检查和相机残帧清理仍由调用方保留。
+    """
+    actual = np.asarray(current_tcp, dtype=np.float64).reshape(4, 4).copy()
+    desired = np.asarray(target, dtype=np.float64).reshape(4, 4).copy()
+    position_error = float(np.linalg.norm(actual[:3, 3] - desired[:3, 3]))
+    rotation_error = _rotation_distance_deg(actual[:3, :3], desired[:3, :3])
+    if position_error <= 0.5 and rotation_error <= 0.5:
+        return actual
+
+    safe_z = max(float(actual[2, 3]), float(desired[2, 3])) + THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM
+    lift_z = max(
+        float(actual[2, 3]) + SHARED_OBSERVATION_MIN_LIFT_MM,
+        safe_z,
+    )
+    lift = actual.copy()
+    lift[2, 3] = lift_z
+    actual = _confirm_and_move_line(
+        f"{label}：先纯Z抬升{SHARED_OBSERVATION_MIN_LIFT_MM:.0f}mm以上",
+        actual,
+        lift,
+        args,
+        motion_session,
+        pose_session,
+        "仅修改基坐标Z；XY和姿态保持不变",
+        require_confirmation=False,
+        motion_profile="transit",
+    )
+
+    high_target = desired.copy()
+    high_target[2, 3] = lift_z
+    actual = _confirm_and_move_line(
+        f"{label}：安全高度横移并调整共同视野姿态",
+        actual,
+        high_target,
+        args,
+        motion_session,
+        pose_session,
+        "已完成纯Z抬升；此段不下降到观察高度",
+        require_confirmation=False,
+        motion_profile="transit",
+    )
+    descent_clearance_mm = float(lift_z - desired[2, 3])
+    if descent_clearance_mm < SHARED_OBSERVATION_MIN_DESCENT_MM:
+        raise RuntimeError(
+            f"{label}纯Z下降安全余量不足：{descent_clearance_mm:.3f}mm < "
+            f"{SHARED_OBSERVATION_MIN_DESCENT_MM:.3f}mm"
+        )
+    descent_guard = desired.copy()
+    descent_guard[2, 3] = float(desired[2, 3]) + SHARED_OBSERVATION_MIN_DESCENT_MM
+    actual = _confirm_and_move_line(
+        f"{label}：纯Z下降到目标上方{SHARED_OBSERVATION_MIN_DESCENT_MM:.0f}mm安全位",
+        actual,
+        descent_guard,
+        args,
+        motion_session,
+        pose_session,
+        f"保持XY和姿态不变；先纯Z下降到最终观察位上方"
+        f"{SHARED_OBSERVATION_MIN_DESCENT_MM:.0f}mm，禁止斜向接近",
+        require_confirmation=False,
+        motion_profile=descent_profile,
+    )
+    return _confirm_and_move_line(
+        f"{label}：再纯Z下降{SHARED_OBSERVATION_MIN_DESCENT_MM:.0f}mm到"
+        f"{float(target_height_mm):.0f}mm共同观察位",
+        actual,
+        desired,
+        args,
+        motion_session,
+        pose_session,
+        f"共同视野孔集合已冻结；保持XY和姿态不变，最后"
+        f"纯Z下降{SHARED_OBSERVATION_MIN_DESCENT_MM:.0f}mm到指定RGB相机高度"
+        f"{float(target_height_mm):.0f}mm",
+        require_confirmation=False,
+        motion_profile=descent_profile,
+    )
+
+
+def _move_to_shared_coarse_pose(
+    group_index: int,
+    group_count: int,
+    current_tcp: np.ndarray,
+    target: np.ndarray,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+) -> np.ndarray:
+    """共享粗定位专用的共同340 mm观察位移动。"""
+    return _move_to_shared_observation_pose(
+        f"共享粗定位：第{int(group_index)}组/{int(group_count)}组",
+        current_tcp,
+        target,
+        args,
+        motion_session,
+        pose_session,
+        target_height_mm=340.0,
+        descent_profile="transit",
+    )
+
+
 def _plan_batch_coarse_group_pose(
     selected_holes: list[dict[str, Any]],
     current_tcp: np.ndarray,
@@ -3331,7 +3836,16 @@ def _plan_batch_coarse_group_pose(
     normals_base = []
     for hole in selected_holes:
         point = np.asarray(hole["initial_center_base_mm"], dtype=np.float64).reshape(3)
-        normal = np.asarray(hole["initial_plane_normal_base"], dtype=np.float64).reshape(3)
+        normal = np.asarray(
+            hole.get(
+                "planning_normal_base",
+                hole.get(
+                    "initial_shared_plane_normal_base",
+                    hole["initial_plane_normal_base"],
+                ),
+            ),
+            dtype=np.float64,
+        ).reshape(3)
         points_base.append(point)
         normals_base.append(normal)
 
@@ -3952,6 +4466,455 @@ def _batch_coarse_localization_at_340mm(
     return batch_results
 
 
+def _flush_rgb_queue_until_fresh(
+    pipeline: Any,
+    minimum_discard_frames: int,
+    *,
+    maximum_extra_frames: int = 20,
+    fresh_host_interval_ms: float = 10.0,
+    required_fresh_intervals: int = 2,
+) -> dict[str, Any]:
+    """丢弃运动过程RGB帧，直到确认pipeline已经返回实时新帧。
+
+    Orbbec队列中的旧帧会在几毫秒内连续返回；队列清空后，wait_for_frames
+    必须等待下一个相机周期。RgbFrameBundle的host_timestamp_ns记录在
+    wait_for_frames返回后，因此连续两个足够长的主机时间间隔可以作为
+    “已追上实时流”的证据。测试替身或旧调用方没有设备帧元数据时，保持
+    原有行为，只执行配置的最少丢帧数。
+    """
+    minimum = max(0, int(minimum_discard_frames))
+    maximum = minimum + max(0, int(maximum_extra_frames))
+    required = max(1, int(required_fresh_intervals))
+    threshold_ns = max(0, int(float(fresh_host_interval_ms) * 1_000_000.0))
+    if minimum == 0:
+        return {
+            "discarded_frame_count": 0,
+            "fresh_frame_confirmed": False,
+            "reason": "disabled",
+            "records": [],
+        }
+
+    discarded = 0
+    attempts = 0
+    fresh_streak = 0
+    previous_host_timestamp_ns: int | None = None
+    metadata_available = False
+    records: list[dict[str, Any]] = []
+    max_attempts = max(maximum + 5, minimum)
+    while discarded < maximum and attempts < max_attempts:
+        attempts += 1
+        bundle = get_rgb_frame_bundle(pipeline)
+        if bundle is None:
+            records.append({"attempt": attempts, "valid": False})
+            continue
+        discarded += 1
+        has_frame_metadata = bool(
+            hasattr(bundle, "color_frame_index")
+            or hasattr(bundle, "color_timestamp_us")
+        )
+        metadata_available = metadata_available or has_frame_metadata
+        host_timestamp_ns = int(bundle.host_timestamp_ns)
+        host_interval_ms = None
+        if previous_host_timestamp_ns is not None:
+            interval_ns = host_timestamp_ns - previous_host_timestamp_ns
+            host_interval_ms = float(interval_ns / 1_000_000.0)
+            if has_frame_metadata and interval_ns >= threshold_ns:
+                fresh_streak += 1
+            elif has_frame_metadata:
+                fresh_streak = 0
+        previous_host_timestamp_ns = host_timestamp_ns
+        records.append({
+            "attempt": attempts,
+            "discard_index": discarded,
+            "valid": True,
+            "host_timestamp_ns": host_timestamp_ns,
+            "host_interval_ms": host_interval_ms,
+            "color_timestamp_us": getattr(bundle, "color_timestamp_us", None),
+            "color_frame_index": getattr(bundle, "color_frame_index", None),
+            "fresh_interval_streak": fresh_streak,
+        })
+        if discarded < minimum:
+            continue
+        if not metadata_available:
+            return {
+                "discarded_frame_count": discarded,
+                "attempt_count": attempts,
+                "fresh_frame_confirmed": False,
+                "reason": "minimum_reached_without_frame_metadata",
+                "fresh_host_interval_ms": float(fresh_host_interval_ms),
+                "required_fresh_intervals": required,
+                "records": records,
+            }
+        if fresh_streak >= required:
+            return {
+                "discarded_frame_count": discarded,
+                "attempt_count": attempts,
+                "fresh_frame_confirmed": True,
+                "reason": "minimum_and_fresh_intervals_reached",
+                "fresh_host_interval_ms": float(fresh_host_interval_ms),
+                "required_fresh_intervals": required,
+                "records": records,
+            }
+
+    return {
+        "discarded_frame_count": discarded,
+        "attempt_count": attempts,
+        "fresh_frame_confirmed": bool(metadata_available and fresh_streak >= required),
+        "reason": "maximum_discard_reached_before_fresh_confirmation",
+        "fresh_host_interval_ms": float(fresh_host_interval_ms),
+        "required_fresh_intervals": required,
+        "records": records,
+    }
+
+
+def _batch_fine_localization_at_260mm(
+    selected_holes: list[dict[str, Any]],
+    current_tcp: np.ndarray,
+    handeye: Any,
+    pipeline: Any,
+    model: Any,
+    confidence: float,
+    cfg: TwoStageConfig,
+    intrinsics: Any,
+    run_dir: Path,
+    timing: TimingRecorder,
+    rows: list[dict[str, Any]],
+    *,
+    artifact_prefix: str | None = None,
+) -> dict[Any, dict[str, Any]]:
+    """在一个260mm共同位姿同时精定位当前视野内的全部选中孔。
+
+    机器人在本函数调用前已经移动到共同260mm位姿。本函数只采集RGB帧，
+    每帧运行一次YOLO并把检测框一对一分配给所有目标孔；椭圆质量门和
+    融合/验收沿用单孔精定位逻辑；同一共同位姿执行一次短连拍，达到
+    有效帧数与稳定性门后一次性输出当前孔集合。移动到另一个共享位姿的
+    补拍由外层工作流负责，本函数本身不移动机器人。
+    """
+    if not selected_holes:
+        raise RuntimeError("批量精定位：没有选中孔")
+
+    T_base_camera = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+    projected_holes = {
+        str(int(hole["hole_id"])): _project_base_point_to_pixel(
+            np.asarray(hole["initial_center_base_mm"], dtype=np.float64).reshape(3),
+            T_base_camera, intrinsics,
+        )
+        for hole in selected_holes
+    }
+    expected_metadata = {
+        str(int(hole["hole_id"])): {
+            "class_id": int(hole["initial_detection"].get("class_id", -1)),
+            "box": hole["initial_detection"].get("box"),
+        }
+        for hole in selected_holes
+    }
+    hole_ids = [int(hole["hole_id"]) for hole in selected_holes]
+    observations_by_hole: dict[int, list[Observation]] = {
+        hole_id: [] for hole_id in hole_ids
+    }
+    frame_records: list[dict[str, Any]] = []
+    latest_bundle: Any = None
+    artifact_tag = "" if not artifact_prefix else f"{str(artifact_prefix).strip()}_"
+    anchor_correction: dict[str, np.ndarray] | None = None
+    anchor_correction_info: dict[str, Any] | None = None
+    anchor_correction_attempted = False
+    discarded_frame_count = 0
+    settle_flush: dict[str, Any] = {
+        "discarded_frame_count": 0,
+        "fresh_frame_confirmed": False,
+        "reason": "disabled",
+        "records": [],
+    }
+    batch_cfg = replace(
+        cfg,
+        fine_frames=int(cfg.batch_fine_frames),
+        min_fine_valid=int(cfg.batch_fine_min_valid),
+        fine_stable_min_frames=int(cfg.batch_fine_stable_min_frames),
+        fine_settle_discard_frames=int(cfg.batch_fine_settle_discard_frames),
+    )
+    settle_discard_frames = max(0, int(batch_cfg.fine_settle_discard_frames))
+    if settle_discard_frames > 0:
+        with timing.measure(
+            "batch_fine/discard_settle_frames",
+            target_frames=settle_discard_frames,
+        ):
+            settle_flush = _flush_rgb_queue_until_fresh(
+                pipeline, settle_discard_frames,
+            )
+            discarded_frame_count = int(settle_flush["discarded_frame_count"])
+
+    max_frames = max(1, int(batch_cfg.fine_frames))
+    # batch_fine_frames定义同一共同位姿下短连拍的正式帧数上限；达到
+    # 当前孔集合的有效帧数和稳定门即可提前结束。
+    max_attempts = max_frames
+    stable_gate_frames = max(
+        1, int(batch_cfg.fine_stable_min_frames), int(batch_cfg.min_fine_valid),
+    )
+    locked_holes: set[int] = set()
+    with timing.measure(
+        "batch_fine/capture_all_holes",
+        hole_count=len(selected_holes), target_frames=max_frames,
+    ):
+        for frame_index in range(max_attempts):
+            if len(locked_holes) == len(hole_ids):
+                break
+
+            bundle = get_rgb_frame_bundle(pipeline)
+            if bundle is None or bundle.intrinsics is None:
+                for hole_id, anchor in projected_holes.items():
+                    if int(hole_id) in locked_holes:
+                        continue
+                    observations_by_hole[int(hole_id)].append(Observation(
+                        "batch_fine", frame_index,
+                        np.asarray(anchor, dtype=np.float64),
+                        timestamp_ns=None, error="rgb_frame_missing",
+                    ))
+                frame_records.append({
+                    "frame_index": frame_index, "valid": False,
+                    "valid_hole_count": 0, "reason": "rgb_frame_missing",
+                })
+                continue
+
+            latest_bundle = bundle
+            detections = detect(model, bundle.color_bgr, confidence)
+            raw_anchors = {
+                hole_id: _project_base_point_to_pixel(
+                    np.asarray(next(
+                        hole["initial_center_base_mm"]
+                        for hole in selected_holes
+                        if str(int(hole["hole_id"])) == hole_id
+                    ), dtype=np.float64).reshape(3),
+                    camera_transform(current_tcp, handeye.T_tcp_rgb_camera),
+                    bundle.intrinsics,
+                )
+                for hole_id in projected_holes
+            }
+            if not anchor_correction_attempted:
+                anchor_correction_attempted = True
+                try:
+                    anchor_correction, anchor_correction_info = (
+                        _fit_batch_projected_anchor_correction(
+                            detections,
+                            raw_anchors,
+                            cfg.multi_coarse_tracking_tolerance_px,
+                            min_matches=max(3, min(6, len(selected_holes))),
+                        )
+                    )
+                except Exception as correction_exc:
+                    anchor_correction = None
+                    anchor_correction_info = {
+                        "enabled": False,
+                        "error": f"{type(correction_exc).__name__}:{correction_exc}",
+                    }
+            current_anchors = anchor_correction if anchor_correction is not None else raw_anchors
+            assignments = _assign_detections_to_projection(
+                detections,
+                current_anchors,
+                batch_cfg.fine_pointcloud_anchor_tolerance_px,
+                expected_metadata=expected_metadata,
+            )
+            valid_hole_count = 0
+            hole_records: list[dict[str, Any]] = []
+            for hole in selected_holes:
+                hole_id = int(hole["hole_id"])
+                key = str(hole_id)
+                if hole_id in locked_holes:
+                    hole_records.append({
+                        "hole_id": hole_id, "valid": True, "locked": True,
+                    })
+                    continue
+                anchor = np.asarray(current_anchors[key], dtype=np.float64)
+                assigned = assignments.get(key)
+                if assigned is None:
+                    observations_by_hole[hole_id].append(Observation(
+                        "batch_fine", frame_index, anchor,
+                        timestamp_ns=bundle.host_timestamp_ns,
+                        error="yolo_missing_or_far",
+                    ))
+                    hole_records.append({
+                        "hole_id": hole_id, "valid": False,
+                        "reason": "yolo_missing_or_far",
+                    })
+                    continue
+
+                detection = assigned["detection"]
+                detection_center = np.asarray(
+                    detection["center"], dtype=np.float64,
+                ).reshape(2)
+                ellipse = fit_hole_ellipse(bundle.color_bgr, detection, bundle.intrinsics)
+                strict_ok = _ellipse_ok(ellipse, cfg)
+                if not strict_ok:
+                    rejected_center = (
+                        np.asarray(ellipse["center_px"], dtype=np.float64).reshape(2)
+                        if ellipse is not None else
+                        undistort_pixels(
+                            bundle.intrinsics, detection_center.reshape(1, 2),
+                            pixel_output=True,
+                        )[0]
+                    )
+                    observations_by_hole[hole_id].append(Observation(
+                        "batch_fine", frame_index, rejected_center, ellipse,
+                        timestamp_ns=bundle.host_timestamp_ns,
+                        error="ellipse_quality", center_source="rejected",
+                        quality_note="strict_geometric_center_gate_failed_no_yolo_fallback",
+                        tracking_distance_px=float(assigned["distance_px"]),
+                    ))
+                    hole_records.append({
+                        "hole_id": hole_id, "valid": False,
+                        "distance_px": float(assigned["distance_px"]),
+                        "reason": "ellipse_quality",
+                    })
+                    continue
+
+                center = np.asarray(ellipse["center_px"], dtype=np.float64).reshape(2)
+                center_source = str(ellipse.get("fit_method") or "ellipse")
+                observations_by_hole[hole_id].append(Observation(
+                    "batch_fine", frame_index, center, ellipse,
+                    timestamp_ns=bundle.host_timestamp_ns,
+                    center_source=center_source,
+                    quality_note="strict_geometric_center",
+                    tracking_distance_px=float(assigned["distance_px"]),
+                ))
+                valid_hole_count += 1
+                hole_records.append({
+                    "hole_id": hole_id, "valid": True,
+                    "distance_px": float(assigned["distance_px"]),
+                    "center_source": center_source,
+                    "geometric_center_px": center.tolist(),
+                    "geometric_center_px_distorted": np.asarray(
+                        ellipse.get("center_px_distorted", center), dtype=np.float64,
+                    ).reshape(2).tolist(),
+                    "ellipse_residual_px": float(ellipse["residual_px"]),
+                })
+
+            for hole_id in hole_ids:
+                if hole_id in locked_holes:
+                    continue
+                if _fine_burst_stable(
+                    {hole_id: observations_by_hole[hole_id]},
+                    stable_gate_frames,
+                    float(batch_cfg.fine_stable_center_scatter_p95_px),
+                ):
+                    locked_holes.add(hole_id)
+
+            geometric_centers = {
+                str(record["hole_id"]): np.asarray(
+                    record["geometric_center_px_distorted"], dtype=np.float64,
+                )
+                for record in hole_records
+                if record.get("geometric_center_px_distorted") is not None
+            }
+            view = bundle.color_bgr.copy()
+            for detection in detections:
+                box = tuple(np.rint(np.asarray(detection["box"], dtype=np.float64)).astype(int))
+                cv2.rectangle(view, (box[0], box[1]), (box[2], box[3]), (255, 180, 0), 1)
+            for hole_id, anchor in current_anchors.items():
+                point = tuple(np.rint(np.asarray(anchor, dtype=np.float64)).astype(int))
+                assigned = assignments.get(hole_id)
+                color = (0, 255, 0) if assigned is not None else (0, 165, 255)
+                cv2.circle(view, point, 14, color, 2, cv2.LINE_AA)
+                cv2.putText(
+                    view, f"H{hole_id}", (point[0] + 8, point[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+                )
+                if assigned is not None:
+                    detected_point = tuple(np.rint(np.asarray(
+                        assigned["detection"]["center"], dtype=np.float64,
+                    )).astype(int))
+                    cv2.drawMarker(
+                        view, detected_point, (255, 0, 255),
+                        cv2.MARKER_TILTED_CROSS, 12, 2, cv2.LINE_AA,
+                    )
+                geometric_center = geometric_centers.get(str(hole_id))
+                if geometric_center is not None:
+                    geometric_point = tuple(np.rint(geometric_center).astype(int))
+                    cv2.drawMarker(
+                        view, geometric_point, (0, 0, 255),
+                        cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA,
+                    )
+            cv2.putText(
+                view,
+                f"Batch RGB 260mm frame={frame_index} valid={valid_hole_count}/{len(selected_holes)}",
+                (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            overlay_path = run_dir / f"{artifact_tag}batch_fine_260_frame_{frame_index:02d}.png"
+            cv2.imwrite(str(overlay_path), view)
+            frame_records.append({
+                "frame_index": frame_index,
+                "valid": valid_hole_count > 0,
+                "valid_hole_count": valid_hole_count,
+                "detection_count": len(detections),
+                "holes": hole_records,
+                "locked_holes": sorted(locked_holes),
+                "overlay_path": str(overlay_path),
+            })
+
+    if latest_bundle is None:
+        raise RuntimeError("批量精定位期间未获得RGB帧")
+
+    batch_results: dict[int, dict[str, Any]] = {}
+    for hole_id in hole_ids:
+        observations = observations_by_hole[hole_id]
+        rows.extend(_observation_rows(observations))
+        try:
+            summary = _fuse_fine(
+                observations, batch_cfg,
+                max_center_scatter_p95_px=batch_cfg.max_fine_center_scatter_p95_px,
+            )
+            summary.update({
+                "fine_quality_status": "strict",
+                "fine_quality_note": None,
+                "fine_recovery_attempts": [{
+                    "attempt": 1,
+                    "name": "batch_fine",
+                    "capture_status": "completed",
+                    "total_frames": len(observations),
+                    "valid_frames": int(summary["valid_frames"]),
+                    "mode": "batch_fine_at_260mm",
+                }],
+            })
+            batch_results[hole_id] = {
+                "success": True,
+                "fine": summary,
+                "observations": observations,
+                "intrinsics": latest_bundle.intrinsics,
+                "capture_tcp": np.asarray(current_tcp, dtype=np.float64).copy(),
+                "expected_anchor_px": np.asarray(
+                    projected_holes[str(hole_id)], dtype=np.float64,
+                ).copy(),
+                "fine_capture_overlay_path": frame_records[-1].get("overlay_path")
+                if frame_records else None,
+            }
+        except Exception as exc:
+            batch_results[hole_id] = {
+                "success": False,
+                "fine": None,
+                "observations": observations,
+                "intrinsics": latest_bundle.intrinsics,
+                "capture_tcp": np.asarray(current_tcp, dtype=np.float64).copy(),
+                "expected_anchor_px": np.asarray(
+                    projected_holes[str(hole_id)], dtype=np.float64,
+                ).copy(),
+                "error": f"{type(exc).__name__}:{exc}",
+            }
+
+    batch_results["_batch_metadata"] = {
+        "frame_records": frame_records,
+        "anchor_correction": anchor_correction_info,
+        "settle_discard_frames": settle_discard_frames,
+        "discarded_frame_count": discarded_frame_count,
+        "settle_flush": settle_flush,
+        "max_frames": max_frames,
+        "max_attempts": max_attempts,
+        "locked_holes": sorted(locked_holes),
+        "max_tracking_distance_px": float(batch_cfg.fine_pointcloud_anchor_tolerance_px),
+        "latest_overlay_path": (
+            frame_records[-1].get("overlay_path") if frame_records else None
+        ),
+    }
+    return batch_results
+
+
 def optimize_hole_order(
     hole_ids: list[int], target_xy_by_hole: dict[int, Any], start_xy: Any | None = None,
 ) -> tuple[list[int], float]:
@@ -4009,6 +4972,18 @@ def _run_sequential_hole_workflow(
     if not initial_holes:
         raise RuntimeError("没有初始选定孔，无法执行顺序定位")
 
+    initial_pointcloud_reused_holes: list[int] = []
+    if cfg.batch_fine_localization and len(initial_holes) > 1:
+        initial_pointcloud_reused_holes = [
+            int(hole["hole_id"])
+            for hole in initial_holes
+            if _reuse_initial_pointcloud_geometry_for_batch_fine(hole)
+        ]
+    all_selected_two_capture_mode = bool(
+        len(initial_pointcloud_reused_holes) == len(initial_holes)
+        and len(initial_holes) > 1
+    )
+
     fixed_rz_rad = _matrix_to_rpy_zyx(current_tcp[:3, :3])[2]
     results: list[dict[str, Any]] = []
     order_ids = [int(item["hole_id"]) for item in initial_holes]
@@ -4035,14 +5010,19 @@ def _run_sequential_hole_workflow(
     report.setdefault("coarse_cache", {}).setdefault("cache_invalidated", [])
     report.setdefault("coarse_cache", {}).setdefault("full_coarse_fallback", [])
     report["stages"]["sequential_plan"] = {
-        "mode": "initial_selection_then_one_hole_complete",
+        "mode": "single_shared_coarse_capture_then_shared_fine_capture_with_supplement",
         "hole_count": len(initial_holes),
         "hole_order": order_ids,
         "fixed_rz_rad": fixed_rz_rad,
         "coarse_settle_buffer_s": float(cfg.coarse_settle_delay_s),
         "tracking_identity_source": "initial_selection_order_and_initial_rgbd_3d_projection",
-        "confirmation_policy": "only_before_starting_next_selected_hole",
+        "confirmation_policy": "no_per_hole_pause_after_batch_fine_capture",
         "camera_pipeline_policy": "reuse_single_rgbd_pipeline_for_coarse_and_rgb_fine",
+        "initial_pointcloud_reused_holes": initial_pointcloud_reused_holes,
+        "capture_policy": (
+            "all_selected_holes_in_one_initial_pose_per_stage_then_failed_holes"
+            "_in_shared_supplement_pose"
+        ),
     }
 
     def ensure_rgbd_pipeline() -> tuple[Any, Any, Any]:
@@ -4054,12 +5034,12 @@ def _run_sequential_hole_workflow(
             runtime["chain"] = chain
         return runtime["rgbd_pipeline"], runtime["align"], runtime["chain"]
 
-    # 批量粗定位结果缓存：显式批量模式，或缓存策略首次没有任何正式
-    # 一拍多缓存时，都在340 mm按视野分组采集。每个组独立规划/采集，
-    # 某一组失败只影响该组，其他视野组仍可继续建立正式缓存。
+    # 正式多孔流程固定先在340 mm共同位姿拍摄全部选中孔。初始RGB-D
+    # 点云只负责规划这个共同粗定位位姿，不能代替正式粗定位拍摄。
     batch_coarse_results: dict[int, dict[str, Any]] = {}
     batch_coarse_for_cache = bool(
-        cfg.batch_coarse_localization
+        all_selected_two_capture_mode
+        or cfg.batch_coarse_localization
         or (cache_enabled and not cache_entries)
     )
 
@@ -4102,15 +5082,23 @@ def _run_sequential_hole_workflow(
 
         rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
 
-        batch_groups = _split_shared_cache_validation_groups(
-            initial_holes, current_tcp, handeye, fixed_rz_rad, initial_intrinsics,
-            cfg.coarse_height_mm, cfg.batch_coarse_view_margin_px,
+        batch_groups = (
+            [list(initial_holes)]
+            if all_selected_two_capture_mode else
+            _split_shared_cache_validation_groups(
+                initial_holes, current_tcp, handeye, fixed_rz_rad, initial_intrinsics,
+                cfg.coarse_height_mm, cfg.batch_coarse_view_margin_px,
+            )
         )
         batch_plan: dict[str, Any] = {
             "enabled": True,
             "hole_count": len(initial_holes),
             "hole_order": order_ids,
             "group_count": len(batch_groups),
+            "all_selected_holes_single_group": bool(all_selected_two_capture_mode),
+            "capture_frames": int(cfg.batch_coarse_frames),
+            "combined_position_policy": "projected_bbox_center_above_all_selected_holes",
+            "motion_policy": "shared_vertical_lift_min10_safe_horizontal_descent_guard10_then_pure_descent10_then_steady_capture",
             "view_margin_px": float(cfg.batch_coarse_view_margin_px),
             "groups": [],
         }
@@ -4139,6 +5127,11 @@ def _run_sequential_hole_workflow(
                     )
                 group_report.update({
                     "target_tcp_pose_m_rad": batch_geometry["target_tcp_pose_m_rad"],
+                    "combined_point_base_mm": batch_geometry.get("group_point_base_mm"),
+                    "combined_normal_base": batch_geometry.get(
+                        "group_normal_toward_camera_base"
+                    ),
+                    "pose_policy": "above_projected_bbox_center_of_all_selected_holes",
                     "projected_holes_px": {
                         str(key): value.tolist()
                         for key, value in batch_geometry["projected_holes_px"].items()
@@ -4151,11 +5144,14 @@ def _run_sequential_hole_workflow(
                     f"batch_coarse/group_{group_index:02d}/navigate_to_group_pose",
                     hole_count=len(group), group_index=group_index,
                 ):
-                    current_tcp = _confirm_and_move_line(
-                        f"批量粗定位：移动到第{group_index}组{len(group)}个孔的共同340mm观察位",
-                        current_tcp, batch_target, args, motion_session, pose_session,
-                        f"本组孔在视野内；group_center={batch_geometry['group_center_px']}",
-                        require_confirmation=False, motion_profile="transit",
+                    current_tcp = _move_to_shared_coarse_pose(
+                        group_index,
+                        len(batch_groups),
+                        current_tcp,
+                        batch_target,
+                        args,
+                        motion_session,
+                        pose_session,
                     )
 
                 coarse_settle_delay_s = max(0.0, float(cfg.coarse_settle_delay_s))
@@ -4200,7 +5196,7 @@ def _run_sequential_hole_workflow(
                     hole_id for hole_id in group_ids if hole_id not in accepted
                 ]
                 group_report["capture"] = group_metadata
-                if group_report["fallback_holes"]:
+                if group_report["fallback_holes"] and not all_selected_two_capture_mode:
                     print(
                         f"[BATCH_COARSE] 第{group_index}组失败孔将逐孔回退: "
                         f"{group_report['fallback_holes']}", flush=True,
@@ -4211,7 +5207,13 @@ def _run_sequential_hole_workflow(
                 group_report["error"] = f"{type(exc).__name__}:{exc}"
                 group_report["fallback_reason"] = "group_failed"
                 print(
-                    f"[BATCH_COARSE] 第{group_index}组失败，回退该组逐孔粗定位: {exc}",
+                    f"[BATCH_COARSE] 第{group_index}组失败；"
+                    + (
+                        "全部选中孔不再拆分或逐孔补拍"
+                        if all_selected_two_capture_mode else
+                        "回退该组逐孔粗定位"
+                    )
+                    + f": {exc}",
                     flush=True,
                 )
             batch_plan["groups"].append(group_report)
@@ -4355,8 +5357,11 @@ def _run_sequential_hole_workflow(
     # 缓存策略默认就是“340 mm一拍多验证”；命令行开关仅保留为兼容旧
     # 调用方的显式开启方式。批量粗定位模式本身优先使用新采集结果。
     shared_cache_requested = bool(
-        getattr(args, "shared_cache_validation", False)
-        or (cache_enabled and bool(cache_entries) and not cfg.batch_coarse_localization)
+        not all_selected_two_capture_mode
+        and (
+            getattr(args, "shared_cache_validation", False)
+            or (cache_enabled and bool(cache_entries) and not cfg.batch_coarse_localization)
+        )
     )
     shared_cache_allowed = (
         shared_cache_requested and cache_enabled and not batch_coarse_for_cache
@@ -4513,6 +5518,427 @@ def _run_sequential_hole_workflow(
                     }
             report["stages"]["shared_cache_validation"]["groups"].append(group_report)
 
+    # 260 mm 批量精定位：所有已选孔优先复用本轮初始选择RGB-D帧中已经
+    # 计算完成的逐孔点云几何。跨运行缓存是否匹配不再影响选中孔进入精拍。
+    # 这些字段已在进入流程时统一建立；此处只消费，不再触发任何采集。
+    batch_fine_results: dict[int, dict[str, Any]] = {}
+    batch_fine_plan: dict[str, Any] = {
+        "enabled": False,
+        "requested": bool(cfg.batch_fine_localization and len(initial_holes) > 1),
+        "hole_count": len(initial_holes),
+        "groups": [],
+        "fallback_holes": [],
+        "initial_pointcloud_reused_holes": initial_pointcloud_reused_holes,
+        "coarse_geometry_policy": "fresh_shared_340mm_capture_required",
+        "failure_policy": "move_to_shared_260mm_supplement_capture",
+        "combined_position_policy": "projected_bbox_center_from_all_coarse_holes",
+        "motion_policy": "shared_vertical_lift_min10_safe_horizontal_descent_guard10_then_pure_descent10_then_steady_capture",
+        "final_pose_policy": "per_hole_coarse_z_and_orientation_with_batch_fine_xy_only",
+        "fine_output_components": ["base_x", "base_y"],
+        "coarse_output_components": ["base_z", "rx", "ry", "rz"],
+        "supplement_rounds": int(cfg.batch_fine_supplement_rounds),
+    }
+    if cfg.batch_fine_localization and len(initial_holes) > 1:
+        fine_planning_holes: list[dict[str, Any]] = []
+        fine_planning_holes_by_id: dict[int, dict[str, Any]] = {}
+        missing_fine_geometry: list[int] = []
+        for hole in initial_holes:
+            hole_id = int(hole["hole_id"])
+            coarse_result = batch_coarse_results.get(hole_id, {})
+            if all_selected_two_capture_mode:
+                # 正式两拍流程必须使用同一次340mm拍摄的结果来规划260mm；
+                # 初始选孔点云不能在粗定位漏检时悄悄顶替。
+                point_value = (
+                    coarse_result.get("center_base_mm")
+                    if coarse_result.get("success") else None
+                )
+                normal_value = (
+                    coarse_result.get("normal_base")
+                    if coarse_result.get("success") else None
+                )
+            else:
+                point_value = hole.get("coarse_center_base_mm")
+                normal_value = hole.get("coarse_normal_toward_camera_base")
+                if point_value is None and coarse_result.get("success"):
+                    point_value = coarse_result.get("center_base_mm")
+                if normal_value is None and coarse_result.get("success"):
+                    normal_value = coarse_result.get("normal_base")
+            if point_value is None or normal_value is None:
+                missing_fine_geometry.append(hole_id)
+                continue
+            fine_planning_holes.append({
+                **hole,
+                # 共同260mm位姿规划器复用已有的批量视野算法；这里把
+                # 粗定位后的可信几何映射到规划器要求的通用字段。
+                "initial_center_base_mm": np.asarray(point_value, dtype=np.float64).copy(),
+                "initial_plane_normal_base": np.asarray(normal_value, dtype=np.float64).copy(),
+                "planning_normal_base": np.asarray(normal_value, dtype=np.float64).copy(),
+            })
+        fine_planning_holes_by_id = {
+            int(hole["hole_id"]): hole for hole in fine_planning_holes
+        }
+
+        if all_selected_two_capture_mode and missing_fine_geometry:
+            # 两次共享拍摄都必须覆盖同一套完整选孔。粗定位少一个孔时，
+            # 不能拿剩余子集重新计算所谓“综合位置”并继续精拍。
+            fine_planning_holes = []
+
+        batch_fine_plan.update({
+            "hole_count_with_coarse_geometry": len(fine_planning_holes),
+            "missing_coarse_geometry_holes": missing_fine_geometry,
+            "view_margin_px": float(cfg.batch_fine_view_margin_px),
+            "target_height_mm": float(cfg.fine_height_mm),
+            "frames": int(cfg.batch_fine_frames),
+            "min_valid_frames": int(cfg.batch_fine_min_valid),
+            "stable_min_frames": int(cfg.batch_fine_stable_min_frames),
+            "settle_discard_frames": int(cfg.batch_fine_settle_discard_frames),
+            "supplement_rounds": int(cfg.batch_fine_supplement_rounds),
+        })
+        if fine_planning_holes:
+            batch_fine_groups = (
+                [list(fine_planning_holes)]
+                if all_selected_two_capture_mode else
+                _split_shared_cache_validation_groups(
+                    fine_planning_holes, current_tcp, handeye, fixed_rz_rad,
+                    initial_intrinsics, cfg.fine_height_mm, cfg.batch_fine_view_margin_px,
+                )
+            )
+            batch_fine_plan.update({
+                "enabled": True,
+                "group_count": len(batch_fine_groups),
+                "all_selected_holes_single_group": bool(all_selected_two_capture_mode),
+            })
+            rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
+            fine_hole_groups_by_id: dict[int, int] = {}
+
+            def _summarize_batch_fine_results(
+                values: dict[Any, dict[str, Any]],
+            ) -> dict[str, dict[str, Any]]:
+                return {
+                    str(hole_id): {
+                        "success": bool(result.get("success", False)),
+                        "error": result.get("error"),
+                        "batch_fine_source": result.get("batch_fine_source"),
+                        "capture_round": result.get("batch_fine_capture_round", 0),
+                        "fine_quality_status": (
+                            result.get("fine") or {}
+                        ).get("fine_quality_status"),
+                        "valid_frames": (
+                            result.get("fine") or {}
+                        ).get("valid_frames", 0),
+                    }
+                    for hole_id, result in values.items()
+                    if isinstance(hole_id, int)
+                }
+
+            for group_index, group in enumerate(batch_fine_groups, start=1):
+                group_ids = [int(hole["hole_id"]) for hole in group]
+                group_report: dict[str, Any] = {
+                    "group_index": group_index,
+                    "hole_ids": group_ids,
+                    "hole_count": len(group),
+                    "accepted_holes": [],
+                    "fallback_holes": list(group_ids),
+                    "supplement_captures": [],
+                }
+                for hole_id in group_ids:
+                    fine_hole_groups_by_id[hole_id] = group_index
+                try:
+                    batch_target, batch_geometry = _plan_batch_coarse_group_pose(
+                        group, current_tcp, handeye, fixed_rz_rad,
+                        initial_intrinsics, cfg.fine_height_mm,
+                        cfg.batch_fine_view_margin_px,
+                    )
+                    group_report.update({
+                        "target_tcp_pose_m_rad": batch_geometry["target_tcp_pose_m_rad"],
+                        "combined_point_base_mm": batch_geometry.get("group_point_base_mm"),
+                        "combined_normal_base": batch_geometry.get(
+                            "group_normal_toward_camera_base"
+                        ),
+                        "pose_policy": "above_projected_bbox_center_of_all_coarse_holes",
+                        "projected_holes_px": {
+                            str(key): value.tolist()
+                            for key, value in batch_geometry["projected_holes_px"].items()
+                        },
+                        "group_bbox_px": batch_geometry["group_bbox_px"],
+                        "group_center_px": batch_geometry["group_center_px"].tolist(),
+                    })
+                    group_results: dict[Any, dict[str, Any]] = {}
+                    initial_capture_error: str | None = None
+                    with timing.measure(
+                        f"batch_fine/group_{group_index:02d}/navigate_to_260mm",
+                        hole_count=len(group), group_index=group_index,
+                    ):
+                        current_tcp = _move_to_shared_fine_pose(
+                            f"fine_group_{group_index:02d}", group_index,
+                            current_tcp, batch_target, args, motion_session, pose_session,
+                            target_height_mm=cfg.fine_height_mm,
+                            target_stage="批量精定位",
+                        )
+                    try:
+                        with timing.measure(
+                            f"batch_fine/group_{group_index:02d}/capture_and_localize",
+                            hole_count=len(group), group_index=group_index,
+                        ):
+                            group_results = _batch_fine_localization_at_260mm(
+                                group, current_tcp, handeye, rgbd_pipeline, model,
+                                args.confidence, cfg, initial_intrinsics, run_dir,
+                                timing, rows,
+                                artifact_prefix=f"batch_fine_group_{group_index:02d}",
+                            )
+                    except Exception as exc:
+                        initial_capture_error = f"{type(exc).__name__}:{exc}"
+                        group_report["initial_capture_error"] = initial_capture_error
+                        print(
+                            f"[BATCH_FINE] 第{group_index}组首拍失败，准备共享补拍: "
+                            f"{initial_capture_error}",
+                            flush=True,
+                        )
+                    group_metadata = group_results.pop("_batch_metadata", {})
+                    for hole_id, result in group_results.items():
+                        if isinstance(hole_id, int):
+                            result.setdefault("batch_fine_source", "batch_fine_at_260mm")
+                            result.setdefault("batch_fine_capture_round", 0)
+                    batch_fine_results.update({
+                        int(hole_id): result
+                        for hole_id, result in group_results.items()
+                        if isinstance(hole_id, int)
+                    })
+                    if initial_capture_error is not None and not group_results:
+                        for hole_id in group_ids:
+                            batch_fine_results[hole_id] = {
+                                "success": False,
+                                "error": initial_capture_error,
+                                "batch_fine_source": "batch_fine_at_260mm",
+                                "batch_fine_capture_round": 0,
+                            }
+                    group_report["capture"] = group_metadata
+                    group_report["initial_results"] = _summarize_batch_fine_results(
+                        group_results
+                    )
+
+                    # 首拍中只有质量门失败的孔进入补拍。补拍仍以失败孔集合
+                    # 规划共同260mm观察位，因此不会退化为逐孔精定位。
+                    pending_holes = [
+                        hole_id for hole_id in group_ids
+                        if not batch_fine_results.get(hole_id, {}).get("success", False)
+                    ]
+                    for supplement_round in range(
+                        1, max(0, int(cfg.batch_fine_supplement_rounds)) + 1
+                    ):
+                        if not pending_holes:
+                            break
+                        supplement_group = [
+                            fine_planning_holes_by_id[hole_id]
+                            for hole_id in pending_holes
+                            if hole_id in fine_planning_holes_by_id
+                        ]
+                        supplement_report: dict[str, Any] = {
+                            "round": supplement_round,
+                            "hole_ids": list(pending_holes),
+                            "hole_count": len(supplement_group),
+                            "accepted_holes": [],
+                            "fallback_holes": list(pending_holes),
+                        }
+                        if not supplement_group:
+                            supplement_report["error"] = (
+                                "补拍缺少可用粗定位几何，无法规划共享260mm补拍位"
+                            )
+                            group_report["supplement_captures"].append(supplement_report)
+                            break
+                        try:
+                            supplement_target, supplement_geometry = (
+                                _plan_batch_coarse_group_pose(
+                                    supplement_group, current_tcp, handeye, fixed_rz_rad,
+                                    initial_intrinsics, cfg.fine_height_mm,
+                                    cfg.batch_fine_view_margin_px,
+                                )
+                            )
+                            supplement_report.update({
+                                "target_tcp_pose_m_rad": supplement_geometry[
+                                    "target_tcp_pose_m_rad"
+                                ],
+                                "combined_point_base_mm": supplement_geometry.get(
+                                    "group_point_base_mm"
+                                ),
+                                "combined_normal_base": supplement_geometry.get(
+                                    "group_normal_toward_camera_base"
+                                ),
+                                "pose_policy": (
+                                    "above_projected_bbox_center_of_failed_coarse_holes"
+                                ),
+                                "projected_holes_px": {
+                                    str(key): value.tolist()
+                                    for key, value in supplement_geometry[
+                                        "projected_holes_px"
+                                    ].items()
+                                },
+                                "group_bbox_px": supplement_geometry["group_bbox_px"],
+                                "group_center_px": supplement_geometry[
+                                    "group_center_px"
+                                ].tolist(),
+                            })
+                            with timing.measure(
+                                f"batch_fine/group_{group_index:02d}/supplement_{supplement_round:02d}/navigate_to_260mm",
+                                hole_count=len(supplement_group),
+                                group_index=group_index,
+                                supplement_round=supplement_round,
+                            ):
+                                current_tcp = _move_to_shared_fine_pose(
+                                    f"fine_group_{group_index:02d}_supplement_{supplement_round:02d}",
+                                    group_index,
+                                    current_tcp,
+                                    supplement_target,
+                                    args,
+                                    motion_session,
+                                    pose_session,
+                                    target_height_mm=cfg.fine_height_mm,
+                                    target_stage="共享精定位补拍",
+                                )
+                            with timing.measure(
+                                f"batch_fine/group_{group_index:02d}/supplement_{supplement_round:02d}/capture_and_localize",
+                                hole_count=len(supplement_group),
+                                group_index=group_index,
+                                supplement_round=supplement_round,
+                            ):
+                                supplement_results = _batch_fine_localization_at_260mm(
+                                    supplement_group,
+                                    current_tcp,
+                                    handeye,
+                                    rgbd_pipeline,
+                                    model,
+                                    args.confidence,
+                                    cfg,
+                                    initial_intrinsics,
+                                    run_dir,
+                                    timing,
+                                    rows,
+                                    artifact_prefix=(
+                                        f"batch_fine_group_{group_index:02d}"
+                                        f"_supplement_{supplement_round:02d}"
+                                    ),
+                                )
+                            supplement_metadata = supplement_results.pop(
+                                "_batch_metadata", {}
+                            )
+                            for hole_id, result in supplement_results.items():
+                                if not isinstance(hole_id, int):
+                                    continue
+                                result["batch_fine_source"] = (
+                                    "batch_fine_supplement_at_260mm"
+                                )
+                                result["batch_fine_capture_round"] = supplement_round
+                                batch_fine_results[int(hole_id)] = result
+                            supplement_report["capture"] = supplement_metadata
+                            supplement_report["results"] = (
+                                _summarize_batch_fine_results(supplement_results)
+                            )
+                            supplement_report["accepted_holes"] = [
+                                int(hole_id) for hole_id, result in supplement_results.items()
+                                if isinstance(hole_id, int)
+                                and result.get("success", False)
+                            ]
+                            pending_holes = [
+                                hole_id for hole_id in group_ids
+                                if not batch_fine_results.get(hole_id, {}).get(
+                                    "success", False
+                                )
+                            ]
+                            supplement_report["fallback_holes"] = list(pending_holes)
+                            print(
+                                f"[BATCH_FINE] 第{group_index}组第{supplement_round}轮"
+                                f"共享补拍完成；accepted={supplement_report['accepted_holes']} "
+                                f"fallback={pending_holes}",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            supplement_report["error"] = (
+                                f"{type(exc).__name__}:{exc}"
+                            )
+                            supplement_report["fallback_reason"] = (
+                                "batch_fine_supplement_failed"
+                            )
+                            for hole_id in pending_holes:
+                                previous = dict(batch_fine_results.get(hole_id, {}))
+                                previous.update({
+                                    "success": False,
+                                    "error": supplement_report["error"],
+                                    "batch_fine_source": (
+                                        "batch_fine_supplement_at_260mm"
+                                    ),
+                                    "batch_fine_capture_round": supplement_round,
+                                })
+                                batch_fine_results[hole_id] = previous
+                            print(
+                                f"[BATCH_FINE] 第{group_index}组第{supplement_round}轮"
+                                f"共享补拍失败: {supplement_report['error']}",
+                                flush=True,
+                            )
+                        group_report["supplement_captures"].append(supplement_report)
+
+                    group_report["accepted_holes"] = [
+                        hole_id for hole_id in group_ids
+                        if batch_fine_results.get(hole_id, {}).get("success", False)
+                    ]
+                    group_report["fallback_holes"] = [
+                        hole_id for hole_id in group_ids
+                        if hole_id not in group_report["accepted_holes"]
+                    ]
+                    group_report["results"] = _summarize_batch_fine_results({
+                        hole_id: batch_fine_results[hole_id]
+                        for hole_id in group_ids
+                        if hole_id in batch_fine_results
+                    })
+                except Exception as exc:
+                    group_report["error"] = f"{type(exc).__name__}:{exc}"
+                    group_report["fallback_reason"] = "batch_fine_group_failed"
+                    for hole_id in group_ids:
+                        batch_fine_results[hole_id] = {
+                            "success": False,
+                            "error": group_report["error"],
+                            "batch_fine_source": "batch_fine_group_failed",
+                            "batch_fine_capture_round": 0,
+                        }
+                    print(
+                        f"[BATCH_FINE] 第{group_index}组失败，无法规划共享补拍: {exc}",
+                        flush=True,
+                    )
+                batch_fine_plan["groups"].append(group_report)
+
+            batch_fine_plan["fallback_holes"] = sorted({
+                *missing_fine_geometry,
+                *[
+                    hole_id for group in batch_fine_plan["groups"]
+                    for hole_id in group.get("fallback_holes", [])
+                ],
+            })
+            batch_fine_plan["hole_group_indices"] = {
+                str(hole_id): group_index
+                for hole_id, group_index in fine_hole_groups_by_id.items()
+            }
+        else:
+            batch_fine_plan["fallback_holes"] = missing_fine_geometry
+            batch_fine_plan["reason"] = (
+                "shared_coarse_capture_incomplete_abort_fine_capture"
+                if all_selected_two_capture_mode and missing_fine_geometry else
+                "no_hole_has_reliable_coarse_geometry"
+            )
+    elif len(initial_holes) <= 1:
+        batch_fine_plan["reason"] = "single_hole"
+    else:
+        batch_fine_plan["reason"] = "batch_fine_disabled"
+
+    report["stages"]["batch_fine_plan"] = batch_fine_plan
+    report["stages"]["batch_fine_results"] = {
+        "success_count": sum(
+            1 for result in batch_fine_results.values() if result.get("success", False)
+        ),
+        "total_count": len(initial_holes),
+        "fallback_holes": batch_fine_plan.get("fallback_holes", []),
+        "group_count": len(batch_fine_plan.get("groups", [])),
+        "groups": batch_fine_plan.get("groups", []),
+    }
+
     if bool(getattr(args, "optimize_hole_order", False)) and batch_coarse_results:
         original_order = list(order_ids)
         targets = {
@@ -4591,13 +6017,102 @@ def _run_sequential_hole_workflow(
             and batch_coarse_results[hole_id].get("success", False)
         )
         shared_cache_available = hole_id in shared_cache_results
+        batch_fine_available = (
+            hole_id in batch_fine_results
+            and batch_fine_results[hole_id].get("success", False)
+        )
+        batch_fine_result = batch_fine_results.get(hole_id, {})
+        initial_pointcloud_reuse_available = bool(
+            hole.get("coarse_source") == "initial_selection_shared_pointcloud_reuse"
+            and hole.get("coarse_center_base_mm") is not None
+            and hole.get("coarse_normal_toward_camera_base") is not None
+        )
         coarse_settle_delay_s = max(0.0, float(cfg.coarse_settle_delay_s))
         coarse_captures: list[dict[str, Any]] = []
         final_center_offset: float | None = None
         final_normal_error: float | None = None
         last_coarse_observations: list[Observation] | None = None
         last_coarse_T_base_camera: np.ndarray | None = None
-        last_coarse_tcp: np.ndarray | None = None
+
+        # 批量模式的正式RGB图像已经在进入逐孔结果计算前统一拍完；首拍失败
+        # 的孔会在此前的共享精拍阶段尝试移动到补拍位。到这里仍失败时才延后，
+        # 不再悄悄转成逐孔精拍。
+        if (
+            cfg.batch_fine_localization
+            and len(initial_holes) > 1
+            and all_selected_two_capture_mode
+            and not batch_fine_available
+        ):
+            group_index = batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id))
+            group_error = next((
+                group.get("error")
+                for group in batch_fine_plan.get("groups", [])
+                if hole_id in group.get("hole_ids", []) and group.get("error")
+            ), None)
+            failure_reason = (
+                batch_fine_result.get("error")
+                or group_error
+                or "selected_hole_missing_from_single_batch_fine_frame"
+            )
+            deferred_result = {
+                "status": "deferred_batch_fine",
+                "hole_id": hole_id,
+                "processing_order": order,
+                "tracking_identity": hole["tracking_identity"],
+                "initial_selection_order": hole.get("initial_selection_order"),
+                "initial_center_px": hole.get("initial_center_px"),
+                "initial_center_base_mm": hole.get("initial_center_base_mm"),
+                "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
+                "initial_pointcloud_reused_for_batch_fine": bool(
+                    hole.get("initial_pointcloud_reused_for_batch_fine")
+                ),
+                "coarse_source": hole.get("coarse_source"),
+                "coarse_center_base_mm": hole.get("coarse_center_base_mm"),
+                "coarse_plane_point_base_mm": hole.get("coarse_plane_point_base_mm"),
+                "coarse_normal_toward_camera_base": hole.get(
+                    "coarse_normal_toward_camera_base"
+                ),
+                "batch_fine_requested": True,
+                "batch_fine_source": str(
+                    batch_fine_result.get(
+                        "batch_fine_source", "shared_batch_fine_failed"
+                    )
+                ),
+                "batch_fine_capture_round": int(
+                    batch_fine_result.get("batch_fine_capture_round", 0)
+                ),
+                "batch_fine_group_index": group_index,
+                "fine_quality_status": "deferred_batch_fine",
+                "fine_quality_note": failure_reason,
+                "deferred_reason": failure_reason,
+                "final_xy_motion": None,
+                "final_z_motion": None,
+                "final_y_trim_motion": None,
+                "tracking_events": hole.get("tracking_events", []),
+                "initial_detection": hole.get("initial_detection"),
+                "timing": timing.scoped_snapshot(f"hole_{hole_id:02d}/"),
+            }
+            deferred_result["comparison_diagnostics"] = _build_comparison_hole_diagnostics(
+                deferred_result
+            )
+            hole["final_result"] = deferred_result
+            results.append(deferred_result)
+            report["stages"][f"hole_{hole_id}"] = deferred_result
+            report.setdefault("deferred_holes", []).append(hole_id)
+            report["stages"]["processed_holes"] = {
+                "completed_count": sum(item.get("status") == "completed" for item in results),
+                "deferred_count": sum(item.get("status") != "completed" for item in results),
+                "total_count": len(results),
+                "hole_order": [int(item["hole_id"]) for item in results],
+                "holes": results,
+            }
+            _write_report(run_dir, report, rows)
+            print(
+                f"[BATCH_FINE] hole={hole_id} status=deferred_batch_fine；"
+                f"单拍失败且禁止逐孔补拍：{failure_reason}",
+                flush=True,
+            )
+            continue
 
         if batch_coarse_available:
             # 使用批量粗定位结果，跳过逐孔粗定位流程
@@ -4669,36 +6184,43 @@ def _run_sequential_hole_workflow(
             }
             cache_reused = False
 
-            # 共同340 mm位姿只负责一次采集整组点云。随后仍需按当前孔的
-            # 融合中心和法向安全移动到该孔的260 mm精定位位。
             rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
-            batch_fine_target, batch_fine_geometry = _plan_hole_tcp_pose_fixed_rz(
-                np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
-                np.asarray(hole["coarse_normal_toward_camera_base"], dtype=np.float64),
-                current_tcp,
-                handeye.T_tcp_rgb_camera,
-                fixed_rz_rad=fixed_rz_rad,
-                camera_height_mm=cfg.fine_height_mm,
-            )
-            hole["batch_fine_target_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
-                batch_fine_target
-            )
-            hole["batch_fine_pose_geometry"] = batch_fine_geometry
-            with timing.measure(
-                f"hole_{hole_id:02d}/batch_move_to_fine_pose",
-                hole_id=hole_id,
-                processing_order=order,
-            ):
-                current_tcp = _move_to_fine_pose(
-                    str(hole_id),
-                    order,
+            if not batch_fine_available:
+                # 没有成功的共同260mm批量结果时，保留原有逐孔精定位兜底。
+                batch_fine_target, batch_fine_geometry = _plan_hole_tcp_pose_fixed_rz(
+                    np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
+                    np.asarray(hole["coarse_normal_toward_camera_base"], dtype=np.float64),
                     current_tcp,
-                    batch_fine_target,
-                    args,
-                    motion_session,
-                    pose_session,
-                    target_height_mm=cfg.fine_height_mm,
-                    target_stage="批量粗定位后的精定位",
+                    handeye.T_tcp_rgb_camera,
+                    fixed_rz_rad=fixed_rz_rad,
+                    camera_height_mm=cfg.fine_height_mm,
+                )
+                hole["batch_fine_target_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
+                    batch_fine_target
+                )
+                hole["batch_fine_pose_geometry"] = batch_fine_geometry
+                with timing.measure(
+                    f"hole_{hole_id:02d}/batch_move_to_fine_pose",
+                    hole_id=hole_id,
+                    processing_order=order,
+                ):
+                    current_tcp = _move_to_fine_pose(
+                        str(hole_id),
+                        order,
+                        current_tcp,
+                        batch_fine_target,
+                        args,
+                        motion_session,
+                        pose_session,
+                        target_height_mm=cfg.fine_height_mm,
+                        target_stage="批量粗定位后的单孔精定位兜底",
+                    )
+            else:
+                hole["batch_fine_localization_source"] = str(
+                    batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+                )
+                hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
+                    batch_fine_result["capture_tcp"]
                 )
 
         elif shared_cache_available:
@@ -4728,23 +6250,66 @@ def _run_sequential_hole_workflow(
                 "summary": {"validation": validation.to_dict()},
             }]
             rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
-            fine_target, fine_geometry = _plan_hole_tcp_pose_fixed_rz(
-                np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
-                np.asarray(hole["coarse_normal_toward_camera_base"], dtype=np.float64),
-                current_tcp, handeye.T_tcp_rgb_camera, fixed_rz_rad=fixed_rz_rad,
-                camera_height_mm=cfg.fine_height_mm,
-            )
-            hole["shared_cache_fine_target_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(fine_target)
-            hole["shared_cache_fine_pose_geometry"] = fine_geometry
-            with timing.measure(
-                f"hole_{hole_id:02d}/shared_cache_move_to_fine_pose",
-                hole_id=hole_id, processing_order=order,
-            ):
-                current_tcp = _move_to_fine_pose(
-                    str(hole_id), order, current_tcp, fine_target, args,
-                    motion_session, pose_session, target_height_mm=cfg.fine_height_mm,
-                    target_stage="共享缓存验证后的精定位",
+            if not batch_fine_available:
+                fine_target, fine_geometry = _plan_hole_tcp_pose_fixed_rz(
+                    np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
+                    np.asarray(hole["coarse_normal_toward_camera_base"], dtype=np.float64),
+                    current_tcp, handeye.T_tcp_rgb_camera, fixed_rz_rad=fixed_rz_rad,
+                    camera_height_mm=cfg.fine_height_mm,
                 )
+                hole["shared_cache_fine_target_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(fine_target)
+                hole["shared_cache_fine_pose_geometry"] = fine_geometry
+                with timing.measure(
+                    f"hole_{hole_id:02d}/shared_cache_move_to_fine_pose",
+                    hole_id=hole_id, processing_order=order,
+                ):
+                    current_tcp = _move_to_fine_pose(
+                        str(hole_id), order, current_tcp, fine_target, args,
+                        motion_session, pose_session, target_height_mm=cfg.fine_height_mm,
+                        target_stage="共享缓存验证后的单孔精定位兜底",
+                    )
+            else:
+                hole["batch_fine_localization_source"] = str(
+                    batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+                )
+                hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
+                    batch_fine_result["capture_tcp"]
+                )
+
+        elif initial_pointcloud_reuse_available:
+            # 直接复用本轮初始选孔帧的逐孔点云。这不是历史缓存命中，
+            # 不做340mm验证、不移动、不重新读取点云。
+            print(
+                f"[POINTCLOUD_REUSE] hole={hole_id} 复用本轮初始RGB-D点云，"
+                "跳过逐孔340mm采集",
+                flush=True,
+            )
+            cache_event = {
+                "enabled": False,
+                "hole_id": hole_id,
+                "cache_available": False,
+                "cache_source": "initial_selection_shared_pointcloud_reuse",
+                "cache_reused": False,
+                "initial_pointcloud_reused": True,
+                "reuse_scope": "current_cycle_initial_rgbd_frame",
+                "cache_validation_skipped": True,
+                "cache_validation_failed": False,
+                "full_coarse_fallback": False,
+                "coarse_settle_buffer_s": 0.0,
+                "navigation_source": "batch_fine_group_already_captured",
+                "navigation_point_base_mm": np.asarray(
+                    hole["coarse_center_base_mm"], dtype=np.float64
+                ).copy(),
+            }
+            # 内部沿用“粗几何已就绪”布尔量；报告通过独立字段与缓存区分。
+            cache_reused = True
+            coarse_captures = list(hole.get("coarse_captures", []))
+            hole["batch_fine_localization_source"] = str(
+                batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+            )
+            hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
+                batch_fine_result["capture_tcp"]
+            )
 
         else:
             # 使用传统逐孔粗定位流程
@@ -4994,7 +6559,6 @@ def _run_sequential_hole_workflow(
             # capture_tcp 与采集期间的 current_tcp 相同，复用上面已计算的变换。
             last_coarse_observations = coarse_observations
             last_coarse_T_base_camera = np.asarray(T_base_camera, dtype=np.float64).copy()
-            last_coarse_tcp = capture_tcp
             with timing.measure(
                 f"hole_{hole_id:02d}/coarse_pointcloud_geometry_{capture_index}",
                 hole_id=hole_id,
@@ -5173,7 +6737,16 @@ def _run_sequential_hole_workflow(
                 "initial_center_px": hole.get("initial_center_px"),
                 "initial_center_base_mm": hole.get("initial_center_base_mm"),
                 "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
-                "batch_coarse_requested": bool(cfg.batch_coarse_localization),
+                "batch_coarse_requested": bool(batch_coarse_for_cache),
+                "batch_fine_requested": bool(cfg.batch_fine_localization),
+                "batch_fine_source": (
+                    str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                    if batch_fine_available else "per_hole_fine_fallback"
+                ),
+                "batch_fine_capture_round": int(
+                    batch_fine_result.get("batch_fine_capture_round", 0)
+                ),
+                "batch_fine_group_index": batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id)),
                 "batch_coarse_fallback_reason": (
                     batch_coarse_results.get(hole_id, {}).get("error")
                     if batch_coarse_results else None
@@ -5257,6 +6830,8 @@ def _run_sequential_hole_workflow(
             )
             cache_event["coarse_capture_time_saved_s"] = None
             cache_event["coarse_capture_time_saved_basis"] = (
+                "current_initial_rgbd_pointcloud_reuse"
+                if cache_event.get("initial_pointcloud_reused") else
                 "direct_cache_reuse_no_live_validation_baseline"
             )
         else:
@@ -5277,58 +6852,110 @@ def _run_sequential_hole_workflow(
         hole["coarse_plane_point_base_mm"] = coarse_plane_base
         hole["coarse_normal_toward_camera_base"] = coarse_normal_base
 
-        estimated_height = None
-        for height_index in range(cfg.max_z_corrections):
-            _, actual_tcp = _require_safe_snapshot(pose_session)
+        # 260 mm共享精拍只是一处同时观察全部孔的相机位姿，不能作为每个孔
+        # 的最终姿态底稿。逐孔保存由该孔粗定位中心和法向生成的260 mm参考
+        # 位姿；执行最终动作时先恢复这个孔自己的Z和姿态，再仅写入精拍XY。
+        coarse_fine_reference_tcp: np.ndarray | None = None
+        coarse_fine_reference_geometry: dict[str, Any] | None = None
+        if batch_fine_available:
+            coarse_fine_reference_tcp, coarse_fine_reference_geometry = (
+                _plan_hole_tcp_pose_fixed_rz(
+                    np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
+                    coarse_normal_base,
+                    current_tcp,
+                    handeye.T_tcp_rgb_camera,
+                    fixed_rz_rad=fixed_rz_rad,
+                    camera_height_mm=cfg.fine_height_mm,
+                )
+            )
+            hole["coarse_fine_reference_tcp_pose_m_rad"] = (
+                transform_to_sdk_pose_m_rad(coarse_fine_reference_tcp)
+            )
+            hole["coarse_fine_reference_pose_geometry"] = coarse_fine_reference_geometry
+
+        if batch_fine_available:
+            # 批量精定位已经在共同260mm位姿完成；这里仅使用采集位姿做
+            # 像素到基坐标的转换，不再为当前孔重复移动、等待或拍照。
+            fine_capture_tcp = np.asarray(
+                batch_fine_result["capture_tcp"], dtype=np.float64,
+            ).copy()
             estimated_height = camera_height_to_plane_mm(
-                actual_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
+                fine_capture_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
             )
-            if abs(estimated_height - cfg.fine_height_mm) <= cfg.height_tolerance_mm:
-                current_tcp = actual_tcp
-                break
-            z_target, _ = base_z_target_for_camera_height(
-                actual_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base, cfg.fine_height_mm,
+            hole["fine_height_estimate_mm"] = estimated_height
+            fine_intrinsics = batch_fine_result["intrinsics"]
+            fine_observations = list(batch_fine_result.get("observations", []))
+            fine = batch_fine_result["fine"]
+            expected_fine_anchor_px = np.asarray(
+                batch_fine_result["expected_anchor_px"], dtype=np.float64,
+            ).copy()
+            fine_recovery = {
+                "success": True,
+                "observations": fine_observations,
+                "intrinsics": fine_intrinsics,
+                "fine": fine,
+                "attempts": fine.get("fine_recovery_attempts", []),
+                "error": None,
+            }
+            _record_hole_tracking_event(
+                hole, "batch_fine", expected_fine_anchor_px,
+                fine_observations, fine_intrinsics,
+                "undistorted_pixel_yolo_center",
             )
+        else:
+            estimated_height = None
+            for height_index in range(cfg.max_z_corrections):
+                _, actual_tcp = _require_safe_snapshot(pose_session)
+                estimated_height = camera_height_to_plane_mm(
+                    actual_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
+                )
+                if abs(estimated_height - cfg.fine_height_mm) <= cfg.height_tolerance_mm:
+                    current_tcp = actual_tcp
+                    break
+                z_target, _ = base_z_target_for_camera_height(
+                    actual_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base, cfg.fine_height_mm,
+                )
+                with timing.measure(
+                    f"hole_{hole_id:02d}/move_to_fine_height_{height_index + 1}",
+                    hole_id=hole_id,
+                    processing_order=order,
+                    correction_index=height_index + 1,
+                ):
+                    current_tcp = _confirm_and_move_line(
+                        f"孔{hole_id}仅基坐标Z下降至{cfg.fine_height_mm:.0f} mm",
+                        actual_tcp, z_target, args, motion_session, pose_session,
+                        f"当前孔估计高度={estimated_height:.2f} mm；XY、姿态和RZ锁定",
+                        require_confirmation=False,
+                        motion_profile="approach",
+                    )
+            _, current_tcp = _require_safe_snapshot(pose_session)
+            estimated_height = camera_height_to_plane_mm(
+                current_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
+            )
+            if abs(estimated_height - cfg.fine_height_mm) > cfg.height_tolerance_mm:
+                raise RuntimeError(
+                    f"孔{hole_id}仅Z修正后仍未达到精拍高度：{estimated_height:.2f} mm"
+                )
+            hole["fine_height_estimate_mm"] = estimated_height
+            fine_capture_tcp = np.asarray(current_tcp, dtype=np.float64).copy()
+
+            # RGB 精定位只需要 RGB 帧；get_rgb_frame_bundle 不会读取深度或生成点云，
+            # 因此直接复用当前 RGB-D pipeline，避免每个孔重复 stop/start 两套相机管线。
             with timing.measure(
-                f"hole_{hole_id:02d}/move_to_fine_height_{height_index + 1}",
+                f"hole_{hole_id:02d}/reuse_rgbd_pipeline_for_rgb",
                 hole_id=hole_id,
                 processing_order=order,
-                correction_index=height_index + 1,
             ):
-                current_tcp = _confirm_and_move_line(
-                    f"孔{hole_id}仅基坐标Z下降至{cfg.fine_height_mm:.0f} mm",
-                    actual_tcp, z_target, args, motion_session, pose_session,
-                    f"当前孔估计高度={estimated_height:.2f} mm；XY、姿态和RZ锁定",
-                    require_confirmation=False,
-                    motion_profile="approach",
-                )
-        _, current_tcp = _require_safe_snapshot(pose_session)
-        estimated_height = camera_height_to_plane_mm(
-            current_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
-        )
-        if abs(estimated_height - cfg.fine_height_mm) > cfg.height_tolerance_mm:
-            raise RuntimeError(
-                f"孔{hole_id}仅Z修正后仍未达到精拍高度：{estimated_height:.2f} mm"
+                fine_pipeline = rgbd_pipeline
+            T_base_camera_fine = camera_transform(fine_capture_tcp, handeye.T_tcp_rgb_camera)
+            expected_fine_anchor_px = _project_base_point_to_pixel(
+                np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
+                T_base_camera_fine, initial_intrinsics,
             )
-        hole["fine_height_estimate_mm"] = estimated_height
-
-        # RGB 精定位只需要 RGB 帧；get_rgb_frame_bundle 不会读取深度或生成点云，
-        # 因此直接复用当前 RGB-D pipeline，避免每个孔重复 stop/start 两套相机管线。
-        with timing.measure(
-            f"hole_{hole_id:02d}/reuse_rgbd_pipeline_for_rgb",
-            hole_id=hole_id,
-            processing_order=order,
-        ):
-            fine_pipeline = rgbd_pipeline
-        T_base_camera_fine = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
-        expected_fine_anchor_px = _project_base_point_to_pixel(
-            np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
-            T_base_camera_fine, initial_intrinsics,
-        )
-        fine_recovery = _capture_fine_with_recovery(
-            fine_pipeline, model, args.confidence, chosen, cfg, run_dir,
-            hole, hole_id, order, expected_fine_anchor_px, timing, rows,
-        )
+            fine_recovery = _capture_fine_with_recovery(
+                fine_pipeline, model, args.confidence, chosen, cfg, run_dir,
+                hole, hole_id, order, expected_fine_anchor_px, timing, rows,
+            )
         fine_observations = fine_recovery["observations"]
         fine_intrinsics = fine_recovery["intrinsics"]
         fine = fine_recovery["fine"]
@@ -5342,7 +6969,16 @@ def _run_sequential_hole_workflow(
                 "initial_center_px": hole.get("initial_center_px"),
                 "initial_center_base_mm": hole.get("initial_center_base_mm"),
                 "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
-                "batch_coarse_requested": bool(cfg.batch_coarse_localization),
+                "batch_coarse_requested": bool(batch_coarse_for_cache),
+                "batch_fine_requested": bool(cfg.batch_fine_localization),
+                "batch_fine_source": (
+                    str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                    if batch_fine_available else "per_hole_fine_fallback"
+                ),
+                "batch_fine_capture_round": int(
+                    batch_fine_result.get("batch_fine_capture_round", 0)
+                ),
+                "batch_fine_group_index": batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id)),
                 "batch_coarse_fallback_reason": (
                     batch_coarse_results.get(hole_id, {}).get("error")
                     if batch_coarse_results else None
@@ -5446,7 +7082,7 @@ def _run_sequential_hole_workflow(
             processing_order=order,
         ):
             naive_final_point_base = pixel_to_base_plane(
-                fine["center_px"], fine_intrinsics, current_tcp, handeye.T_tcp_rgb_camera,
+                fine["center_px"], fine_intrinsics, fine_capture_tcp, handeye.T_tcp_rgb_camera,
                 coarse_plane_base, coarse_normal_base, center_is_undistorted=True,
             )
         diameter_px = float(max(float(fine["axes_px_median"][0]), float(fine["axes_px_median"][1])))
@@ -5454,7 +7090,7 @@ def _run_sequential_hole_workflow(
             (fine_intrinsics.fx + fine_intrinsics.fy) / 2.0
         )
         nearest_diameter = min(HOLE_DIAMETERS_MM, key=lambda value: abs(value - diameter_estimate))
-        T_base_camera_fine = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
+        T_base_camera_fine = camera_transform(fine_capture_tcp, handeye.T_tcp_rgb_camera)
         final_normal = (
             coarse_normal_base
             if float(coarse_normal_base @ T_base_camera_fine[:3, 2]) < 0.0
@@ -5469,27 +7105,45 @@ def _run_sequential_hole_workflow(
                 processing_order=order,
             ):
                 final_point_base, tilt_correction = correct_projected_circle_center(
-                    fine["center_px"], fine_intrinsics, current_tcp, handeye.T_tcp_rgb_camera,
+                    fine["center_px"], fine_intrinsics, fine_capture_tcp, handeye.T_tcp_rgb_camera,
                     coarse_plane_base, coarse_normal_base, nearest_diameter,
                     iterations=cfg.tilt_correction_iterations,
                     samples=cfg.tilt_correction_samples,
                     max_correction_mm=cfg.max_tilt_correction_mm,
                 )
 
+        # 共享精拍只更新每孔最终XY。该孔的最终Z与姿态仍由粗定位决定；
+        # 非共享精拍流程保持原有三维最终点行为。
+        pose_point_base = np.asarray(final_point_base, dtype=np.float64).copy()
+        if batch_fine_available:
+            pose_point_base = compose_batch_fine_xy_with_coarse_z(
+                pose_point_base,
+                np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
+            )
+
         # 先按最终点模式施加基坐标偏移，再用偏移后的点规划最终移动。
         final_target_mode = str(getattr(args, "final_target_mode", DEFAULT_FINAL_TARGET_MODE))
         final_x_offset_mm, final_z_offset_mm = final_point_offsets_for_mode(final_target_mode)
         final_target_point_base = apply_final_point_base_offsets(
-            final_point_base, final_x_offset_mm, final_z_offset_mm,
+            pose_point_base, final_x_offset_mm, final_z_offset_mm,
         )
-        fine_tcp = current_tcp.copy()
+        fine_tcp = np.asarray(fine_capture_tcp, dtype=np.float64).copy()
         final_xy_motion: dict[str, Any] | None = None
         final_z_motion: dict[str, Any] | None = None
         final_y_trim_motion: dict[str, Any] | None = None
-        hole_pose, hole_pose_geometry = _plan_hole_tcp_pose_fixed_rz(
-            final_target_point_base, coarse_normal_base, current_tcp,
-            handeye.T_tcp_rgb_camera, fixed_rz_rad=fixed_rz_rad,
-        )
+        if args.move_final_xy and batch_fine_available:
+            assert coarse_fine_reference_tcp is not None
+            with timing.measure(
+                f"hole_{hole_id:02d}/restore_coarse_pose_for_final_motion",
+                hole_id=hole_id,
+                processing_order=order,
+            ):
+                current_tcp = _restore_batch_fine_pose_for_final_motion(
+                    str(hole_id), order, current_tcp, coarse_fine_reference_tcp,
+                    args, motion_session, pose_session,
+                    target_height_mm=cfg.fine_height_mm,
+                )
+            hole["coarse_pose_restored_for_batch_fine_final_motion"] = True
         if args.move_final_xy:
             fixed_offset = (
                 None if args.tcp_xy_offset_mm is None
@@ -5522,6 +7176,7 @@ def _run_sequential_hole_workflow(
                 "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                 "tcp_position_before_mm": tcp_before,
                 "hole_center_base_mm": final_point_base,
+                "pose_point_base_mm": pose_point_base,
                 "target_point_base_mm": final_target_point_base,
                 "final_point_mode": final_target_mode,
                 "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
@@ -5603,7 +7258,16 @@ def _run_sequential_hole_workflow(
             "initial_center_px": hole.get("initial_center_px"),
             "initial_center_base_mm": hole.get("initial_center_base_mm"),
             "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
-            "batch_coarse_requested": bool(cfg.batch_coarse_localization),
+            "batch_coarse_requested": bool(batch_coarse_for_cache),
+            "batch_fine_requested": bool(cfg.batch_fine_localization),
+            "batch_fine_source": (
+                str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                if batch_fine_available else "per_hole_fine"
+            ),
+            "batch_fine_capture_round": int(
+                batch_fine_result.get("batch_fine_capture_round", 0)
+            ),
+            "batch_fine_group_index": batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id)),
             "batch_coarse_fallback_reason": batch_fallback_reason,
             "coarse_source": coarse_source,
             "fine_center_source": fine.get("center_source", "unknown"),
@@ -5612,6 +7276,16 @@ def _run_sequential_hole_workflow(
             "fine_quality_note": fine.get("fine_quality_note"),
             "fine_recovery_attempts": fine.get("fine_recovery_attempts", []),
             "hole_center_base_mm": final_point_base,
+            "hole_result_type": "base_frame_3d_point",
+            "final_pose_source": (
+                "per_hole_coarse_pose_with_batch_fine_xy_only"
+                if batch_fine_available else "per_hole_fine_pose_and_center"
+            ),
+            "batch_fine_xy_only": bool(batch_fine_available),
+            "coarse_fine_reference_tcp_pose_m_rad": (
+                transform_to_sdk_pose_m_rad(coarse_fine_reference_tcp)
+                if coarse_fine_reference_tcp is not None else None
+            ),
             "target_point_base_mm": final_target_point_base,
             "hole_center_base_naive_mm": naive_final_point_base,
             "final_point_mode": final_target_mode,
@@ -5649,16 +7323,24 @@ def _run_sequential_hole_workflow(
             "fine_xy_source": (
                 "pointcloud_anchor_locked_yolo_center_on_coarse_local_plane"
             ),
-            "fine_z_source": "coarse_front_surface_plane_intersection_z",
+            "fine_z_source": (
+                "per_hole_coarse_center_z"
+                if batch_fine_available else
+                "coarse_front_surface_plane_intersection_z"
+            ),
             "tilt_center_correction": tilt_correction,
             "estimated_height_mm": estimated_height,
             "diameter_estimate_mm": diameter_estimate,
             "matched_diameter_mm": nearest_diameter,
             "plane_normal_toward_camera_base": final_normal,
-            "hole_pose_m_rad": transform_to_sdk_pose_m_rad(hole_pose),
-            "hole_pose_geometry": hole_pose_geometry,
             "fixed_rz_rad": fixed_rz_rad,
-            "fine_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(fine_tcp),
+            "shared_batch_capture_tcp_pose_m_rad": (
+                transform_to_sdk_pose_m_rad(fine_capture_tcp)
+                if batch_fine_available else None
+            ),
+            "fine_tcp_pose_m_rad": (
+                None if batch_fine_available else transform_to_sdk_pose_m_rad(fine_tcp)
+            ),
             "final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
             "final_xy_motion": final_xy_motion,
             "final_z_motion": final_z_motion,
@@ -5696,7 +7378,13 @@ def _run_sequential_hole_workflow(
             flush=True,
         )
 
-        if order < len(initial_holes):
+        if (
+            order < len(initial_holes)
+            and (
+                bool(getattr(args, "move_final_xy", False))
+                or not all_selected_two_capture_mode
+            )
+        ):
             next_hole_id = int(initial_holes[order]["hole_id"])
             with timing.measure(
                 f"hole_{hole_id:02d}/wait_next_hole_confirmation",
@@ -5712,19 +7400,34 @@ def _run_sequential_hole_workflow(
         item for item in results if item.get("status", "").startswith("deferred_")
     ]
     report["stages"]["sequential_holes"] = {
-        "mode": "one_hole_complete_then_next",
+        "mode": (
+            "single_batch_fine_capture_then_compute_all_holes"
+            if all_selected_two_capture_mode else
+            "one_hole_complete_then_next"
+        ),
         "hole_count": len(results),
         "completed_count": len(completed_results),
         "deferred_count": len(deferred_results),
-        "failed_holes": [
-            int(item["hole_id"]) for item in deferred_results
-            if item.get("status") == "deferred_coarse_quality"
-        ],
+        "failed_holes": [int(item["hole_id"]) for item in deferred_results],
         "hole_order": order_ids,
         "fixed_rz_rad": fixed_rz_rad,
         "tracking_identity_source": "initial_selection_order_and_locked_projected_anchor",
         "holes": results,
     }
+    try:
+        final_overlay = _save_batch_fine_final_result_overlay(
+            run_dir, batch_fine_results, results, handeye,
+        )
+    except Exception as exc:
+        final_overlay = {
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+        print(f"[FINAL_RESULT_OVERLAY_WARNING] {exc}", flush=True)
+    report["stages"]["batch_fine_final_result_overlay"] = final_overlay
+    if final_overlay and final_overlay.get("image_path"):
+        for item in results:
+            if str(item.get("batch_fine_source", "")).startswith("batch_fine"):
+                item["final_result_overlay_path"] = final_overlay["image_path"]
     report["final_result"] = {
         "hole_count": len(results),
         "completed_count": len(completed_results),
@@ -5772,6 +7475,74 @@ def _request_next_cycle_confirmation(cycle_index: int) -> str:
 
 
 
+def _restore_batch_fine_pose_for_final_motion(
+    hole_id: str,
+    order: int,
+    current_tcp: np.ndarray,
+    target_tcp: np.ndarray,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+    *,
+    target_height_mm: float = 260.0,
+    position_tolerance_mm: float = 0.5,
+    rotation_tolerance_deg: float = 0.5,
+) -> np.ndarray:
+    """共享精拍后，安全恢复当前孔由粗定位生成的260 mm参考位姿。
+
+    共享精拍会先完成全部孔的图像采集，随后逐孔执行最终动作；不能只把
+    target_tcp赋给current_tcp，因为那不会让机器人真实移动。位姿不一致时
+    复用安全的抬升-横移-分段下降路径，避免低位横移或沿用上一孔姿态。
+    """
+    actual = np.asarray(current_tcp, dtype=np.float64).reshape(4, 4).copy()
+    desired = np.asarray(target_tcp, dtype=np.float64).reshape(4, 4).copy()
+    position_error = float(np.linalg.norm(actual[:3, 3] - desired[:3, 3]))
+    rotation_error = _rotation_distance_deg(actual[:3, :3], desired[:3, :3])
+    if (
+        position_error <= float(position_tolerance_mm)
+        and rotation_error <= float(rotation_tolerance_deg)
+    ):
+        return actual
+    return _move_to_fine_pose(
+        hole_id,
+        order,
+        actual,
+        desired,
+        args,
+        motion_session,
+        pose_session,
+        target_height_mm=target_height_mm,
+        target_stage="恢复该孔粗定位位姿后执行精定位XY",
+        descent_guard_mm=SHARED_OBSERVATION_MIN_DESCENT_MM,
+    )
+
+
+def _move_to_shared_fine_pose(
+    group_label: str,
+    order: int,
+    current_tcp: np.ndarray,
+    target: np.ndarray,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+    *,
+    target_height_mm: float = 260.0,
+    target_stage: str = "共享精定位",
+) -> np.ndarray:
+    """共享精定位专用的共同260 mm观察位移动。"""
+    del order
+    return _move_to_shared_observation_pose(
+        target_stage,
+        current_tcp,
+        target,
+        args,
+        motion_session,
+        pose_session,
+        target_height_mm=target_height_mm,
+        descent_profile="approach",
+    )
+
+
 def _move_to_fine_pose(
     hole_id: str,
     order: int,
@@ -5783,6 +7554,7 @@ def _move_to_fine_pose(
     *,
     target_height_mm: float = 260.0,
     target_stage: str = "精定位",
+    descent_guard_mm: float = 0.0,
 ) -> np.ndarray:
     """沿安全高度移动到两阶段流程的目标相机高度。"""
 
@@ -5804,10 +7576,40 @@ def _move_to_fine_pose(
         motion_session, pose_session, "安全高度横移并调整目标姿态；不下降",
         require_confirmation=False, motion_profile="transit",
     )
+    guard_mm = max(0.0, float(descent_guard_mm))
+    if guard_mm > 0.0:
+        if float(safe_z - target[2, 3]) < guard_mm:
+            raise RuntimeError(
+                f"孔{hole_id}纯Z下降安全余量不足："
+                f"{float(safe_z - target[2, 3]):.3f}mm < {guard_mm:.3f}mm"
+            )
+        descent_guard = np.asarray(target, dtype=np.float64).copy()
+        descent_guard[2, 3] = float(target[2, 3]) + guard_mm
+        actual = _confirm_and_move_line(
+            f"孔{hole_id}纯Z下降到目标上方{guard_mm:.0f}mm安全位",
+            actual,
+            descent_guard,
+            args,
+            motion_session,
+            pose_session,
+            f"保持XY和姿态不变；先纯Z下降到目标上方{guard_mm:.0f}mm",
+            require_confirmation=False,
+            motion_profile="approach",
+        )
     return _confirm_and_move_line(
-        f"孔{hole_id}下降到{float(target_height_mm):.0f} mm{target_stage}位",
+        (
+            f"孔{hole_id}再纯Z下降{guard_mm:.0f}mm到"
+            f"{float(target_height_mm):.0f} mm{target_stage}位"
+            if guard_mm > 0.0 else
+            f"孔{hole_id}下降到{float(target_height_mm):.0f} mm{target_stage}位"
+        ),
         actual, target, args, motion_session, pose_session,
-        f"孔中心和法向已冻结；仅下降到指定RGB相机高度{float(target_height_mm):.0f} mm",
+        (
+            f"孔中心和法向已冻结；保持XY和姿态不变，最后纯Z下降{guard_mm:.0f}mm"
+            f"到指定RGB相机高度{float(target_height_mm):.0f} mm"
+            if guard_mm > 0.0 else
+            f"孔中心和法向已冻结；仅下降到指定RGB相机高度{float(target_height_mm):.0f} mm"
+        ),
         require_confirmation=False, motion_profile="approach",
     )
 
@@ -5950,12 +7752,17 @@ def _run_two_stage_localization_cycle(
         + T_base_camera_home[:3, 3]
     )
     camera_origin_home = T_base_camera_home[:3, 3]
+    group_plane_normal_camera = _unit(
+        np.asarray(initial_plane_camera.normal_camera, dtype=np.float64),
+        "initial group camera normal",
+    )
     plane_normal_base = _unit(
-        T_base_camera_home[:3, :3] @ initial_plane_camera.normal_camera,
+        T_base_camera_home[:3, :3] @ group_plane_normal_camera,
         "initial group base normal",
     )
     if float(plane_normal_base @ (camera_origin_home - selected_point_base)) < 0.0:
         plane_normal_base = -plane_normal_base
+        group_plane_normal_camera = -group_plane_normal_camera
     for hole in initial_selected_holes:
         point_camera = np.asarray(
             hole["initial_point_camera_mm"], dtype=np.float64,
@@ -5981,6 +7788,21 @@ def _run_two_stage_localization_cycle(
                 + T_base_camera_home[:3, 3]
             ).tolist(),
             "initial_plane_normal_base": normal_base.tolist(),
+            # 同一批孔属于同一工件平面：批量精定位统一使用这一个平面和
+            # 法向；逐孔字段仅保留作初始点云质量诊断。
+            "initial_shared_plane_point_camera_mm": (
+                np.asarray(initial_plane_camera.point_camera_mm, dtype=np.float64).tolist()
+            ),
+            "initial_shared_plane_point_base_mm": plane_point_base.tolist(),
+            "initial_shared_plane_normal_camera": group_plane_normal_camera.tolist(),
+            "initial_shared_plane_normal_base": plane_normal_base.tolist(),
+            "initial_shared_plane_rmse_mm": float(initial_plane_camera.rmse_mm),
+            "initial_shared_ring_points": int(initial_plane_camera.ring_points),
+            "initial_shared_surface_model": initial_plane_camera.surface_model,
+            "initial_shared_surface_selection_policy": (
+                initial_plane_camera.surface_selection_policy
+            ),
+            "initial_shared_front_surface_z_mm": initial_plane_camera.front_surface_z_mm,
             "tracking_identity": f"initial_selection_hole_{int(hole['hole_id'])}",
         })
     report["stages"]["home_selection"] = {
@@ -6024,7 +7846,6 @@ def _run_two_stage_localization_cycle(
     cache_entries: dict[int, CoarseCacheEntry] = {}
     cache_sources: dict[int, str] = {}
     cache_source_ids: dict[int, int] = {}
-    cache_failures: dict[int, str] = {}
     cache_built_ids: set[int] = set()
     persistent_entries: dict[int, CoarseCacheEntry] = {}
     persistent_load_errors: dict[int, str] = {}
@@ -6197,11 +8018,20 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
         fine_settle_discard_frames=int(args.fine_settle_discard_frames),
         fine_retry_count=int(args.fine_retries),
         batch_coarse_localization=bool(args.batch_coarse_localization),
-        batch_coarse_frames=int(args.batch_coarse_frames),
-        batch_coarse_min_valid=int(args.batch_coarse_min_valid),
+        batch_coarse_frames=int(getattr(args, "batch_coarse_frames", 15)),
+        batch_coarse_min_valid=int(getattr(args, "batch_coarse_min_valid", 10)),
         batch_coarse_settle_discard_frames=int(args.batch_coarse_settle_discard_frames),
         batch_coarse_min_holes_per_frame=int(args.batch_coarse_min_holes_per_frame) if args.batch_coarse_min_holes_per_frame is not None else None,
         batch_coarse_view_margin_px=float(args.batch_coarse_view_margin_px),
+        batch_fine_localization=bool(getattr(args, "batch_fine_localization", True)),
+        batch_fine_frames=int(getattr(args, "batch_fine_frames", 8)),
+        batch_fine_min_valid=int(getattr(args, "batch_fine_min_valid", 5)),
+        batch_fine_stable_min_frames=int(getattr(args, "batch_fine_stable_min_frames", 5)),
+        batch_fine_settle_discard_frames=int(getattr(args, "batch_fine_settle_discard_frames", 10)),
+        batch_fine_supplement_rounds=int(
+            getattr(args, "batch_fine_supplement_rounds", 1)
+        ),
+        batch_fine_view_margin_px=float(getattr(args, "batch_fine_view_margin_px", 50.0)),
         shared_cache_validation=bool(getattr(args, "shared_cache_validation", False)),
         shared_cache_validation_frames=int(args.shared_cache_validation_frames),
         shared_cache_validation_min_valid=int(args.shared_cache_validation_min_valid),
@@ -6286,6 +8116,22 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             raise ValueError("粗定位跟踪距离P95门限必须大于0")
         if cfg.batch_coarse_view_margin_px < 0:
             raise ValueError("批量粗定位视野边缘余量不能小于0")
+    if cfg.batch_fine_view_margin_px < 0.0 or not math.isfinite(cfg.batch_fine_view_margin_px):
+        raise ValueError("批量精定位视野边缘余量必须是大于等于0的有限数字")
+    if cfg.batch_fine_localization:
+        if cfg.batch_fine_frames < 1 or cfg.batch_fine_min_valid < 1:
+            raise ValueError("批量精定位帧数和最少有效帧数必须大于0")
+        if cfg.batch_fine_frames < cfg.batch_fine_min_valid:
+            raise ValueError("批量精定位帧数必须不少于最少有效帧数")
+        if (
+            cfg.batch_fine_stable_min_frames < 1
+            or cfg.batch_fine_stable_min_frames > cfg.batch_fine_frames
+        ):
+            raise ValueError("批量精定位稳定门帧数必须在批量帧数范围内")
+        if cfg.batch_fine_settle_discard_frames < 0:
+            raise ValueError("批量精定位停稳丢弃帧数不能小于0")
+        if cfg.batch_fine_supplement_rounds < 0:
+            raise ValueError("批量精定位共享补拍轮数不能小于0")
     cycle_index = 1
     run_dir = _new_two_stage_run_dir(cycle_index)
     report = _new_two_stage_report(args, handeye, cfg, run_dir, cycle_index)
@@ -6575,19 +8421,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_coarse_localization",
         action="store_true",
         default=False,
-        help="批量粗定位模式：在340mm一次性检测所有选中孔的位姿和深度，然后逐孔精定位",
+        help="批量粗定位模式：在340mm一次性检测所有选中孔的位姿和深度，然后按视野批量精定位",
     )
     p.add_argument(
         "--batch-coarse-frames",
         type=int,
         default=15,
-        help="批量粗定位模式的RGB-D采集帧数，默认15",
+        help="340mm共同位姿稳定连拍帧数，默认15；同一批帧覆盖全部选中孔",
     )
     p.add_argument(
         "--batch-coarse-min-valid",
         type=int,
         default=10,
-        help="批量粗定位模式每个孔最少有效帧数，默认10",
+        help="340mm共同粗定位每孔最少有效帧数，默认10",
     )
     p.add_argument(
         "--batch-coarse-settle-discard-frames",
@@ -6606,6 +8452,45 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=50.0,
         help="批量粗定位共同位姿的视野边缘安全余量(px)，默认50",
+    )
+    p.add_argument(
+        "--batch-fine-localization",
+        dest="batch_fine_localization",
+        action="store_true",
+        default=True,
+        help="260mm批量精定位：每个视野一次采集并精定位全部选中孔，默认开启",
+    )
+    p.add_argument(
+        "--no-batch-fine-localization",
+        dest="batch_fine_localization",
+        action="store_false",
+        help="关闭260mm批量精定位，恢复逐孔精定位",
+    )
+    p.add_argument(
+        "--batch-fine-view-margin-px",
+        type=float,
+        default=50.0,
+        help="260mm批量精定位共同位姿的视野边缘安全余量(px)，默认50",
+    )
+    p.add_argument(
+        "--batch-fine-frames", type=int, default=8,
+        help="260mm共同位姿严格几何圆心连拍最大帧数，默认8",
+    )
+    p.add_argument(
+        "--batch-fine-min-valid", type=int, default=5,
+        help="260mm共同精定位每孔最少严格几何圆心帧数，默认5",
+    )
+    p.add_argument(
+        "--batch-fine-stable-min-frames", type=int, default=5,
+        help="260mm共同精定位稳定验收所需严格几何圆心帧数，默认5",
+    )
+    p.add_argument(
+        "--batch-fine-settle-discard-frames", type=int, default=10,
+        help="260mm批量精定位正式采集前最少丢弃的停稳RGB帧数；随后自动确认已追上实时帧，默认10",
+    )
+    p.add_argument(
+        "--batch-fine-supplement-rounds", type=int, default=1,
+        help="260mm共享精拍质量不足时移动到失败孔共同观察位的补拍轮数，默认1",
     )
     p.add_argument(
         "--shared-cache-validation", action="store_true", default=False,

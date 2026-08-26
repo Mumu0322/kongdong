@@ -13,7 +13,6 @@ from .config import AUTO_CAPTURE_CFG, BOARD_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOL
 from .drawing import (
     clamp_score,
     draw_help_line,
-    draw_metric_bar,
     draw_panel_box,
     draw_status_pill,
     draw_unicode_text,

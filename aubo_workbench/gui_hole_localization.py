@@ -121,7 +121,7 @@ class HoleLocalizationPanel(ttk.Frame):
         # 三种粗定位策略在界面上使用互斥单选框。旧的 BooleanVar 仍保留为
         # 命令行兼容层，避免外部脚本或历史测试直接构造面板时失效。
         # 保持原 GUI 的默认行为：优先复用已验证的粗定位缓存。
-        self.strategy_var = tk.StringVar(value="cache")
+        self.strategy_var = tk.StringVar(value="batch")
         self.advanced_visible_var = tk.BooleanVar(value=False)
         self.confidence_var = tk.StringVar(value="0.35")
         self.coarse_height_var = tk.StringVar(value="340")
@@ -137,11 +137,18 @@ class HoleLocalizationPanel(ttk.Frame):
         self.approach_acc_var = tk.StringVar(value="0.35")
         self.offset_radii_var = tk.StringVar(value="0 5 10 15 20")
         self.offset_angles_var = tk.StringVar(value="0 45 90 135 180 225 270 315")
-        self.batch_coarse_localization_var = tk.BooleanVar(value=False)
+        self.batch_coarse_localization_var = tk.BooleanVar(value=True)
         self.batch_coarse_frames_var = tk.StringVar(value="15")
         self.batch_coarse_min_valid_var = tk.StringVar(value="10")
         self.batch_coarse_min_holes_var = tk.StringVar(value="")
         self.batch_coarse_view_margin_var = tk.StringVar(value="50.0")
+        self.batch_fine_localization_var = tk.BooleanVar(value=True)
+        self.batch_fine_frames_var = tk.StringVar(value="8")
+        self.batch_fine_min_valid_var = tk.StringVar(value="5")
+        self.batch_fine_stable_min_frames_var = tk.StringVar(value="5")
+        self.batch_fine_settle_discard_frames_var = tk.StringVar(value="10")
+        self.batch_fine_supplement_rounds_var = tk.StringVar(value="1")
+        self.batch_fine_view_margin_var = tk.StringVar(value="50.0")
         self.optimize_hole_order_var = tk.BooleanVar(value=False)
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=False)
@@ -251,7 +258,7 @@ class HoleLocalizationPanel(ttk.Frame):
         strategy.pack(fill=tk.X, pady=(8, 0))
         for row, (label, value) in enumerate((
             ("逐孔检测：每个孔独立粗定位和精定位", "per_hole"),
-            ("批量粗定位：一次采集多个孔，再逐孔精定位", "batch"),
+            ("全部孔共享两次稳定连拍：340 mm 粗定位，260 mm 精定位", "batch"),
             ("复用粗定位缓存：一拍多验证，失败逐孔粗定位", "cache"),
         )):
             ttk.Radiobutton(
@@ -259,7 +266,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 command=self._apply_strategy,
             ).grid(row=row, column=0, sticky="w", pady=2)
         ttk.Label(
-            strategy, text="缓存验证失败时会自动回退到逐孔粗定位。",
+            strategy,
+            text="共享精拍首拍信息不足时，会移动到失败孔共同观察位补拍；不转成逐孔精拍。",
             foreground="#555555",
         ).grid(row=3, column=0, sticky="w", pady=(4, 0))
 
@@ -271,6 +279,24 @@ class HoleLocalizationPanel(ttk.Frame):
             ("每帧最少孔数", self.batch_coarse_min_holes_var, 7),
             ("视野边缘余量 px", self.batch_coarse_view_margin_var, 7),
         ], columns=2)
+        ttk.Checkbutton(
+            batch,
+            text="260 mm 共享精定位（首拍全部选中孔；失败孔可移动共同位补拍）",
+            variable=self.batch_fine_localization_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Label(batch, text="260 mm 精定位视野边缘余量 px").grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=4,
+        )
+        ttk.Entry(batch, textvariable=self.batch_fine_view_margin_var, width=7).grid(
+            row=3, column=1, sticky="w", padx=(0, 18), pady=4,
+        )
+        self._grid_fields(batch, [
+            ("260 mm 批量帧数", self.batch_fine_frames_var, 7),
+            ("260 mm 最少有效帧", self.batch_fine_min_valid_var, 7),
+            ("260 mm 稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
+            ("260 mm 最少预热丢弃帧", self.batch_fine_settle_discard_frames_var, 7),
+            ("260 mm 失败孔共享补拍轮数", self.batch_fine_supplement_rounds_var, 7),
+        ], columns=2, start_row=4)
 
         shared = ttk.LabelFrame(parent, text="高级：缓存验证策略", padding=8)
         self.shared_cache_validation_frame = shared
@@ -595,6 +621,67 @@ class HoleLocalizationPanel(ttk.Frame):
                 optimize_hole_order_var = getattr(self, "optimize_hole_order_var", None)
                 if optimize_hole_order_var is not None and optimize_hole_order_var.get():
                     command.append("--optimize-hole-order")
+            fine_batch_var = getattr(self, "batch_fine_localization_var", None)
+            fine_batch_enabled = bool(
+                fine_batch_var is None or fine_batch_var.get()
+            )
+            try:
+                fine_batch_margin = float(
+                    getattr(
+                        getattr(self, "batch_fine_view_margin_var", None),
+                        "get",
+                        lambda: "50.0",
+                    )()
+                )
+            except ValueError as exc:
+                raise ValueError("批量精定位视野边缘余量必须是有效数字") from exc
+            if not math.isfinite(fine_batch_margin) or fine_batch_margin < 0.0:
+                raise ValueError("批量精定位视野边缘余量必须是大于等于 0 的有限数字")
+            try:
+                fine_batch_frames = int(getattr(
+                    getattr(self, "batch_fine_frames_var", None),
+                    "get", lambda: "1",
+                )())
+                fine_batch_min_valid = int(getattr(
+                    getattr(self, "batch_fine_min_valid_var", None),
+                    "get", lambda: "1",
+                )())
+                fine_batch_stable_min = int(getattr(
+                    getattr(self, "batch_fine_stable_min_frames_var", None),
+                    "get", lambda: "1",
+                )())
+                fine_batch_settle = int(getattr(
+                    getattr(self, "batch_fine_settle_discard_frames_var", None),
+                    "get", lambda: "10",
+                )())
+                fine_batch_supplement_rounds = int(getattr(
+                    getattr(self, "batch_fine_supplement_rounds_var", None),
+                    "get", lambda: "1",
+                )())
+            except ValueError as exc:
+                raise ValueError("批量精定位帧数参数必须是有效整数") from exc
+            if fine_batch_frames < 1 or fine_batch_min_valid < 1:
+                raise ValueError("批量精定位帧数和最少有效帧数必须大于 0")
+            if fine_batch_frames < fine_batch_min_valid:
+                raise ValueError("批量精定位帧数必须不少于最少有效帧数")
+            if fine_batch_stable_min < 1 or fine_batch_stable_min > fine_batch_frames:
+                raise ValueError("批量精定位稳定门帧数必须在批量帧数范围内")
+            if fine_batch_settle < 0:
+                raise ValueError("批量精定位预热丢弃帧数不能小于 0")
+            if fine_batch_supplement_rounds < 0:
+                raise ValueError("批量精定位共享补拍轮数不能小于 0")
+            command.append(
+                "--batch-fine-localization"
+                if fine_batch_enabled else "--no-batch-fine-localization"
+            )
+            command.extend([
+                "--batch-fine-view-margin-px", str(fine_batch_margin),
+                "--batch-fine-frames", str(fine_batch_frames),
+                "--batch-fine-min-valid", str(fine_batch_min_valid),
+                "--batch-fine-stable-min-frames", str(fine_batch_stable_min),
+                "--batch-fine-settle-discard-frames", str(fine_batch_settle),
+                "--batch-fine-supplement-rounds", str(fine_batch_supplement_rounds),
+            ])
         return command
 
     def start(self) -> None:
@@ -957,7 +1044,7 @@ class HoleLocalizationPanel(ttk.Frame):
                     )
                 lines = [
                     f"报告：{reports[0].parent}",
-                    f"顺序处理孔数：{final.get('hole_count', len(holes))}    "
+            f"批量处理孔数：{final.get('hole_count', len(holes))}    "
                     f"成功：{completed_count}    延期：{deferred_count}    "
                     f"最终 TCP：{self._format_vector(final.get('final_tcp_pose_m_rad'))}",
                 ]
@@ -975,6 +1062,41 @@ class HoleLocalizationPanel(ttk.Frame):
                             f"  组{group.get('group_index', '-')}: 孔={group.get('hole_ids', [])} "
                             f"通过={group.get('accepted_holes', [])} 回退={group.get('fallback_holes', [])}"
                         )
+                batch_fine = (report.get("stages") or {}).get("batch_fine_plan") or {}
+                batch_coarse = (report.get("stages") or {}).get("batch_coarse_plan") or {}
+                if batch_coarse.get("enabled"):
+                    groups = batch_coarse.get("groups") or []
+                    lines.append(
+                        f"340mm共享粗定位：组数={len(groups)}，"
+                        "全部选中孔共享一个综合中心拍摄位姿"
+                    )
+                    for group in groups:
+                        lines.append(
+                            f"  粗定位组{group.get('group_index', '-')}: "
+                            f"孔={group.get('hole_ids', [])} "
+                            f"综合中心={self._format_vector(group.get('combined_point_base_mm'))} "
+                            f"共享拍摄位姿={self._format_vector(group.get('target_tcp_pose_m_rad'))}"
+                        )
+                if batch_fine.get("enabled"):
+                    groups = batch_fine.get("groups") or []
+                    lines.append(
+                        f"260mm共享拍摄：组数={len(groups)}，每组一个相机位姿；"
+                        "孔结果仅为基坐标三维点"
+                    )
+                    for group in groups:
+                        lines.append(
+                            f"  组{group.get('group_index', '-')}: "
+                            f"孔={group.get('hole_ids', [])} "
+                            f"综合中心={self._format_vector(group.get('combined_point_base_mm'))} "
+                            f"共享拍摄位姿={self._format_vector(group.get('target_tcp_pose_m_rad'))}"
+                        )
+                        for supplement in group.get("supplement_captures") or []:
+                            lines.append(
+                                f"    共享补拍{supplement.get('round', '-')}: "
+                                f"孔={supplement.get('hole_ids', [])} "
+                                f"通过={supplement.get('accepted_holes', [])} "
+                                f"未通过={supplement.get('fallback_holes', [])}"
+                            )
                 for item in holes:
                     quality_status = item.get("fine_quality_status", "strict")
                     status_text = (
@@ -985,8 +1107,6 @@ class HoleLocalizationPanel(ttk.Frame):
                     lines.append(
                         f"孔 {item.get('hole_id', '-')}：{status_text}"
                         f"中心={self._format_vector(item.get('hole_center_base_mm'))} "
-                        f"法向={self._format_vector(item.get('plane_normal_toward_camera_base'))} "
-                        f"姿态={self._format_vector(item.get('hole_pose_m_rad'))} "
                         f"孔径={item.get('matched_diameter_mm', '-') } mm "
                         f"跟踪={item.get('tracking_identity', '-')}"
                     )

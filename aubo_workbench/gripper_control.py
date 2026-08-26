@@ -19,7 +19,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, messagebox, ttk
+from tkinter import END, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable
 

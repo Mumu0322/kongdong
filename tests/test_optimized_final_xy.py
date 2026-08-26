@@ -13,6 +13,7 @@ from run_yolo_eye_in_hand_optimized import (
     build_parser,
     fit_sphere,
     apply_final_point_base_offsets,
+    compose_batch_fine_xy_with_coarse_z,
     final_point_offsets_for_mode,
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
@@ -24,6 +25,13 @@ from aubo_workbench.camera import CameraIntrinsics
 
 
 class FinalXyPlanningTests(unittest.TestCase):
+    def test_batch_fine_only_replaces_xy_and_keeps_coarse_z(self):
+        fine_point = np.array([631.7, -108.3, 59.8])
+        coarse_point = np.array([630.9, -109.1, 56.7])
+        target = compose_batch_fine_xy_with_coarse_z(fine_point, coarse_point)
+        np.testing.assert_allclose(target, np.array([631.7, -108.3, 56.7]))
+        np.testing.assert_allclose(fine_point, np.array([631.7, -108.3, 59.8]))
+
     def test_final_point_offsets_are_applied_before_motion_planning(self):
         point = np.array([631.0, -110.7, 56.7])
         target = apply_final_point_base_offsets(point)
@@ -106,7 +114,8 @@ class FinalXyPlanningTests(unittest.TestCase):
 
         self.assertEqual(info["surface_model"], COARSE_SURFACE_MODEL)
         self.assertEqual(info["surface_selection_policy"], COARSE_SURFACE_SELECTION_POLICY)
-        self.assertAlmostEqual(info["ring_inner_factor"], 1.25)
+        self.assertAlmostEqual(info["ring_inner_factor"], 1.10)
+        self.assertAlmostEqual(info["ring_outer_factor"], 1.30)
         self.assertLess(float(point[2]), 510.0)
         self.assertLess(float(info["local_plane_point_camera_mm"][2]), 510.0)
         self.assertGreaterEqual(info["surface_points_selected"], 80)

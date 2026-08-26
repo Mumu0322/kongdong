@@ -33,6 +33,16 @@ COARSE_HEIGHT_MM = 340.0
 FINE_HEIGHT_MM = 260.0
 COARSE_FRAMES = 15
 FINE_FRAMES = 30
+BATCH_COARSE_LOCALIZATION = True
+BATCH_COARSE_FRAMES = 15
+BATCH_COARSE_MIN_VALID = 10
+BATCH_FINE_LOCALIZATION = True
+BATCH_FINE_FRAMES = 8
+BATCH_FINE_MIN_VALID = 5
+BATCH_FINE_STABLE_MIN_FRAMES = 5
+BATCH_FINE_SETTLE_DISCARD_FRAMES = 10
+BATCH_FINE_SUPPLEMENT_ROUNDS = 1
+BATCH_FINE_VIEW_MARGIN_PX = 50.0
 YOLO_CONFIDENCE = 0.35
 
 # 运动配置。默认关闭。
@@ -96,7 +106,19 @@ def build_arguments() -> list[str]:
             "--fine-height-mm", str(FINE_HEIGHT_MM),
             "--coarse-frames", str(COARSE_FRAMES),
             "--fine-frames", str(FINE_FRAMES),
+            "--batch-coarse-frames", str(BATCH_COARSE_FRAMES),
+            "--batch-coarse-min-valid", str(BATCH_COARSE_MIN_VALID),
+            "--batch-fine-localization"
+            if BATCH_FINE_LOCALIZATION else "--no-batch-fine-localization",
+            "--batch-fine-view-margin-px", str(BATCH_FINE_VIEW_MARGIN_PX),
+            "--batch-fine-frames", str(BATCH_FINE_FRAMES),
+            "--batch-fine-min-valid", str(BATCH_FINE_MIN_VALID),
+            "--batch-fine-stable-min-frames", str(BATCH_FINE_STABLE_MIN_FRAMES),
+            "--batch-fine-settle-discard-frames", str(BATCH_FINE_SETTLE_DISCARD_FRAMES),
+            "--batch-fine-supplement-rounds", str(BATCH_FINE_SUPPLEMENT_ROUNDS),
         ])
+        if BATCH_COARSE_LOCALIZATION:
+            args.append("--batch-coarse-localization")
 
     if EXECUTE_MOTION and not I_HAVE_CHECKED_ROBOT_PATH_AND_WORKSPACE:
         raise RuntimeError(
