@@ -702,6 +702,93 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertEqual(args.batch_fine_min_valid, 5)
         self.assertEqual(args.batch_fine_stable_min_frames, 5)
         self.assertEqual(args.batch_fine_supplement_rounds, 1)
+        self.assertTrue(args.batch_fine_joint_localization)
+        self.assertFalse(
+            module.build_parser().parse_args(["--no-batch-fine-joint-localization"])
+            .batch_fine_joint_localization
+        )
+
+    def test_batch_fine_joint_recovers_translation_and_yaw(self) -> None:
+        source_points = np.asarray([
+            [0.0, 0.0], [100.0, 0.0], [0.0, 80.0], [100.0, 80.0],
+        ])
+        yaw_rad = np.deg2rad(1.0)
+        rotation = np.asarray([
+            [np.cos(yaw_rad), -np.sin(yaw_rad)],
+            [np.sin(yaw_rad), np.cos(yaw_rad)],
+        ])
+        translation = np.asarray([1.2, -0.7])
+        target_points = (rotation @ source_points.T).T + translation
+        result = module._fit_batch_fine_joint_transform(
+            [1, 2, 3, 4],
+            {hole_id: point for hole_id, point in zip([1, 2, 3, 4], source_points)},
+            {hole_id: point for hole_id, point in zip([1, 2, 3, 4], target_points)},
+            {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0},
+            min_holes=4,
+            max_residual_mm=0.01,
+            max_translation_mm=5.0,
+            max_yaw_deg=3.0,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["inlier_hole_ids"], [1, 2, 3, 4])
+        np.testing.assert_allclose(result["translation_mm"], translation, atol=1.0e-8)
+        self.assertAlmostEqual(result["yaw_deg"], 1.0, places=7)
+        np.testing.assert_allclose(
+            np.asarray(result["predicted_xy_by_hole"][4]), target_points[3], atol=1.0e-8,
+        )
+
+    def test_batch_fine_joint_rejects_one_outlier(self) -> None:
+        source_points = np.asarray([
+            [0.0, 0.0], [100.0, 0.0], [0.0, 80.0], [100.0, 80.0],
+        ])
+        target_points = source_points + np.asarray([1.0, -0.5])
+        target_points[3] += np.asarray([12.0, -9.0])
+        result = module._fit_batch_fine_joint_transform(
+            [1, 2, 3, 4],
+            {hole_id: point for hole_id, point in zip([1, 2, 3, 4], source_points)},
+            {hole_id: point for hole_id, point in zip([1, 2, 3, 4], target_points)},
+            {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0},
+            min_holes=3,
+            max_residual_mm=1.5,
+            max_translation_mm=5.0,
+            max_yaw_deg=3.0,
+        )
+
+        self.assertEqual(result["inlier_hole_ids"], [1, 2, 3])
+        np.testing.assert_allclose(result["translation_mm"], [1.0, -0.5], atol=1.0e-8)
+        self.assertGreater(result["residual_mm_by_hole"][4], 1.5)
+
+    def test_batch_fine_joint_stability_gate(self) -> None:
+        stable = [
+            {"translation_mm": [1.0, 2.0], "yaw_rad": np.deg2rad(0.10)},
+            {"translation_mm": [1.08, 1.96], "yaw_rad": np.deg2rad(0.14)},
+            {"translation_mm": [0.94, 2.03], "yaw_rad": np.deg2rad(0.06)},
+        ]
+        unstable = stable + [
+            {"translation_mm": [1.8, 2.0], "yaw_rad": np.deg2rad(0.60)},
+        ]
+        self.assertTrue(
+            module._batch_fine_joint_transform_stable(stable, 3, 0.25, 0.15)
+        )
+        self.assertFalse(
+            module._batch_fine_joint_transform_stable(unstable, 4, 0.25, 0.15)
+        )
+
+    def test_batch_fine_joint_preserves_tilt_and_limits_local_residual(self) -> None:
+        result, details = module._compose_batch_fine_joint_xy_with_tilt(
+            np.asarray([10.0, -4.0, 900.0]),
+            np.asarray([10.1, -3.8, 898.0]),
+            np.asarray([8.0, -5.0, 900.0]),
+            local_residual_weight=0.25,
+            local_residual_limit_mm=0.5,
+        )
+
+        self.assertAlmostEqual(result[2], 898.0)
+        self.assertAlmostEqual(details["local_residual_norm_mm"], np.sqrt(5.0))
+        np.testing.assert_allclose(
+            result[:2], [8.2118034, -4.7440983], atol=1.0e-6,
+        )
 
     def test_current_initial_pointcloud_overrides_stale_cache_geometry(self) -> None:
         hole = {
@@ -756,6 +843,8 @@ class TwoStageGeometryTests(unittest.TestCase):
             {
                 "hole_id": 1,
                 "initial_center_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "coarse_plane_point_base_mm": np.array([0.0, 0.0, 1000.0]),
+                "coarse_normal_toward_camera_base": np.array([0.0, 0.0, 1.0]),
                 "initial_detection": {
                     "class_id": 0, "box": [620.0, 340.0, 660.0, 380.0],
                 },
@@ -763,6 +852,8 @@ class TwoStageGeometryTests(unittest.TestCase):
             {
                 "hole_id": 2,
                 "initial_center_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "coarse_plane_point_base_mm": np.array([100.0, 0.0, 1000.0]),
+                "coarse_normal_toward_camera_base": np.array([0.0, 0.0, 1.0]),
                 "initial_detection": {
                     "class_id": 0, "box": [700.0, 340.0, 740.0, 380.0],
                 },
@@ -793,6 +884,7 @@ class TwoStageGeometryTests(unittest.TestCase):
             max_fine_center_scatter_p95_px=1.0,
             fine_settle_discard_frames=1,
             fine_pointcloud_anchor_tolerance_px=30.0,
+            batch_fine_joint_min_valid_frames=2,
         )
         handeye = SimpleNamespace(T_tcp_rgb_camera=np.eye(4, dtype=np.float64))
         with tempfile.TemporaryDirectory() as directory, \
@@ -817,6 +909,11 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertEqual(result[1]["fine"]["yolo_frames"], 0)
         self.assertEqual(len(result[1]["observations"]), 2)
         self.assertEqual(len(result[2]["observations"]), 2)
+        self.assertTrue(result[1]["batch_fine_joint_success"])
+        self.assertTrue(result[1]["batch_fine_joint_summary"]["success"])
+        self.assertEqual(
+            result[1]["batch_fine_joint_summary"]["fused_frame_count"], 2,
+        )
 
     def test_batch_fine_flushes_fast_queue_until_two_fresh_frame_intervals(self) -> None:
         timestamps_ns = [

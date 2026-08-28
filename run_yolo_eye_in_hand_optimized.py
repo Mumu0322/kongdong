@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import json
 import math
 import sys
@@ -322,6 +323,20 @@ class TwoStageConfig:
     # 260mm观察位补拍；补拍仍按孔集合共享，不退化为逐孔精拍。
     batch_fine_supplement_rounds: int = 1
     batch_fine_view_margin_px: float = 50.0
+    # 共享精定位专用：把同一260mm视野内的多个孔作为一个平面刚体
+    # 约束联合求解。该开关只在batch_fine_localization路径生效；逐孔
+    # 精定位、共享粗定位和其它模式不读取这些字段。
+    batch_fine_joint_localization: bool = True
+    batch_fine_joint_min_holes: int = 2
+    batch_fine_joint_min_valid_frames: int = 5
+    batch_fine_joint_max_residual_mm: float = 1.5
+    batch_fine_joint_max_translation_mm: float = 5.0
+    batch_fine_joint_max_yaw_deg: float = 3.0
+    batch_fine_joint_stable_translation_mm: float = 0.25
+    batch_fine_joint_stable_yaw_deg: float = 0.15
+    # 联合结果为主；保留小幅单孔残差，兼容实际加工误差和圆心局部偏差。
+    batch_fine_joint_local_residual_weight: float = 0.25
+    batch_fine_joint_local_residual_limit_mm: float = 0.5
 
 
 @dataclass
@@ -653,6 +668,59 @@ def compose_batch_fine_xy_with_coarse_z(
     target = np.asarray(fine_point_base, dtype=np.float64).reshape(3).copy()
     target[2] = float(np.asarray(coarse_point_base, dtype=np.float64).reshape(3)[2])
     return target
+
+
+def _compose_batch_fine_joint_xy_with_tilt(
+    naive_point_base: np.ndarray,
+    tilted_point_base: np.ndarray,
+    joint_point_base: np.ndarray,
+    *,
+    local_residual_weight: float,
+    local_residual_limit_mm: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """将共享联合XY作为主结果，并保留受限的逐孔残差和倾斜纠偏。
+
+    ``naive_point_base`` 是当前孔单独由精拍圆心反投影得到的点，
+    ``tilted_point_base`` 是经过既有倾斜圆心纠偏后的点，
+    ``joint_point_base`` 是同一共享260 mm视野内多孔联合求解的XY点。
+    联合结果只负责XY；Z由调用方继续替换为该孔粗定位Z。这里不涉及
+    ChArUco，ChArUco仍在最终 ``plan_final_tcp_xy`` 中统一执行一次。
+    """
+    naive = np.asarray(naive_point_base, dtype=np.float64).reshape(3).copy()
+    tilted = np.asarray(tilted_point_base, dtype=np.float64).reshape(3).copy()
+    joint = np.asarray(joint_point_base, dtype=np.float64).reshape(3).copy()
+    if (
+        not np.isfinite(naive).all()
+        or not np.isfinite(tilted).all()
+        or not np.isfinite(joint).all()
+    ):
+        raise ValueError("共享联合XY输入包含非有限坐标")
+
+    weight = min(1.0, max(0.0, float(local_residual_weight)))
+    limit = max(0.0, float(local_residual_limit_mm))
+    local_residual = naive[:2] - joint[:2]
+    residual_norm = float(np.linalg.norm(local_residual))
+    if residual_norm > limit > 0.0:
+        local_residual_clipped = local_residual * (limit / residual_norm)
+    elif limit <= 0.0:
+        local_residual_clipped = np.zeros(2, dtype=np.float64)
+    else:
+        local_residual_clipped = local_residual.copy()
+    local_residual_used = weight * local_residual_clipped
+    tilt_delta = tilted[:2] - naive[:2]
+
+    result = tilted.copy()
+    result[:2] = joint[:2] + local_residual_used + tilt_delta
+    return result, {
+        "joint_xy_base_mm": joint[:2].copy(),
+        "local_residual_base_mm": local_residual.copy(),
+        "local_residual_norm_mm": residual_norm,
+        "local_residual_clipped_base_mm": local_residual_clipped.copy(),
+        "local_residual_used_base_mm": local_residual_used.copy(),
+        "local_residual_weight": weight,
+        "local_residual_limit_mm": limit,
+        "tilt_delta_base_mm": tilt_delta.copy(),
+    }
 
 
 def apply_final_point_base_offsets(
@@ -2074,7 +2142,15 @@ def _save_batch_fine_final_result_overlay(
         ):
             continue
         hole_id = int(result["hole_id"])
-        fine_point = np.asarray(result["hole_center_base_mm"], dtype=np.float64).reshape(3)
+        fine_point = np.asarray(
+            result.get("hole_center_base_naive_mm", result["hole_center_base_mm"]),
+            dtype=np.float64,
+        ).reshape(3)
+        joint_point_value = result.get("batch_fine_joint_visual_point_base_mm")
+        joint_point = (
+            None if joint_point_value is None else
+            np.asarray(joint_point_value, dtype=np.float64).reshape(3)
+        )
         target_point = np.asarray(result["target_point_base_mm"], dtype=np.float64).reshape(3)
         final_pose = result.get("final_tcp_pose_m_rad")
         final_tcp_point = (
@@ -2083,6 +2159,7 @@ def _save_batch_fine_final_result_overlay(
             and result.get("final_xy_motion") is not None else None
         )
         fine_px = projected(fine_point)
+        joint_px = projected(joint_point)
         target_px = projected(target_point)
         final_tcp_px = projected(final_tcp_point)
 
@@ -2091,6 +2168,11 @@ def _save_batch_fine_final_result_overlay(
             cv2.drawMarker(view, p, (0, 0, 255), cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
             cv2.putText(view, f"H{hole_id} FINE", (p[0] + 8, p[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 1, cv2.LINE_AA)
+        if joint_px is not None:
+            p = tuple(np.rint(joint_px).astype(int))
+            cv2.drawMarker(view, p, (0, 255, 0), cv2.MARKER_DIAMOND, 22, 2, cv2.LINE_AA)
+            cv2.putText(view, f"H{hole_id} JOINT", (p[0] + 8, p[1] + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 1, cv2.LINE_AA)
         if target_px is not None:
             p = tuple(np.rint(target_px).astype(int))
             cv2.drawMarker(view, p, (255, 255, 0), cv2.MARKER_DIAMOND, 22, 2, cv2.LINE_AA)
@@ -2101,9 +2183,10 @@ def _save_batch_fine_final_result_overlay(
             cv2.drawMarker(view, p, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 22, 2, cv2.LINE_AA)
             cv2.putText(view, f"H{hole_id} TCP", (p[0] + 8, p[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
-            if fine_px is not None:
+            compensation_start_px = joint_px if joint_px is not None else fine_px
+            if compensation_start_px is not None:
                 cv2.arrowedLine(
-                    view, tuple(np.rint(fine_px).astype(int)), p,
+                    view, tuple(np.rint(compensation_start_px).astype(int)), p,
                     (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.15,
                 )
 
@@ -2111,13 +2194,20 @@ def _save_batch_fine_final_result_overlay(
             "hole_id": hole_id,
             "fine_point_base_mm": fine_point,
             "fine_point_px": fine_px,
+            "joint_point_base_mm": joint_point,
+            "joint_point_px": joint_px,
             "target_point_base_mm": target_point,
             "target_point_px": target_px,
             "final_tcp_base_mm": final_tcp_point,
             "final_tcp_px": final_tcp_px,
             "fine_to_final_tcp_xy_mm": (
                 None if final_tcp_point is None else
-                np.asarray(final_tcp_point[:2] - fine_point[:2], dtype=np.float64)
+                np.asarray(
+                    final_tcp_point[:2] - (
+                        joint_point[:2] if joint_point is not None else fine_point[:2]
+                    ),
+                    dtype=np.float64,
+                )
             ),
         })
 
@@ -2127,7 +2217,7 @@ def _save_batch_fine_final_result_overlay(
     cv2.putText(view, "FINAL RESULT ON SHARED 260mm IMAGE", (18, 31),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(
-        view, "red+=FINE  cyan diamond=TARGET  yellow x=FINAL TCP  orange arrow=compensation",
+        view, "red+=RAW FINE  green diamond=JOINT XY  cyan diamond=TARGET  yellow x=TCP",
         (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA,
     )
     output_path = run_dir / "batch_fine_260_final_result_overlay.png"
@@ -2138,10 +2228,11 @@ def _save_batch_fine_final_result_overlay(
         "source_image_path": str(source_path),
         "coordinate_frame": "shared_260mm_capture_rgb",
         "legend": {
-            "red_cross": "fine_3d_hole_center_reprojected",
+            "red_cross": "raw_per_hole_fine_3d_center_reprojected",
+            "green_diamond": "shared_joint_xy_with_limited_local_residual_and_tilt_correction",
             "cyan_diamond": "final_hole_target_fine_xy_with_coarse_z",
             "yellow_tilted_cross": "actual_final_tcp_after_xy_compensation_and_y_trim",
-            "orange_arrow": "fine_center_to_actual_final_tcp",
+            "orange_arrow": "joint_or_raw_visual_point_to_actual_final_tcp",
         },
         "holes": records,
     }
@@ -2411,6 +2502,306 @@ def _fit_batch_projected_anchor_correction(
 
 
 
+def _fit_planar_rigid_transform(
+    source_xy: np.ndarray,
+    target_xy: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Fit a weighted 2-D rigid transform without allowing scale or shear."""
+    source = np.asarray(source_xy, dtype=np.float64).reshape(-1, 2)
+    target = np.asarray(target_xy, dtype=np.float64).reshape(-1, 2)
+    if source.shape != target.shape or len(source) < 2:
+        raise ValueError("平面刚体变换至少需要两个一一对应的二维点")
+    if not np.isfinite(source).all() or not np.isfinite(target).all():
+        raise ValueError("平面刚体变换输入包含非有限坐标")
+
+    if weights is None:
+        weight_values = np.ones(len(source), dtype=np.float64)
+    else:
+        weight_values = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if len(weight_values) != len(source):
+            raise ValueError("平面刚体变换权重数量与点数量不一致")
+        weight_values = np.maximum(weight_values, 1.0e-6)
+    if not np.isfinite(weight_values).all() or float(np.sum(weight_values)) <= 0.0:
+        raise ValueError("平面刚体变换权重无效")
+
+    weight_values = weight_values / float(np.sum(weight_values))
+    source_centroid = np.sum(source * weight_values[:, None], axis=0)
+    target_centroid = np.sum(target * weight_values[:, None], axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+    source_spread = float(np.max(np.linalg.norm(source_centered, axis=1)))
+    if source_spread < 1.0e-6:
+        raise ValueError("平面刚体变换源点几何退化")
+
+    covariance = source_centered.T @ (weight_values[:, None] * target_centered)
+    try:
+        left, _, right_transposed = np.linalg.svd(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("平面刚体变换SVD失败") from exc
+    rotation = right_transposed.T @ left.T
+    if float(np.linalg.det(rotation)) < 0.0:
+        right_transposed[-1, :] *= -1.0
+        rotation = right_transposed.T @ left.T
+    if not np.isfinite(rotation).all() or float(np.linalg.det(rotation)) <= 0.0:
+        raise ValueError("平面刚体变换旋转矩阵无效")
+
+    translation = target_centroid - rotation @ source_centroid
+    predicted = (rotation @ source.T).T + translation
+    residuals = np.linalg.norm(predicted - target, axis=1)
+    yaw_rad = float(math.atan2(rotation[1, 0], rotation[0, 0]))
+    return {
+        "rotation": rotation,
+        "translation": translation,
+        "yaw_rad": yaw_rad,
+        "predicted": predicted,
+        "residuals_mm": residuals,
+        "weighted_rmse_mm": float(
+            math.sqrt(np.sum(weight_values * residuals * residuals))
+        ),
+    }
+
+
+def _fit_batch_fine_joint_transform(
+    hole_ids: list[int],
+    source_xy_by_hole: dict[int, np.ndarray],
+    target_xy_by_hole: dict[int, np.ndarray],
+    weights_by_hole: dict[int, float],
+    *,
+    min_holes: int,
+    max_residual_mm: float,
+    max_translation_mm: float,
+    max_yaw_deg: float,
+) -> dict[str, Any]:
+    """Fit one robust shared XY correction for one RGB frame.
+
+    The source points are the 340 mm coarse hole centers and the target points
+    are the current 260 mm RGB centers intersected with each hole's frozen
+    coarse plane. A rigid transform is deliberately used here: the existing
+    ChArUco affine model remains the final TCP compensation and is not replaced
+    by this observation-level fit.
+    """
+    ordered_ids = [int(value) for value in hole_ids]
+    available = [
+        hole_id for hole_id in ordered_ids
+        if hole_id in source_xy_by_hole and hole_id in target_xy_by_hole
+    ]
+    required = max(2, int(min_holes))
+    if len(available) < required:
+        raise ValueError(f"共享精定位联合孔数不足：{len(available)}/{required}")
+
+    source = np.asarray(
+        [source_xy_by_hole[hole_id] for hole_id in available], dtype=np.float64,
+    )
+    target = np.asarray(
+        [target_xy_by_hole[hole_id] for hole_id in available], dtype=np.float64,
+    )
+    weights = np.asarray([
+        max(1.0e-3, float(weights_by_hole.get(hole_id, 1.0)))
+        for hole_id in available
+    ], dtype=np.float64)
+    max_residual = max(1.0e-6, float(max_residual_mm))
+
+    # With four holes, fitting all six affine parameters can make a bad
+    # detection look perfect. Enumerating 3-point rigid hypotheses gives a
+    # deterministic, small RANSAC-like guard while retaining all inliers for
+    # the final weighted fit.
+    candidate_indices: list[tuple[int, ...]] = [tuple(range(len(available)))]
+    if len(available) >= 3:
+        candidate_indices.extend(combinations(range(len(available)), 3))
+
+    best: tuple[tuple[int, float, float], dict[str, Any], np.ndarray] | None = None
+    for indices in candidate_indices:
+        index_array = np.asarray(indices, dtype=np.int64)
+        try:
+            candidate = _fit_planar_rigid_transform(
+                source[index_array], target[index_array], weights[index_array],
+            )
+        except ValueError:
+            continue
+        candidate_predicted = (
+            candidate["rotation"] @ source.T
+        ).T + candidate["translation"]
+        residuals = np.linalg.norm(candidate_predicted - target, axis=1)
+        inliers = residuals <= max_residual
+        if int(np.count_nonzero(inliers)) < required:
+            continue
+        weighted_rmse = float(math.sqrt(
+            np.sum(weights * np.minimum(residuals, max_residual) ** 2)
+            / max(float(np.sum(weights)), 1.0e-6)
+        ))
+        key = (
+            int(np.count_nonzero(inliers)),
+            -weighted_rmse,
+            -float(np.max(residuals[inliers])) if np.any(inliers) else -math.inf,
+        )
+        if best is None or key > best[0]:
+            best = (key, candidate, inliers)
+
+    if best is None:
+        raise ValueError(
+            f"共享精定位联合变换残差过大：没有达到{required}个孔的"
+            f"{max_residual:.3f}mm内点门槛"
+        )
+
+    _, _, inlier_mask = best
+    refined = _fit_planar_rigid_transform(
+        source[inlier_mask], target[inlier_mask], weights[inlier_mask],
+    )
+    residuals = np.linalg.norm(
+        (refined["rotation"] @ source.T).T + refined["translation"] - target,
+        axis=1,
+    )
+    inlier_mask = residuals <= max_residual
+    if int(np.count_nonzero(inlier_mask)) >= required and not np.all(inlier_mask):
+        refined = _fit_planar_rigid_transform(
+            source[inlier_mask], target[inlier_mask], weights[inlier_mask],
+        )
+        residuals = np.linalg.norm(
+            (refined["rotation"] @ source.T).T + refined["translation"] - target,
+            axis=1,
+        )
+
+    translation_norm = float(np.linalg.norm(refined["translation"]))
+    yaw_deg = abs(float(math.degrees(refined["yaw_rad"])))
+    if translation_norm > float(max_translation_mm):
+        raise ValueError(
+            f"共享精定位联合平移超限：{translation_norm:.3f}mm > "
+            f"{float(max_translation_mm):.3f}mm"
+        )
+    if yaw_deg > float(max_yaw_deg):
+        raise ValueError(
+            f"共享精定位联合旋转超限：{yaw_deg:.3f}deg > "
+            f"{float(max_yaw_deg):.3f}deg"
+        )
+    if int(np.count_nonzero(inlier_mask)) < required:
+        raise ValueError(
+            f"共享精定位联合内点不足：{int(np.count_nonzero(inlier_mask))}/{required}"
+        )
+
+    predicted_points = (refined["rotation"] @ source.T).T + refined["translation"]
+    residual_p95 = float(np.percentile(residuals[inlier_mask], 95.0))
+    return {
+        "success": True,
+        "hole_ids": available,
+        "inlier_hole_ids": [
+            hole_id for hole_id, keep in zip(available, inlier_mask) if bool(keep)
+        ],
+        "rotation": np.asarray(refined["rotation"], dtype=np.float64),
+        "translation_mm": np.asarray(refined["translation"], dtype=np.float64),
+        "yaw_rad": float(refined["yaw_rad"]),
+        "yaw_deg": float(math.degrees(refined["yaw_rad"])),
+        "translation_norm_mm": translation_norm,
+        "predicted_xy_by_hole": {
+            hole_id: np.asarray(predicted_point, dtype=np.float64)
+            for hole_id, predicted_point in zip(available, predicted_points)
+        },
+        "target_xy_by_hole": {
+            hole_id: np.asarray(point, dtype=np.float64)
+            for hole_id, point in zip(available, target)
+        },
+        "residual_mm_by_hole": {
+            hole_id: float(residual)
+            for hole_id, residual in zip(available, residuals)
+        },
+        "residual_p95_mm": residual_p95,
+        "residual_max_mm": float(np.max(residuals[inlier_mask])),
+        "weighted_rmse_mm": float(refined["weighted_rmse_mm"]),
+        "max_residual_mm": max_residual,
+    }
+
+
+def _batch_fine_joint_transform_stable(
+    transforms: list[dict[str, Any]],
+    min_valid_frames: int,
+    max_translation_scatter_mm: float,
+    max_yaw_scatter_deg: float,
+) -> bool:
+    """Check whether the latest shared transforms form a stable burst."""
+    required = max(1, int(min_valid_frames))
+    if len(transforms) < required:
+        return False
+    recent = transforms[-required:]
+    translations = np.asarray([
+        np.asarray(item["translation_mm"], dtype=np.float64).reshape(2)
+        for item in recent
+    ])
+    yaws = np.unwrap(np.asarray([
+        float(item["yaw_rad"]) for item in recent
+    ], dtype=np.float64))
+    translation_median = np.median(translations, axis=0)
+    yaw_median = float(np.median(yaws))
+    translation_scatter = np.linalg.norm(translations - translation_median, axis=1)
+    yaw_scatter_deg = np.degrees(np.abs(yaws - yaw_median))
+    return bool(
+        float(np.percentile(translation_scatter, 95.0))
+        <= float(max_translation_scatter_mm)
+        and float(np.percentile(yaw_scatter_deg, 95.0))
+        <= float(max_yaw_scatter_deg)
+    )
+
+
+def _fuse_batch_fine_joint_transforms(
+    transforms: list[dict[str, Any]],
+    source_xy_by_hole: dict[int, np.ndarray],
+    cfg: TwoStageConfig,
+) -> dict[str, Any]:
+    """Fuse stable per-frame shared transforms into one batch XY result."""
+    required = max(1, int(cfg.batch_fine_joint_min_valid_frames))
+    if len(transforms) < required:
+        raise ValueError(f"共享精定位联合有效帧不足：{len(transforms)}/{required}")
+    if not _batch_fine_joint_transform_stable(
+        transforms, required,
+        cfg.batch_fine_joint_stable_translation_mm,
+        cfg.batch_fine_joint_stable_yaw_deg,
+    ):
+        raise ValueError("共享精定位联合变换跨帧不稳定")
+
+    recent = transforms[-required:]
+    translations = np.asarray([
+        np.asarray(item["translation_mm"], dtype=np.float64).reshape(2)
+        for item in recent
+    ])
+    yaws = np.unwrap(np.asarray([
+        float(item["yaw_rad"]) for item in recent
+    ], dtype=np.float64))
+    translation = np.median(translations, axis=0)
+    yaw_rad = float(np.median(yaws))
+    rotation = np.asarray([
+        [math.cos(yaw_rad), -math.sin(yaw_rad)],
+        [math.sin(yaw_rad), math.cos(yaw_rad)],
+    ], dtype=np.float64)
+    translation_scatter = np.linalg.norm(translations - translation, axis=1)
+    yaw_scatter_deg = np.degrees(np.abs(yaws - yaw_rad))
+    predicted = {
+        hole_id: (rotation @ np.asarray(point, dtype=np.float64).reshape(2)) + translation
+        for hole_id, point in source_xy_by_hole.items()
+    }
+
+    return {
+        "success": True,
+        "method": "weighted_robust_planar_rigid_transform_median_over_stable_frames",
+        "frame_count": len(transforms),
+        "fused_frame_count": required,
+        "fused_frame_indices": [int(item["frame_index"]) for item in recent],
+        "rotation": rotation,
+        "translation_mm": translation,
+        "yaw_rad": yaw_rad,
+        "yaw_deg": float(math.degrees(yaw_rad)),
+        "translation_norm_mm": float(np.linalg.norm(translation)),
+        "translation_scatter_p95_mm": float(np.percentile(translation_scatter, 95.0)),
+        "yaw_scatter_p95_deg": float(np.percentile(yaw_scatter_deg, 95.0)),
+        "frame_residual_p95_mm": float(np.percentile([
+            float(item["residual_p95_mm"]) for item in recent
+        ], 95.0)),
+        "predicted_xy_by_hole": predicted,
+        "source_xy_by_hole": {
+            hole_id: np.asarray(point, dtype=np.float64).reshape(2).copy()
+            for hole_id, point in source_xy_by_hole.items()
+        },
+    }
+
+
 def _plane_estimate_from_info(info: dict[str, Any], label: str) -> PlaneEstimate:
     """把单次环带点云拟合结果统一转换成跨帧融合使用的平面估计。"""
     return PlaneEstimate(
@@ -2560,6 +2951,22 @@ def _build_comparison_hole_diagnostics(result: dict[str, Any]) -> dict[str, Any]
             "ellipse_roundness_median": result.get("ellipse_roundness_median"),
             "rejected_outlier_frames": result.get("rejected_outlier_frames"),
             "recovery_attempt_count": len(result.get("fine_recovery_attempts") or []),
+            "joint_enabled": bool(result.get("batch_fine_joint_enabled", False)),
+            "joint_applied": bool(result.get("batch_fine_joint_applied", False)),
+            "joint_success": bool(
+                (result.get("batch_fine_joint_summary") or {}).get("success", False)
+            ),
+            "joint_translation_mm": (
+                (result.get("batch_fine_joint_summary") or {}).get("translation_mm")
+            ),
+            "joint_yaw_deg": (
+                (result.get("batch_fine_joint_summary") or {}).get("yaw_deg")
+            ),
+            "joint_residual_p95_mm": (
+                (result.get("batch_fine_joint_summary") or {}).get(
+                    "frame_residual_p95_mm"
+                )
+            ),
         },
         "geometry_change": {
             "initial_to_coarse": _vector_change_metrics(result.get("initial_center_base_mm"), result.get("coarse_center_base_mm")),
@@ -2631,6 +3038,12 @@ def _build_comparison_run_diagnostics(
         "schema_version": 1,
         "method_configuration": {
             "batch_coarse_requested": bool(cfg.batch_coarse_localization),
+            "batch_fine_joint_requested": bool(
+                cfg.batch_fine_localization and cfg.batch_fine_joint_localization
+            ),
+            "batch_fine_joint_method": (
+                "weighted_robust_planar_rigid_transform_median_over_stable_frames"
+            ),
             "persistent_cache_requested": bool(report.get("reuse_persistent_coarse_cache", False)),
             "session_cache_requested": bool(report.get("reuse_coarse_cache", False)),
         },
@@ -2659,6 +3072,15 @@ def _build_comparison_run_diagnostics(
             "initial_to_coarse_norm_mm": _metric_distribution(metric("geometry_change.initial_to_coarse.norm_mm")),
             "coarse_to_fine_norm_mm": _metric_distribution(metric("geometry_change.coarse_to_fine_naive.norm_mm")),
             "tilt_correction_norm_mm": _metric_distribution(metric("geometry_change.fine_tilt_correction.norm_mm")),
+            "joint_residual_p95_mm": _metric_distribution(
+                metric("fine_quality.joint_residual_p95_mm")
+            ),
+            "joint_translation_norm_mm": _metric_distribution(
+                [
+                    None if value is None else float(np.linalg.norm(value))
+                    for value in metric("fine_quality.joint_translation_mm")
+                ]
+            ),
             "final_xy_planned_actual_error_mm": _metric_distribution(metric("motion_quality.final_xy_planned_actual_error_mm")),
         },
         "effective_timing": _effective_timing_summary(
@@ -4586,9 +5008,10 @@ def _batch_fine_localization_at_260mm(
 
     机器人在本函数调用前已经移动到共同260mm位姿。本函数只采集RGB帧，
     每帧运行一次YOLO并把检测框一对一分配给所有目标孔；椭圆质量门和
-    融合/验收沿用单孔精定位逻辑；同一共同位姿执行一次短连拍，达到
-    有效帧数与稳定性门后一次性输出当前孔集合。移动到另一个共享位姿的
-    补拍由外层工作流负责，本函数本身不移动机器人。
+    融合/验收沿用单孔精定位逻辑；启用联合开关时，另外以粗定位孔级
+    XY为源、每帧精拍孔级XY为目标，拟合不带缩放/剪切的平面刚体变换，
+    再对稳定帧做鲁棒融合。移动到另一个共享位姿的补拍由外层工作流
+    负责，本函数本身不移动机器人。
     """
     if not selected_holes:
         raise RuntimeError("批量精定位：没有选中孔")
@@ -4651,18 +5074,53 @@ def _batch_fine_localization_at_260mm(
         1, int(batch_cfg.fine_stable_min_frames), int(batch_cfg.min_fine_valid),
     )
     locked_holes: set[int] = set()
+    joint_frame_transforms: list[dict[str, Any]] = []
+    joint_frame_records: list[dict[str, Any]] = []
+    source_xy_by_hole = {
+        int(hole["hole_id"]): np.asarray(
+            hole["initial_center_base_mm"], dtype=np.float64,
+        ).reshape(3)[:2].copy()
+        for hole in selected_holes
+    }
+    # 联合路径只在每个选中孔都带有可用粗定位法向时启用。旧调用方
+    # 可能只提供中心和检测框，此时保持原共享精拍的采集/锁定节奏，
+    # 联合结果自然回退，不让新功能改变旧模式行为。
+    joint_geometry_ready = all(
+        hole.get("coarse_normal_toward_camera_base") is not None
+        or hole.get("initial_plane_normal_base") is not None
+        for hole in selected_holes
+    )
+    joint_enabled = bool(
+        batch_cfg.batch_fine_joint_localization
+        and len(hole_ids) >= max(2, int(batch_cfg.batch_fine_joint_min_holes))
+        and joint_geometry_ready
+    )
     with timing.measure(
         "batch_fine/capture_all_holes",
         hole_count=len(selected_holes), target_frames=max_frames,
     ):
         for frame_index in range(max_attempts):
-            if len(locked_holes) == len(hole_ids):
+            if (
+                len(locked_holes) == len(hole_ids)
+                and (
+                    not joint_enabled
+                    or _batch_fine_joint_transform_stable(
+                        joint_frame_transforms,
+                        batch_cfg.batch_fine_joint_min_valid_frames,
+                        batch_cfg.batch_fine_joint_stable_translation_mm,
+                        batch_cfg.batch_fine_joint_stable_yaw_deg,
+                    )
+                )
+            ):
                 break
 
             bundle = get_rgb_frame_bundle(pipeline)
             if bundle is None or bundle.intrinsics is None:
                 for hole_id, anchor in projected_holes.items():
-                    if int(hole_id) in locked_holes:
+                    if (
+                        int(hole_id) in locked_holes
+                        and not joint_enabled
+                    ):
                         continue
                     observations_by_hole[int(hole_id)].append(Observation(
                         "batch_fine", frame_index,
@@ -4718,7 +5176,7 @@ def _batch_fine_localization_at_260mm(
             for hole in selected_holes:
                 hole_id = int(hole["hole_id"])
                 key = str(hole_id)
-                if hole_id in locked_holes:
+                if hole_id in locked_holes and not joint_enabled:
                     hole_records.append({
                         "hole_id": hole_id, "valid": True, "locked": True,
                     })
@@ -4797,6 +5255,102 @@ def _batch_fine_localization_at_260mm(
                 ):
                     locked_holes.add(hole_id)
 
+            joint_frame_transform: dict[str, Any] | None = None
+            joint_frame_error: str | None = None
+            if joint_enabled:
+                frame_target_xy_by_hole: dict[int, np.ndarray] = {}
+                frame_weights_by_hole: dict[int, float] = {}
+                for hole in selected_holes:
+                    hole_id = int(hole["hole_id"])
+                    observation = next(
+                        (
+                            item for item in reversed(observations_by_hole[hole_id])
+                            if item.frame_index == frame_index
+                            and item.error is None
+                            and item.ellipse is not None
+                        ),
+                        None,
+                    )
+                    if observation is None:
+                        continue
+                    plane_point_value = hole.get("coarse_plane_point_base_mm")
+                    if plane_point_value is None:
+                        plane_point_value = hole.get("initial_center_base_mm")
+                    normal_value = hole.get("coarse_normal_toward_camera_base")
+                    if normal_value is None:
+                        normal_value = hole.get("initial_plane_normal_base")
+                    if plane_point_value is None or normal_value is None:
+                        continue
+                    try:
+                        target_point = pixel_to_base_plane(
+                            observation.center_px,
+                            bundle.intrinsics,
+                            current_tcp,
+                            handeye.T_tcp_rgb_camera,
+                            np.asarray(plane_point_value, dtype=np.float64).reshape(3),
+                            _unit(
+                                np.asarray(normal_value, dtype=np.float64).reshape(3),
+                                f"batch fine joint hole {hole_id} normal",
+                            ),
+                            center_is_undistorted=True,
+                        )
+                    except Exception:
+                        continue
+                    frame_target_xy_by_hole[hole_id] = np.asarray(
+                        target_point, dtype=np.float64,
+                    ).reshape(3)[:2]
+                    ellipse = observation.ellipse or {}
+                    coverage = float(ellipse.get("coverage_deg", 0.0))
+                    residual = float(ellipse.get("residual_px", 10.0))
+                    roundness = float(ellipse.get("roundness", 0.0))
+                    frame_weights_by_hole[hole_id] = max(
+                        1.0e-3,
+                        max(0.0, min(360.0, coverage)) / 360.0
+                        * max(0.1, min(1.0, roundness))
+                        / max(0.25, residual),
+                    )
+                try:
+                    joint_frame_transform = _fit_batch_fine_joint_transform(
+                        hole_ids,
+                        source_xy_by_hole,
+                        frame_target_xy_by_hole,
+                        frame_weights_by_hole,
+                        min_holes=batch_cfg.batch_fine_joint_min_holes,
+                        max_residual_mm=batch_cfg.batch_fine_joint_max_residual_mm,
+                        max_translation_mm=batch_cfg.batch_fine_joint_max_translation_mm,
+                        max_yaw_deg=batch_cfg.batch_fine_joint_max_yaw_deg,
+                    )
+                    joint_frame_transform["frame_index"] = int(frame_index)
+                    joint_frame_transforms.append(joint_frame_transform)
+                except Exception as joint_exc:
+                    joint_frame_error = f"{type(joint_exc).__name__}:{joint_exc}"
+                joint_frame_records.append({
+                    "frame_index": int(frame_index),
+                    "success": joint_frame_transform is not None,
+                    "hole_count": len(frame_target_xy_by_hole),
+                    "hole_ids": sorted(frame_target_xy_by_hole),
+                    "inlier_hole_ids": (
+                        [] if joint_frame_transform is None else
+                        list(joint_frame_transform["inlier_hole_ids"])
+                    ),
+                    "translation_mm": (
+                        None if joint_frame_transform is None else
+                        np.asarray(
+                            joint_frame_transform["translation_mm"],
+                            dtype=np.float64,
+                        ).tolist()
+                    ),
+                    "yaw_deg": (
+                        None if joint_frame_transform is None else
+                        float(joint_frame_transform["yaw_deg"])
+                    ),
+                    "residual_p95_mm": (
+                        None if joint_frame_transform is None else
+                        float(joint_frame_transform["residual_p95_mm"])
+                    ),
+                    "error": joint_frame_error,
+                })
+
             geometric_centers = {
                 str(record["hole_id"]): np.asarray(
                     record["geometric_center_px_distorted"], dtype=np.float64,
@@ -4847,12 +5401,50 @@ def _batch_fine_localization_at_260mm(
                 "holes": hole_records,
                 "locked_holes": sorted(locked_holes),
                 "overlay_path": str(overlay_path),
+                "joint_fine": joint_frame_records[-1] if joint_frame_records else None,
             })
 
     if latest_bundle is None:
         raise RuntimeError("批量精定位期间未获得RGB帧")
 
+    joint_summary: dict[str, Any] = {
+        "enabled": bool(batch_cfg.batch_fine_joint_localization),
+        "geometry_ready": joint_geometry_ready,
+        "active": joint_enabled,
+        "success": False,
+        "method": "weighted_robust_planar_rigid_transform_median_over_stable_frames",
+        "frame_records": joint_frame_records,
+        "valid_frame_count": len(joint_frame_transforms),
+        "min_valid_frames": int(batch_cfg.batch_fine_joint_min_valid_frames),
+        "min_holes": int(batch_cfg.batch_fine_joint_min_holes),
+        "max_residual_mm": float(batch_cfg.batch_fine_joint_max_residual_mm),
+        "max_translation_mm": float(batch_cfg.batch_fine_joint_max_translation_mm),
+        "max_yaw_deg": float(batch_cfg.batch_fine_joint_max_yaw_deg),
+        "stable_translation_mm": float(
+            batch_cfg.batch_fine_joint_stable_translation_mm
+        ),
+        "stable_yaw_deg": float(batch_cfg.batch_fine_joint_stable_yaw_deg),
+    }
+    if joint_enabled:
+        try:
+            joint_summary.update(
+                _fuse_batch_fine_joint_transforms(
+                    joint_frame_transforms, source_xy_by_hole, batch_cfg,
+                )
+            )
+        except Exception as joint_exc:
+            joint_summary["error"] = (
+                f"{type(joint_exc).__name__}:{joint_exc}"
+            )
+    elif batch_cfg.batch_fine_joint_localization:
+        joint_summary["error"] = (
+            "shared_joint_geometry_unavailable_or_hole_count_below_minimum"
+        )
+
     batch_results: dict[int, dict[str, Any]] = {}
+    holes_by_id = {
+        int(hole["hole_id"]): hole for hole in selected_holes
+    }
     for hole_id in hole_ids:
         observations = observations_by_hole[hole_id]
         rows.extend(_observation_rows(observations))
@@ -4885,6 +5477,63 @@ def _batch_fine_localization_at_260mm(
                 "fine_capture_overlay_path": frame_records[-1].get("overlay_path")
                 if frame_records else None,
             }
+            joint_point = None
+            direct_point = None
+            if joint_summary.get("success"):
+                joint_predictions = joint_summary.get("predicted_xy_by_hole") or {}
+                joint_xy = joint_predictions.get(
+                    hole_id, joint_predictions.get(str(hole_id))
+                )
+                if joint_xy is not None:
+                    coarse_point = np.asarray(
+                        holes_by_id[hole_id].get(
+                            "initial_center_base_mm", [0.0, 0.0, 0.0]
+                        ),
+                        dtype=np.float64,
+                    ).reshape(3)
+                    joint_point = np.asarray(
+                        [
+                            float(np.asarray(joint_xy).reshape(2)[0]),
+                            float(np.asarray(joint_xy).reshape(2)[1]),
+                            float(coarse_point[2]),
+                        ],
+                        dtype=np.float64,
+                    )
+            try:
+                hole = holes_by_id[hole_id]
+                plane_point_value = hole.get("coarse_plane_point_base_mm")
+                if plane_point_value is None:
+                    plane_point_value = hole.get("initial_center_base_mm")
+                normal_value = hole.get("coarse_normal_toward_camera_base")
+                if normal_value is None:
+                    normal_value = hole.get("initial_plane_normal_base")
+                if plane_point_value is not None and normal_value is not None:
+                    direct_point = pixel_to_base_plane(
+                        summary["center_px"],
+                        latest_bundle.intrinsics,
+                        current_tcp,
+                        handeye.T_tcp_rgb_camera,
+                        np.asarray(plane_point_value, dtype=np.float64).reshape(3),
+                        _unit(
+                            np.asarray(normal_value, dtype=np.float64).reshape(3),
+                            f"batch fine fused hole {hole_id} normal",
+                        ),
+                        center_is_undistorted=True,
+                    )
+                    direct_point = np.asarray(
+                        direct_point, dtype=np.float64,
+                    ).reshape(3)
+            except Exception:
+                direct_point = None
+            batch_results[hole_id].update({
+                "batch_fine_joint_success": bool(joint_summary.get("success", False)),
+                "batch_fine_joint_xy_base_mm": (
+                    None if joint_point is None else joint_point[:2].copy()
+                ),
+                "batch_fine_joint_predicted_point_base_mm": joint_point,
+                "batch_fine_direct_point_base_mm": direct_point,
+                "batch_fine_joint_summary": joint_summary,
+            })
         except Exception as exc:
             batch_results[hole_id] = {
                 "success": False,
@@ -4896,6 +5545,8 @@ def _batch_fine_localization_at_260mm(
                     projected_holes[str(hole_id)], dtype=np.float64,
                 ).copy(),
                 "error": f"{type(exc).__name__}:{exc}",
+                "batch_fine_joint_success": False,
+                "batch_fine_joint_summary": joint_summary,
             }
 
     batch_results["_batch_metadata"] = {
@@ -4907,6 +5558,7 @@ def _batch_fine_localization_at_260mm(
         "max_frames": max_frames,
         "max_attempts": max_attempts,
         "locked_holes": sorted(locked_holes),
+        "joint_fine": joint_summary,
         "max_tracking_distance_px": float(batch_cfg.fine_pointcloud_anchor_tolerance_px),
         "latest_overlay_path": (
             frame_records[-1].get("overlay_path") if frame_records else None
@@ -5531,12 +6183,36 @@ def _run_sequential_hole_workflow(
         "initial_pointcloud_reused_holes": initial_pointcloud_reused_holes,
         "coarse_geometry_policy": "fresh_shared_340mm_capture_required",
         "failure_policy": "move_to_shared_260mm_supplement_capture",
+        "joint_failure_policy": (
+            "fallback_to_existing_per_hole_batch_fine_xy_without_affecting_other_modes"
+        ),
         "combined_position_policy": "projected_bbox_center_from_all_coarse_holes",
         "motion_policy": "shared_vertical_lift_min10_safe_horizontal_descent_guard10_then_pure_descent10_then_steady_capture",
-        "final_pose_policy": "per_hole_coarse_z_and_orientation_with_batch_fine_xy_only",
+        "final_pose_policy": (
+            "per_hole_coarse_z_and_orientation_with_joint_batch_fine_xy_and_charuco_when_gate_passes"
+        ),
         "fine_output_components": ["base_x", "base_y"],
         "coarse_output_components": ["base_z", "rx", "ry", "rz"],
         "supplement_rounds": int(cfg.batch_fine_supplement_rounds),
+        "joint_localization_enabled": bool(cfg.batch_fine_joint_localization),
+        "joint_method": (
+            "weighted_robust_planar_rigid_transform_median_over_stable_frames"
+        ),
+        "joint_min_holes": int(cfg.batch_fine_joint_min_holes),
+        "joint_min_valid_frames": int(cfg.batch_fine_joint_min_valid_frames),
+        "joint_max_residual_mm": float(cfg.batch_fine_joint_max_residual_mm),
+        "joint_max_translation_mm": float(cfg.batch_fine_joint_max_translation_mm),
+        "joint_max_yaw_deg": float(cfg.batch_fine_joint_max_yaw_deg),
+        "joint_stable_translation_mm": float(
+            cfg.batch_fine_joint_stable_translation_mm
+        ),
+        "joint_stable_yaw_deg": float(cfg.batch_fine_joint_stable_yaw_deg),
+        "joint_local_residual_weight": float(
+            cfg.batch_fine_joint_local_residual_weight
+        ),
+        "joint_local_residual_limit_mm": float(
+            cfg.batch_fine_joint_local_residual_limit_mm
+        ),
     }
     if cfg.batch_fine_localization and len(initial_holes) > 1:
         fine_planning_holes: list[dict[str, Any]] = []
@@ -5566,6 +6242,21 @@ def _run_sequential_hole_workflow(
             if point_value is None or normal_value is None:
                 missing_fine_geometry.append(hole_id)
                 continue
+            if all_selected_two_capture_mode:
+                # 双共享模式的260 mm联合反投影与中心/法向一样，必须
+                # 完整使用本轮同一拍340 mm粗定位的平面，禁止旧字段混入。
+                plane_value = (
+                    coarse_result.get("plane_point_base_mm")
+                    if coarse_result.get("success") else None
+                )
+            else:
+                plane_value = hole.get("coarse_plane_point_base_mm")
+                if plane_value is None and coarse_result.get("success"):
+                    plane_value = coarse_result.get("plane_point_base_mm")
+            if plane_value is None:
+                # 粗定位结果正常时通常必然存在平面点；仅保留中心作为
+                # 最后兼容回退，避免改变旧缓存/测试数据的进入条件。
+                plane_value = point_value
             fine_planning_holes.append({
                 **hole,
                 # 共同260mm位姿规划器复用已有的批量视野算法；这里把
@@ -5573,6 +6264,14 @@ def _run_sequential_hole_workflow(
                 "initial_center_base_mm": np.asarray(point_value, dtype=np.float64).copy(),
                 "initial_plane_normal_base": np.asarray(normal_value, dtype=np.float64).copy(),
                 "planning_normal_base": np.asarray(normal_value, dtype=np.float64).copy(),
+                # 联合精定位要在每个孔自己的粗定位平面上反投影，不能
+                # 使用共享260mm综合位姿的平面替代孔级粗几何。
+                "coarse_plane_point_base_mm": np.asarray(
+                    plane_value, dtype=np.float64,
+                ).copy(),
+                "coarse_normal_toward_camera_base": np.asarray(
+                    normal_value, dtype=np.float64,
+                ).copy(),
             })
         fine_planning_holes_by_id = {
             int(hole["hole_id"]): hole for hole in fine_planning_holes
@@ -5626,6 +6325,24 @@ def _run_sequential_hole_workflow(
                         "valid_frames": (
                             result.get("fine") or {}
                         ).get("valid_frames", 0),
+                        "joint_success": bool(
+                            result.get("batch_fine_joint_success", False)
+                        ),
+                        "joint_translation_mm": (
+                            (result.get("batch_fine_joint_summary") or {}).get(
+                                "translation_mm"
+                            )
+                        ),
+                        "joint_yaw_deg": (
+                            (result.get("batch_fine_joint_summary") or {}).get(
+                                "yaw_deg"
+                            )
+                        ),
+                        "joint_residual_p95_mm": (
+                            (result.get("batch_fine_joint_summary") or {}).get(
+                                "frame_residual_p95_mm"
+                            )
+                        ),
                     }
                     for hole_id, result in values.items()
                     if isinstance(hole_id, int)
@@ -6073,6 +6790,11 @@ def _run_sequential_hole_workflow(
                     "coarse_normal_toward_camera_base"
                 ),
                 "batch_fine_requested": True,
+                "batch_fine_joint_enabled": bool(cfg.batch_fine_joint_localization),
+                "batch_fine_joint_applied": False,
+                "batch_fine_joint_summary": batch_fine_result.get(
+                    "batch_fine_joint_summary"
+                ),
                 "batch_fine_source": str(
                     batch_fine_result.get(
                         "batch_fine_source", "shared_batch_fine_failed"
@@ -6739,6 +7461,13 @@ def _run_sequential_hole_workflow(
                 "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
                 "batch_coarse_requested": bool(batch_coarse_for_cache),
                 "batch_fine_requested": bool(cfg.batch_fine_localization),
+                "batch_fine_joint_enabled": bool(
+                    cfg.batch_fine_localization and cfg.batch_fine_joint_localization
+                ),
+                "batch_fine_joint_applied": False,
+                "batch_fine_joint_summary": batch_fine_result.get(
+                    "batch_fine_joint_summary"
+                ),
                 "batch_fine_source": (
                     str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
                     if batch_fine_available else "per_hole_fine_fallback"
@@ -6971,6 +7700,13 @@ def _run_sequential_hole_workflow(
                 "initial_plane_normal_base": hole.get("initial_plane_normal_base"),
                 "batch_coarse_requested": bool(batch_coarse_for_cache),
                 "batch_fine_requested": bool(cfg.batch_fine_localization),
+                "batch_fine_joint_enabled": bool(
+                    cfg.batch_fine_localization and cfg.batch_fine_joint_localization
+                ),
+                "batch_fine_joint_applied": False,
+                "batch_fine_joint_summary": batch_fine_result.get(
+                    "batch_fine_joint_summary"
+                ),
                 "batch_fine_source": (
                     str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
                     if batch_fine_available else "per_hole_fine_fallback"
@@ -7112,6 +7848,60 @@ def _run_sequential_hole_workflow(
                     max_correction_mm=cfg.max_tilt_correction_mm,
                 )
 
+        # 共享精拍只更新每孔最终XY。联合结果是同一共享视野内多孔
+        # 平面刚体变换的主结果；在其上只保留受限的逐孔局部残差，
+        # 并保留已有倾斜圆心纠偏。联合门控失败时完全回退到旧的
+        # 逐孔共享精拍XY，不影响逐孔精定位或其它粗定位模式。
+        batch_fine_joint_enabled = bool(
+            batch_fine_available and cfg.batch_fine_joint_localization
+        )
+        batch_fine_joint_applied = False
+        batch_fine_joint_predicted_point_base: np.ndarray | None = None
+        batch_fine_joint_details: dict[str, Any] = {}
+        batch_fine_joint_summary = batch_fine_result.get(
+            "batch_fine_joint_summary"
+        ) or {}
+        if batch_fine_joint_enabled and batch_fine_result.get(
+            "batch_fine_joint_success", False
+        ):
+            joint_predictions = (
+                batch_fine_joint_summary.get("predicted_xy_by_hole") or {}
+            )
+            joint_xy = joint_predictions.get(
+                hole_id, joint_predictions.get(str(hole_id))
+            )
+            if joint_xy is not None:
+                try:
+                    coarse_center_for_joint = np.asarray(
+                        hole["coarse_center_base_mm"], dtype=np.float64,
+                    ).reshape(3)
+                    batch_fine_joint_predicted_point_base = np.asarray(
+                        [
+                            float(np.asarray(joint_xy).reshape(2)[0]),
+                            float(np.asarray(joint_xy).reshape(2)[1]),
+                            float(coarse_center_for_joint[2]),
+                        ],
+                        dtype=np.float64,
+                    )
+                    final_point_base, batch_fine_joint_details = (
+                        _compose_batch_fine_joint_xy_with_tilt(
+                            naive_final_point_base,
+                            final_point_base,
+                            batch_fine_joint_predicted_point_base,
+                            local_residual_weight=(
+                                cfg.batch_fine_joint_local_residual_weight
+                            ),
+                            local_residual_limit_mm=(
+                                cfg.batch_fine_joint_local_residual_limit_mm
+                            ),
+                        )
+                    )
+                    batch_fine_joint_applied = True
+                except Exception as joint_apply_exc:
+                    batch_fine_joint_details = {
+                        "error": f"{type(joint_apply_exc).__name__}:{joint_apply_exc}",
+                    }
+
         # 共享精拍只更新每孔最终XY。该孔的最终Z与姿态仍由粗定位决定；
         # 非共享精拍流程保持原有三维最终点行为。
         pose_point_base = np.asarray(final_point_base, dtype=np.float64).copy()
@@ -7178,6 +7968,7 @@ def _run_sequential_hole_workflow(
                 "hole_center_base_mm": final_point_base,
                 "pose_point_base_mm": pose_point_base,
                 "target_point_base_mm": final_target_point_base,
+                "batch_fine_joint_applied": batch_fine_joint_applied,
                 "final_point_mode": final_target_mode,
                 "final_point_offset_base_mm": [final_x_offset_mm, 0.0, final_z_offset_mm],
                 "compensation_mode": (
@@ -7269,6 +8060,23 @@ def _run_sequential_hole_workflow(
             ),
             "batch_fine_group_index": batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id)),
             "batch_coarse_fallback_reason": batch_fallback_reason,
+            "batch_fine_joint_enabled": batch_fine_joint_enabled,
+            "batch_fine_joint_applied": batch_fine_joint_applied,
+            "batch_fine_joint_predicted_xy_base_mm": (
+                None if batch_fine_joint_predicted_point_base is None else
+                batch_fine_joint_predicted_point_base[:2].copy()
+            ),
+            "batch_fine_joint_predicted_point_base_mm": (
+                batch_fine_joint_predicted_point_base
+            ),
+            "batch_fine_joint_visual_point_base_mm": (
+                pose_point_base.copy() if batch_fine_joint_applied else None
+            ),
+            "batch_fine_joint_details": batch_fine_joint_details,
+            "batch_fine_joint_summary": batch_fine_joint_summary,
+            "batch_fine_direct_point_base_mm": batch_fine_result.get(
+                "batch_fine_direct_point_base_mm"
+            ),
             "coarse_source": coarse_source,
             "fine_center_source": fine.get("center_source", "unknown"),
             "fine_center_source_counts": fine.get("center_source_counts", {}),
@@ -7278,8 +8086,11 @@ def _run_sequential_hole_workflow(
             "hole_center_base_mm": final_point_base,
             "hole_result_type": "base_frame_3d_point",
             "final_pose_source": (
+                "per_hole_coarse_pose_with_joint_batch_fine_xy_and_charuco"
+                if batch_fine_joint_applied else
                 "per_hole_coarse_pose_with_batch_fine_xy_only"
-                if batch_fine_available else "per_hole_fine_pose_and_center"
+                if batch_fine_available else
+                "per_hole_fine_pose_and_center"
             ),
             "batch_fine_xy_only": bool(batch_fine_available),
             "coarse_fine_reference_tcp_pose_m_rad": (
@@ -7321,6 +8132,8 @@ def _run_sequential_hole_workflow(
             "pointcloud_segmentation": hole["pointcloud_segmentation"],
             "fine_plane_intersection_mm": naive_final_point_base,
             "fine_xy_source": (
+                "shared_batch_fine_robust_planar_joint_xy_with_limited_local_residual"
+                if batch_fine_joint_applied else
                 "pointcloud_anchor_locked_yolo_center_on_coarse_local_plane"
             ),
             "fine_z_source": (
@@ -8032,6 +8845,36 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             getattr(args, "batch_fine_supplement_rounds", 1)
         ),
         batch_fine_view_margin_px=float(getattr(args, "batch_fine_view_margin_px", 50.0)),
+        batch_fine_joint_localization=bool(
+            getattr(args, "batch_fine_joint_localization", True)
+        ),
+        batch_fine_joint_min_holes=int(
+            getattr(args, "batch_fine_joint_min_holes", 2)
+        ),
+        batch_fine_joint_min_valid_frames=int(
+            getattr(args, "batch_fine_joint_min_valid_frames", 5)
+        ),
+        batch_fine_joint_max_residual_mm=float(
+            getattr(args, "batch_fine_joint_max_residual_mm", 1.5)
+        ),
+        batch_fine_joint_max_translation_mm=float(
+            getattr(args, "batch_fine_joint_max_translation_mm", 5.0)
+        ),
+        batch_fine_joint_max_yaw_deg=float(
+            getattr(args, "batch_fine_joint_max_yaw_deg", 3.0)
+        ),
+        batch_fine_joint_stable_translation_mm=float(
+            getattr(args, "batch_fine_joint_stable_translation_mm", 0.25)
+        ),
+        batch_fine_joint_stable_yaw_deg=float(
+            getattr(args, "batch_fine_joint_stable_yaw_deg", 0.15)
+        ),
+        batch_fine_joint_local_residual_weight=float(
+            getattr(args, "batch_fine_joint_local_residual_weight", 0.25)
+        ),
+        batch_fine_joint_local_residual_limit_mm=float(
+            getattr(args, "batch_fine_joint_local_residual_limit_mm", 0.5)
+        ),
         shared_cache_validation=bool(getattr(args, "shared_cache_validation", False)),
         shared_cache_validation_frames=int(args.shared_cache_validation_frames),
         shared_cache_validation_min_valid=int(args.shared_cache_validation_min_valid),
@@ -8132,6 +8975,30 @@ def run_two_stage_hole_localization(args: Any, handeye: Any, model: Any) -> int:
             raise ValueError("批量精定位停稳丢弃帧数不能小于0")
         if cfg.batch_fine_supplement_rounds < 0:
             raise ValueError("批量精定位共享补拍轮数不能小于0")
+        if cfg.batch_fine_joint_localization:
+            if cfg.batch_fine_joint_min_holes < 2:
+                raise ValueError("共享精定位联合最少孔数必须不少于2")
+            if (
+                cfg.batch_fine_joint_min_valid_frames < 1
+                or cfg.batch_fine_joint_min_valid_frames > cfg.batch_fine_frames
+            ):
+                raise ValueError("共享精定位联合稳定帧数必须在批量精拍帧数范围内")
+            for value, label in (
+                (cfg.batch_fine_joint_max_residual_mm, "共享精定位联合残差门限"),
+                (cfg.batch_fine_joint_max_translation_mm, "共享精定位联合平移门限"),
+                (cfg.batch_fine_joint_max_yaw_deg, "共享精定位联合旋转门限"),
+                (cfg.batch_fine_joint_stable_translation_mm, "共享精定位联合平移稳定门限"),
+                (cfg.batch_fine_joint_stable_yaw_deg, "共享精定位联合旋转稳定门限"),
+            ):
+                if not math.isfinite(float(value)) or float(value) <= 0.0:
+                    raise ValueError(f"{label}必须是大于0的有限数字")
+            if not 0.0 <= float(cfg.batch_fine_joint_local_residual_weight) <= 1.0:
+                raise ValueError("共享精定位逐孔残差权重必须在0到1之间")
+            if (
+                not math.isfinite(float(cfg.batch_fine_joint_local_residual_limit_mm))
+                or float(cfg.batch_fine_joint_local_residual_limit_mm) < 0.0
+            ):
+                raise ValueError("共享精定位逐孔残差限幅必须是大于等于0的有限数字")
     cycle_index = 1
     run_dir = _new_two_stage_run_dir(cycle_index)
     report = _new_two_stage_report(args, handeye, cfg, run_dir, cycle_index)
@@ -8465,6 +9332,55 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_fine_localization",
         action="store_false",
         help="关闭260mm批量精定位，恢复逐孔精定位",
+    )
+    p.add_argument(
+        "--batch-fine-joint-localization",
+        dest="batch_fine_joint_localization",
+        action="store_true",
+        default=True,
+        help="260mm共享精定位启用多孔平面刚体联合XY；仅影响共享精定位路径，默认开启",
+    )
+    p.add_argument(
+        "--no-batch-fine-joint-localization",
+        dest="batch_fine_joint_localization",
+        action="store_false",
+        help="关闭260mm多孔联合XY，回退为现有共享精拍逐孔XY结果",
+    )
+    p.add_argument(
+        "--batch-fine-joint-min-holes", type=int, default=2,
+        help="共享精定位联合求解每帧所需的最少孔数，默认2",
+    )
+    p.add_argument(
+        "--batch-fine-joint-min-valid-frames", type=int, default=5,
+        help="共享精定位联合变换稳定验收所需的有效帧数，默认5",
+    )
+    p.add_argument(
+        "--batch-fine-joint-max-residual-mm", type=float, default=1.5,
+        help="共享精定位联合刚体拟合最大孔级残差(mm)，默认1.5",
+    )
+    p.add_argument(
+        "--batch-fine-joint-max-translation-mm", type=float, default=5.0,
+        help="共享精定位联合平移幅度门限(mm)，默认5",
+    )
+    p.add_argument(
+        "--batch-fine-joint-max-yaw-deg", type=float, default=3.0,
+        help="共享精定位联合平面旋转幅度门限(deg)，默认3",
+    )
+    p.add_argument(
+        "--batch-fine-joint-stable-translation-mm", type=float, default=0.25,
+        help="共享精定位联合跨帧平移稳定门限(mm)，默认0.25",
+    )
+    p.add_argument(
+        "--batch-fine-joint-stable-yaw-deg", type=float, default=0.15,
+        help="共享精定位联合跨帧旋转稳定门限(deg)，默认0.15",
+    )
+    p.add_argument(
+        "--batch-fine-joint-local-residual-weight", type=float, default=0.25,
+        help="联合XY结果中保留逐孔局部残差的权重，默认0.25",
+    )
+    p.add_argument(
+        "--batch-fine-joint-local-residual-limit-mm", type=float, default=0.5,
+        help="逐孔局部残差参与联合XY的最大限幅(mm)，默认0.5",
     )
     p.add_argument(
         "--batch-fine-view-margin-px",

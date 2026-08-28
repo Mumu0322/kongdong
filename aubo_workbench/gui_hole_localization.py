@@ -143,6 +143,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.batch_coarse_min_holes_var = tk.StringVar(value="")
         self.batch_coarse_view_margin_var = tk.StringVar(value="50.0")
         self.batch_fine_localization_var = tk.BooleanVar(value=True)
+        self.batch_fine_joint_localization_var = tk.BooleanVar(value=True)
         self.batch_fine_frames_var = tk.StringVar(value="8")
         self.batch_fine_min_valid_var = tk.StringVar(value="5")
         self.batch_fine_stable_min_frames_var = tk.StringVar(value="5")
@@ -284,11 +285,16 @@ class HoleLocalizationPanel(ttk.Frame):
             text="260 mm 共享精定位（首拍全部选中孔；失败孔可移动共同位补拍）",
             variable=self.batch_fine_localization_var,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Checkbutton(
+            batch,
+            text="260 mm 多孔联合精定位（共享XY；保留逐孔残差、倾斜纠偏和ChArUco补偿）",
+            variable=self.batch_fine_joint_localization_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 2))
         ttk.Label(batch, text="260 mm 精定位视野边缘余量 px").grid(
-            row=3, column=0, sticky="w", padx=(0, 4), pady=4,
+            row=4, column=0, sticky="w", padx=(0, 4), pady=4,
         )
         ttk.Entry(batch, textvariable=self.batch_fine_view_margin_var, width=7).grid(
-            row=3, column=1, sticky="w", padx=(0, 18), pady=4,
+            row=4, column=1, sticky="w", padx=(0, 18), pady=4,
         )
         self._grid_fields(batch, [
             ("260 mm 批量帧数", self.batch_fine_frames_var, 7),
@@ -296,7 +302,7 @@ class HoleLocalizationPanel(ttk.Frame):
             ("260 mm 稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
             ("260 mm 最少预热丢弃帧", self.batch_fine_settle_discard_frames_var, 7),
             ("260 mm 失败孔共享补拍轮数", self.batch_fine_supplement_rounds_var, 7),
-        ], columns=2, start_row=4)
+        ], columns=2, start_row=5)
 
         shared = ttk.LabelFrame(parent, text="高级：缓存验证策略", padding=8)
         self.shared_cache_validation_frame = shared
@@ -674,6 +680,12 @@ class HoleLocalizationPanel(ttk.Frame):
                 "--batch-fine-localization"
                 if fine_batch_enabled else "--no-batch-fine-localization"
             )
+            joint_batch_var = getattr(
+                self, "batch_fine_joint_localization_var", None,
+            )
+            joint_batch_enabled = bool(
+                joint_batch_var is None or joint_batch_var.get()
+            )
             command.extend([
                 "--batch-fine-view-margin-px", str(fine_batch_margin),
                 "--batch-fine-frames", str(fine_batch_frames),
@@ -681,6 +693,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 "--batch-fine-stable-min-frames", str(fine_batch_stable_min),
                 "--batch-fine-settle-discard-frames", str(fine_batch_settle),
                 "--batch-fine-supplement-rounds", str(fine_batch_supplement_rounds),
+                "--batch-fine-joint-localization"
+                if joint_batch_enabled else "--no-batch-fine-joint-localization",
             ])
         return command
 
