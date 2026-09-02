@@ -22,7 +22,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
-from .paths import HANDEYE_CANDIDATE_PATH, HOLE_LOCALIZATION_RUNS_DIR, MODEL_PATH
+from .hole_map import load_hole_map, resolve_hole_map_path
+from .paths import (
+    HANDEYE_CANDIDATE_PATH,
+    HOLE_LOCALIZATION_CURRENT_MAP_PATH,
+    HOLE_LOCALIZATION_MAPS_DIR,
+    HOLE_LOCALIZATION_RUNS_DIR,
+    MODEL_PATH,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 LOCALIZATION_SCRIPT = PROJECT_DIR / "run_yolo_eye_in_hand_optimized.py"
@@ -122,7 +129,6 @@ class HoleLocalizationPanel(ttk.Frame):
         # 命令行兼容层，避免外部脚本或历史测试直接构造面板时失效。
         # 保持原 GUI 的默认行为：优先复用已验证的粗定位缓存。
         self.strategy_var = tk.StringVar(value="batch")
-        self.advanced_visible_var = tk.BooleanVar(value=False)
         self.confidence_var = tk.StringVar(value="0.35")
         self.coarse_height_var = tk.StringVar(value="340")
         self.fine_height_var = tk.StringVar(value="260")
@@ -148,6 +154,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.batch_fine_min_valid_var = tk.StringVar(value="5")
         self.batch_fine_stable_min_frames_var = tk.StringVar(value="5")
         self.batch_fine_settle_discard_frames_var = tk.StringVar(value="10")
+        self.batch_fine_inplace_recovery_frames_var = tk.StringVar(value="4")
         self.batch_fine_supplement_rounds_var = tk.StringVar(value="1")
         self.batch_fine_view_margin_var = tk.StringVar(value="50.0")
         self.optimize_hole_order_var = tk.BooleanVar(value=False)
@@ -163,6 +170,13 @@ class HoleLocalizationPanel(ttk.Frame):
         self.auto_next_hole_var = tk.BooleanVar(value=False)
         self.final_xy_var = tk.BooleanVar(value=False)
         self.include_final_motion_var = tk.BooleanVar(value=False)
+        self.hole_map_path_var = tk.StringVar(
+            value=(
+                str(HOLE_LOCALIZATION_CURRENT_MAP_PATH)
+                if HOLE_LOCALIZATION_CURRENT_MAP_PATH.is_file() else ""
+            )
+        )
+        self.hole_map_ids_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="待开始：默认仅预览，不会下发机器人运动")
         self.motion_var = tk.StringVar(value="无待确认运动")
         self.result_var = tk.StringVar(value="尚无本次结果")
@@ -259,7 +273,7 @@ class HoleLocalizationPanel(ttk.Frame):
         strategy.pack(fill=tk.X, pady=(8, 0))
         for row, (label, value) in enumerate((
             ("逐孔检测：每个孔独立粗定位和精定位", "per_hole"),
-            ("全部孔共享两次稳定连拍：340 mm 粗定位，260 mm 精定位", "batch"),
+            ("多孔分组共享定位：340 mm 分组粗定位，260 mm 分组精定位", "batch"),
             ("复用粗定位缓存：一拍多验证，失败逐孔粗定位", "cache"),
         )):
             ttk.Radiobutton(
@@ -268,7 +282,7 @@ class HoleLocalizationPanel(ttk.Frame):
             ).grid(row=row, column=0, sticky="w", pady=2)
         ttk.Label(
             strategy,
-            text="共享精拍首拍信息不足时，会移动到失败孔共同观察位补拍；不转成逐孔精拍。",
+            text="粗定位和精定位均按视野自动分组；组内稳定连拍，失败孔再按紧凑组补拍。",
             foreground="#555555",
         ).grid(row=3, column=0, sticky="w", pady=(4, 0))
 
@@ -282,7 +296,7 @@ class HoleLocalizationPanel(ttk.Frame):
         ], columns=2)
         ttk.Checkbutton(
             batch,
-            text="260 mm 共享精定位（首拍全部选中孔；失败孔可移动共同位补拍）",
+            text="260 mm 分组共享精定位（按视野自动分组；失败孔可分组补拍）",
             variable=self.batch_fine_localization_var,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
         ttk.Checkbutton(
@@ -301,6 +315,7 @@ class HoleLocalizationPanel(ttk.Frame):
             ("260 mm 最少有效帧", self.batch_fine_min_valid_var, 7),
             ("260 mm 稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
             ("260 mm 最少预热丢弃帧", self.batch_fine_settle_discard_frames_var, 7),
+            ("260 mm 原位补帧数", self.batch_fine_inplace_recovery_frames_var, 7),
             ("260 mm 失败孔共享补拍轮数", self.batch_fine_supplement_rounds_var, 7),
         ], columns=2, start_row=5)
 
@@ -359,6 +374,46 @@ class HoleLocalizationPanel(ttk.Frame):
             text="仅作用于本轮已选孔；开启后孔间不再等待人工确认，请确认运行区域安全。",
             foreground="#a35a00",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+        map_panel = ttk.LabelFrame(parent, text="多孔孔位地图（一次建图，后续按孔号调用）", padding=8)
+        map_panel.pack(fill=tk.X, pady=(8, 0))
+        map_panel.columnconfigure(1, weight=1)
+        ttk.Label(map_panel, text="当前地图 JSON").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(map_panel, textvariable=self.hole_map_path_var).grid(
+            row=0, column=1, columnspan=2, sticky="ew", pady=3,
+        )
+        ttk.Button(map_panel, text="选择", command=self._browse_hole_map).grid(
+            row=0, column=3, sticky="w", padx=(8, 0), pady=3,
+        )
+        ttk.Button(map_panel, text="查看点云", command=self.open_hole_map_pointcloud).grid(
+            row=2, column=3, sticky="w", padx=(8, 0), pady=(6, 0),
+        )
+        ttk.Button(map_panel, text="打开三维PLY", command=self.open_hole_map_ply).grid(
+            row=3, column=3, sticky="w", padx=(8, 0), pady=(6, 0),
+        )
+        ttk.Label(map_panel, text="调用孔号").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(map_panel, textvariable=self.hole_map_ids_var, width=24).grid(
+            row=1, column=1, sticky="w", pady=3,
+        )
+        ttk.Label(
+            map_panel,
+            text="留空=调用全部有效孔；例如：1 3 2",
+            foreground="#555555",
+        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=3)
+        self.build_map_btn = ttk.Button(
+            map_panel, text="建立孔位地图", command=self.start_hole_map_build,
+        )
+        self.build_map_btn.grid(row=2, column=0, padx=(0, 8), pady=(6, 0), sticky="w")
+        self.execute_map_btn = ttk.Button(
+            map_panel, text="调用地图孔位", command=self.start_hole_map_execute,
+        )
+        self.execute_map_btn.grid(row=2, column=1, padx=(0, 8), pady=(6, 0), sticky="w")
+        ttk.Label(
+            map_panel,
+            text="建图自动生成新版本并更新完整地图；调用地图时不启动相机和YOLO，仅按安全路径运动。",
+            foreground="#555555",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=(0, 0), pady=(6, 0))
+
         actions = ttk.LabelFrame(parent, text="开始检测", padding=8)
         actions.pack(fill=tk.X, pady=(8, 0))
         self.start_btn = ttk.Button(actions, text="开始两阶段定位", command=self.start)
@@ -466,6 +521,41 @@ class HoleLocalizationPanel(ttk.Frame):
         if path:
             self.handeye_var.set(path)
 
+    def _browse_hole_map(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择孔位地图",
+            initialdir=str(HOLE_LOCALIZATION_MAPS_DIR),
+            filetypes=[("孔位地图 JSON", "*.json"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.hole_map_path_var.set(path)
+
+    def open_hole_map_pointcloud(self) -> None:
+        """打开当前/选定地图的点云预览JPG。"""
+        self._open_hole_map_artifact("preview_jpg", "点云预览")
+
+    def open_hole_map_ply(self) -> None:
+        """用系统默认三维查看器打开当前/选定地图的PLY点云。"""
+        self._open_hole_map_artifact("ply", "三维点云PLY")
+
+    def _open_hole_map_artifact(self, artifact_name: str, label: str) -> None:
+        raw_path = self.hole_map_path_var.get().strip()
+        if not raw_path:
+            raw_path = str(HOLE_LOCALIZATION_CURRENT_MAP_PATH)
+        try:
+            map_path = resolve_hole_map_path(raw_path)
+            payload = load_hole_map(raw_path)
+            artifact = (payload.get("artifacts") or {}).get(artifact_name)
+            if not artifact:
+                raise ValueError(f"该地图没有{label}；请重新建立地图")
+            preview = map_path.parent / str(artifact)
+            if not preview.is_file():
+                raise FileNotFoundError(f"{label}不存在：{preview}")
+            os.startfile(str(preview))  # type: ignore[attr-defined]
+        except Exception as exc:
+            messagebox.showerror(f"打开{label}失败", str(exc), parent=self)
+
     def _numbers(self) -> dict[str, float | int]:
         try:
             numbers: dict[str, float | int] = {
@@ -497,15 +587,19 @@ class HoleLocalizationPanel(ttk.Frame):
 
     def _build_command(self, mode: str = "two_stage", execute_override: bool | None = None) -> list[str]:
         is_offset = mode == "offset"
-        script = LOCALIZATION_SCRIPT if mode == "two_stage" else OFFSET_TEST_SCRIPT
+        is_map_build = mode == "hole_map_build"
+        is_map_execute = mode == "hole_map_execute"
+        if not (is_offset or mode == "two_stage" or is_map_build or is_map_execute):
+            raise ValueError(f"未知定位流程模式：{mode}")
+        script = OFFSET_TEST_SCRIPT if is_offset else LOCALIZATION_SCRIPT
         if not script.is_file():
             raise FileNotFoundError(f"找不到定位脚本：{script}")
         model = Path(self.model_var.get().strip())
         handeye = Path(self.handeye_var.get().strip())
         execute = self.execute_var.get() if execute_override is None else bool(execute_override)
-        if (not is_offset or execute) and not model.is_file():
+        if (not is_offset and not is_map_execute) and not model.is_file():
             raise FileNotFoundError(f"YOLO 模型不存在：{model}")
-        if (not is_offset or execute) and not handeye.is_file():
+        if (not is_offset and not is_map_execute) and not handeye.is_file():
             raise FileNotFoundError(f"手眼结果不存在：{handeye}")
         values = self._numbers()
         connection = self.connection_provider()
@@ -545,7 +639,34 @@ class HoleLocalizationPanel(ttk.Frame):
                 command.append("--start-confirmed")
             if self.include_final_motion_var.get():
                 command.append("--include-final-motion")
-        else:  # two_stage
+        elif is_map_execute:
+            final_mode = {
+                "机械爪模式": "gripper",
+                "平常模式": "normal",
+            }.get(self.final_target_mode_var.get())
+            if final_mode is None:
+                raise ValueError("最终点模式必须选择“机械爪模式”或“平常模式”")
+            map_path_text = self.hole_map_path_var.get().strip()
+            if not map_path_text:
+                map_path_text = str(HOLE_LOCALIZATION_CURRENT_MAP_PATH)
+            map_path = Path(map_path_text)
+            if not map_path.is_file():
+                raise FileNotFoundError(f"孔位地图不存在：{map_path}")
+            command.extend([
+                "--hole-map-mode", "execute",
+                "--hole-map-path", str(map_path),
+                "--final-target-mode", final_mode,
+            ])
+            ids_text = self.hole_map_ids_var.get().replace(",", " ").strip()
+            if ids_text:
+                try:
+                    hole_ids = [int(item) for item in ids_text.split()]
+                except ValueError as exc:
+                    raise ValueError("调用孔号必须是空格或逗号分隔的整数") from exc
+                if not hole_ids or any(item <= 0 for item in hole_ids):
+                    raise ValueError("调用孔号必须是正整数")
+                command.extend(["--hole-ids", *[str(item) for item in hole_ids]])
+        else:  # two_stage / hole_map_build
             command.append(
                 "--allow-experimental-handeye"
                 if self.experimental_var.get() else "--require-validated-handeye"
@@ -557,16 +678,29 @@ class HoleLocalizationPanel(ttk.Frame):
             if final_mode is None:
                 raise ValueError("最终点模式必须选择“机械爪模式”或“平常模式”")
             command.extend(["--final-target-mode", final_mode])
-            command.append("--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy")
+            if is_map_build and self.final_xy_var.get():
+                raise ValueError("建立地图阶段不会执行最终安放，请关闭“精定位后执行最终移动”")
+            command.append(
+                "--no-move-final-xy"
+                if is_map_build else
+                "--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy"
+            )
             # “复用粗定位缓存”策略的语义是跨运行复用一拍多正式缓存。
             # 即使高级兼容开关被旧配置残留为 False，也不能悄悄退化成
             # 仅当前运行缓存，否则下一轮会再次执行一拍多。
             strategy_name = getattr(getattr(self, "strategy_var", None), "get", lambda: "")()
+            if is_map_build and strategy_name != "batch":
+                raise ValueError("建立孔位地图要求选择“多孔分组共享定位”策略")
             cache_strategy = strategy_name == "cache"
             reuse_session_cache = bool(self.reuse_coarse_cache_var.get()) or cache_strategy
             reuse_persistent_cache = (
                 bool(self.reuse_persistent_coarse_cache_var.get()) or cache_strategy
             )
+            if is_map_build:
+                # 建图必须使用本轮新鲜的共享340 mm点云；地图建立速度让位于
+                # 坐标精度，避免把历史缓存中的旧工件几何写入当前地图。
+                reuse_session_cache = False
+                reuse_persistent_cache = False
             command.append(
                 "--reuse-coarse-cache"
                 if reuse_session_cache else "--no-reuse-coarse-cache"
@@ -660,6 +794,10 @@ class HoleLocalizationPanel(ttk.Frame):
                     getattr(self, "batch_fine_settle_discard_frames_var", None),
                     "get", lambda: "10",
                 )())
+                fine_batch_inplace_recovery = int(getattr(
+                    getattr(self, "batch_fine_inplace_recovery_frames_var", None),
+                    "get", lambda: "4",
+                )())
                 fine_batch_supplement_rounds = int(getattr(
                     getattr(self, "batch_fine_supplement_rounds_var", None),
                     "get", lambda: "1",
@@ -674,6 +812,8 @@ class HoleLocalizationPanel(ttk.Frame):
                 raise ValueError("批量精定位稳定门帧数必须在批量帧数范围内")
             if fine_batch_settle < 0:
                 raise ValueError("批量精定位预热丢弃帧数不能小于 0")
+            if fine_batch_inplace_recovery < 0:
+                raise ValueError("批量精定位原位补帧数不能小于 0")
             if fine_batch_supplement_rounds < 0:
                 raise ValueError("批量精定位共享补拍轮数不能小于 0")
             command.append(
@@ -692,14 +832,23 @@ class HoleLocalizationPanel(ttk.Frame):
                 "--batch-fine-min-valid", str(fine_batch_min_valid),
                 "--batch-fine-stable-min-frames", str(fine_batch_stable_min),
                 "--batch-fine-settle-discard-frames", str(fine_batch_settle),
+                "--batch-fine-inplace-recovery-frames", str(fine_batch_inplace_recovery),
                 "--batch-fine-supplement-rounds", str(fine_batch_supplement_rounds),
                 "--batch-fine-joint-localization"
                 if joint_batch_enabled else "--no-batch-fine-joint-localization",
             ])
+            if is_map_build:
+                command.extend(["--hole-map-mode", "build"])
         return command
 
     def start(self) -> None:
         self._start_process("two_stage")
+
+    def start_hole_map_build(self) -> None:
+        self._start_process("hole_map_build")
+
+    def start_hole_map_execute(self) -> None:
+        self._start_process("hole_map_execute")
 
     def start_offset_test(self) -> None:
         self._start_process("offset")
@@ -722,13 +871,18 @@ class HoleLocalizationPanel(ttk.Frame):
         auto_next_hole = bool(
             getattr(getattr(self, "auto_next_hole_var", None), "get", lambda: False)()
         )
-        if execute and not messagebox.askyesno(
-            "确认真实运动",
-            (
-                "将执行回原点、单孔粗定位、下降和横向偏移采集。"
-                f"{offset_confirmation}\n"
-                "请在相机窗口中只选择一个孔，之后测试会自动运行。\n\n确认开始吗？"
-                if mode == "offset" else
+        if mode == "hole_map_build":
+            confirmation_text = (
+                "将按视野分组执行多孔共享粗/精定位并建立孔位地图；建图阶段不会执行最终安放动作，"
+                "完成后可按孔号单独调用。"
+            )
+        elif mode == "hole_map_execute":
+            confirmation_text = (
+                "将直接调用已保存孔位地图，不启动相机和YOLO，按地图孔号执行安全抬升、平移和下降。"
+                f"调用孔号：{self.hole_map_ids_var.get().strip() or '全部有效孔'}。"
+            )
+        else:
+            confirmation_text = (
                 "将执行回原点及两阶段定位；每轮完成后会自动回原点并进入下一轮选孔，"
                 "相机和机器人会话保持运行。按选孔窗口 Esc 可结束会话。\n"
                 + (
@@ -737,7 +891,15 @@ class HoleLocalizationPanel(ttk.Frame):
                     if auto_next_hole else
                     "当前轮每个孔完成后需要人工确认，确认后才会移动到下一个孔。\n"
                 )
-                + "\n确认开始吗？"
+            )
+        if execute and not messagebox.askyesno(
+            "确认真实运动",
+            (
+                "将执行回原点、单孔粗定位、下降和横向偏移采集。"
+                f"{offset_confirmation}\n"
+                "请在相机窗口中只选择一个孔，之后测试会自动运行。\n\n确认开始吗？"
+                if mode == "offset" else
+                confirmation_text + "\n确认开始吗？"
             ),
             parent=self,
         ):
@@ -746,10 +908,14 @@ class HoleLocalizationPanel(ttk.Frame):
         self._clear_log()
         self.result_var.set(
             "偏移容忍度测试进行中…" if mode == "offset" else
+            "孔位地图调用进行中…" if mode == "hole_map_execute" else
+            "孔位地图建立进行中…" if mode == "hole_map_build" else
             "本次定位进行中…"
         )
         self.status_var.set(
             "正在启动偏移测试进程…" if mode == "offset" else
+            "正在启动孔位地图调用…" if mode == "hole_map_execute" else
+            "正在启动孔位地图建立…" if mode == "hole_map_build" else
             "正在启动定位进程…"
         )
         self.motion_var.set("无待确认运动")
@@ -759,6 +925,10 @@ class HoleLocalizationPanel(ttk.Frame):
         self.confirm_btn.configure(state=tk.DISABLED)
         self.mark_error_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.DISABLED)
+        if hasattr(self, "build_map_btn"):
+            self.build_map_btn.configure(state=tk.DISABLED)
+        if hasattr(self, "execute_map_btn"):
+            self.execute_map_btn.configure(state=tk.DISABLED)
         try:
             self.process = subprocess.Popen(
                 command,
@@ -773,6 +943,10 @@ class HoleLocalizationPanel(ttk.Frame):
             )
         except OSError as exc:
             self.status_var.set("启动失败")
+            if hasattr(self, "build_map_btn"):
+                self.build_map_btn.configure(state=tk.NORMAL)
+            if hasattr(self, "execute_map_btn"):
+                self.execute_map_btn.configure(state=tk.NORMAL)
             messagebox.showerror("无法启动定位", str(exc), parent=self)
             return
         self.run_started_at = time.time()
@@ -974,10 +1148,16 @@ class HoleLocalizationPanel(ttk.Frame):
         self.confirm_btn.configure(text="开始检测下一个孔")
         self.start_btn.configure(state=tk.NORMAL)
         self.offset_start_btn.configure(state=tk.NORMAL)
+        if hasattr(self, "build_map_btn"):
+            self.build_map_btn.configure(state=tk.NORMAL)
+        if hasattr(self, "execute_map_btn"):
+            self.execute_map_btn.configure(state=tk.NORMAL)
         self.process = None
         if code == 0:
             self.status_var.set(
                 "偏移测试完成" if self.process_mode == "offset" else
+                "孔位地图调用完成" if self.process_mode == "hole_map_execute" else
+                "孔位地图建立完成" if self.process_mode == "hole_map_build" else
                 "定位完成"
             )
             self._show_latest_result()
@@ -986,6 +1166,38 @@ class HoleLocalizationPanel(ttk.Frame):
             self.result_var.set("本次定位未通过质量门或被取消；请查看运行日志和结果目录。")
 
     def _show_latest_result(self) -> None:
+        if self.process_mode == "hole_map_execute":
+            reports = sorted(
+                (
+                    path
+                    for path in HOLE_LOCALIZATION_MAPS_DIR.glob(
+                        "hole-map-*/calls/*/report.json"
+                    )
+                    if path.stat().st_mtime >= self.run_started_at - 2.0
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if not reports:
+                self.result_var.set("孔位地图调用完成，但未找到本次调用报告。")
+                return
+            try:
+                report = json.loads(reports[0].read_text(encoding="utf-8"))
+                lines = [
+                    f"地图：{report.get('map_path', '-')}\n"
+                    f"调用孔号：{report.get('requested_hole_ids', [])}    "
+                    f"完成：{report.get('completed_holes', len(report.get('holes') or []))}",
+                    f"调用报告：{reports[0].parent}",
+                ]
+                for item in report.get("holes") or []:
+                    lines.append(
+                        f"孔 {item.get('hole_id', '-')}：{item.get('status', '-')} "
+                        f"目标TCP={self._format_vector((item.get('target') or {}).get('planned_tcp_pose_m_rad'))}"
+                    )
+                self.result_var.set("\n".join(lines))
+            except Exception as exc:
+                self.result_var.set(f"读取孔位地图调用报告失败：{exc}")
+            return
         if self.process_mode == "offset":
             reports = sorted(
                 (
@@ -1047,6 +1259,39 @@ class HoleLocalizationPanel(ttk.Frame):
             return
         try:
             report = json.loads(reports[0].read_text(encoding="utf-8"))
+            summary_path = reports[0].parent / "result_summary.json"
+            if summary_path.is_file():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                summary_status = summary.get("status") or {}
+                summary_timing = summary.get("timing") or {}
+                lines = [
+                    f"简明报告：{summary_path}",
+                    f"本轮状态：{summary_status.get('cycle_status', '-') }    "
+                    f"会话结束：{summary_status.get('session_end_reason') or summary_status.get('session_status', '-')}",
+                    f"孔数：{summary_status.get('selected_holes', 0)}    "
+                    f"成功：{summary_status.get('completed_holes', 0)}    "
+                    f"延后/失败：{summary_status.get('deferred_holes', 0)}",
+                    f"生产节拍：{float(summary_timing.get('production_cycle_s', 0.0)):.2f} s    "
+                    f"纯执行：{float(summary_timing.get('pure_execution_s', 0.0)):.2f} s",
+                    f"机械臂运动：{float((summary_timing.get('task_breakdown') or {}).get('robot_motion_s', 0.0)):.2f} s    "
+                    f"视觉计算：{float((summary_timing.get('task_breakdown') or {}).get('vision_compute_s', 0.0)):.2f} s",
+                    f"人工等待：{float(summary_timing.get('operator_wait_s', 0.0)):.2f} s    "
+                    f"安全等待：{float(summary_timing.get('safety_wait_s', 0.0)):.2f} s    "
+                    f"文件生成：{float(summary_timing.get('artifact_io_s', 0.0)):.2f} s",
+                    "",
+                    "孔号    来源                  孔自身(s)  共享分摊(s)  合计(s)",
+                ]
+                for item in summary.get("holes") or []:
+                    lines.append(
+                        f"H{int(item.get('hole_id', 0)):02d}     "
+                        f"{str(item.get('source', '-')):<21} "
+                        f"{float(item.get('exclusive_time_s', 0.0)):>8.2f}  "
+                        f"{float(item.get('shared_allocated_time_s', 0.0)):>9.2f}  "
+                        f"{float(item.get('attributed_total_s', 0.0)):>7.2f}"
+                    )
+                lines.append(f"详细报告：{reports[0]}")
+                self.result_var.set("\n".join(lines))
+                return
             final = report.get("final_result", {})
             holes = final.get("holes")
             if isinstance(holes, list) and holes:
@@ -1062,6 +1307,24 @@ class HoleLocalizationPanel(ttk.Frame):
                     f"成功：{completed_count}    延期：{deferred_count}    "
                     f"最终 TCP：{self._format_vector(final.get('final_tcp_pose_m_rad'))}",
                 ]
+                map_summary = report.get("hole_map") or {}
+                if map_summary:
+                    lines.append(
+                        f"孔位地图：{map_summary.get('path', '-')}，"
+                        f"有效孔={map_summary.get('ready_holes', [])}，"
+                        f"延期孔={map_summary.get('deferred_holes', [])}"
+                    )
+                    current_path = map_summary.get("current_path")
+                    if current_path:
+                        self.hole_map_path_var.set(str(current_path))
+                        lines.append(f"当前可调用地图：{current_path}")
+                    elif self.process_mode == "hole_map_build":
+                        lines.append("本次地图为部分结果，未替换已有完整当前地图。")
+                    artifacts = map_summary.get("artifacts") or {}
+                    if artifacts.get("preview_jpg"):
+                        lines.append(
+                            f"点云预览：{Path(map_summary.get('path', '')).parent / str(artifacts['preview_jpg'])}"
+                        )
                 shared = (report.get("stages") or {}).get("shared_cache_validation") or {}
                 if shared.get("requested"):
                     groups = shared.get("groups") or []
@@ -1082,8 +1345,11 @@ class HoleLocalizationPanel(ttk.Frame):
                     groups = batch_coarse.get("groups") or []
                     lines.append(
                         f"340mm共享粗定位：组数={len(groups)}，"
-                        "全部选中孔共享一个综合中心拍摄位姿"
+                        "每组使用本组孔位的综合中心拍摄位姿"
                     )
+                    grouping_visualization = batch_coarse.get("grouping_visualization") or {}
+                    if grouping_visualization.get("jpg"):
+                        lines.append(f"粗定位分组可视化：{grouping_visualization['jpg']}")
                     for group in groups:
                         lines.append(
                             f"  粗定位组{group.get('group_index', '-')}: "
@@ -1091,12 +1357,23 @@ class HoleLocalizationPanel(ttk.Frame):
                             f"综合中心={self._format_vector(group.get('combined_point_base_mm'))} "
                             f"共享拍摄位姿={self._format_vector(group.get('target_tcp_pose_m_rad'))}"
                         )
+                        capture_visualization = group.get("capture_grouping_visualization") or {}
+                        if capture_visualization.get("jpg"):
+                            lines.append(f"    实际拍摄分组图：{capture_visualization['jpg']}")
                 if batch_fine.get("enabled"):
                     groups = batch_fine.get("groups") or []
                     lines.append(
                         f"260mm共享拍摄：组数={len(groups)}，每组一个相机位姿；"
                         "孔结果仅为基坐标三维点"
                     )
+                    per_hole_fallback = batch_fine.get("per_hole_fallback_holes") or []
+                    if per_hole_fallback:
+                        lines.append(
+                            f"共享精拍质量门未通过，转逐孔精定位：{per_hole_fallback}"
+                        )
+                    grouping_visualization = batch_fine.get("grouping_visualization") or {}
+                    if grouping_visualization.get("jpg"):
+                        lines.append(f"精定位分组可视化：{grouping_visualization['jpg']}")
                     for group in groups:
                         lines.append(
                             f"  组{group.get('group_index', '-')}: "
@@ -1104,6 +1381,9 @@ class HoleLocalizationPanel(ttk.Frame):
                             f"综合中心={self._format_vector(group.get('combined_point_base_mm'))} "
                             f"共享拍摄位姿={self._format_vector(group.get('target_tcp_pose_m_rad'))}"
                         )
+                        capture_visualization = group.get("capture_grouping_visualization") or {}
+                        if capture_visualization.get("jpg"):
+                            lines.append(f"    实际拍摄分组图：{capture_visualization['jpg']}")
                         for supplement in group.get("supplement_captures") or []:
                             lines.append(
                                 f"    共享补拍{supplement.get('round', '-')}: "
@@ -1111,6 +1391,9 @@ class HoleLocalizationPanel(ttk.Frame):
                                 f"通过={supplement.get('accepted_holes', [])} "
                                 f"未通过={supplement.get('fallback_holes', [])}"
                             )
+                            supplement_visualization = supplement.get("capture_grouping_visualization") or {}
+                            if supplement_visualization.get("jpg"):
+                                lines.append(f"      补拍分组图：{supplement_visualization['jpg']}")
                 for item in holes:
                     quality_status = item.get("fine_quality_status", "strict")
                     status_text = (

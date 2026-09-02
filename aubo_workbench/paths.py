@@ -46,9 +46,14 @@ MODEL_PATH = _path_from_env("AUBO_WORKBENCH_MODEL", WORKSPACE_DIR / "models" / "
 CAMERA_CALIBRATION_PATH = DATA_DIR / "camera_calibration" / "current_rgb_intrinsics.json"
 HANDEYE_CANDIDATE_PATH = DATA_DIR / "e7_candidates" / "e7_handeye_candidate_current.json"
 HANDEYE_VALIDATION_PATH = DATA_DIR / "e7_handeye_validation_current.json"
-HANDEYE_DIAGNOSTIC_PATH = DATA_DIR / "handeye_diagnostic_current.json"
 
 HOLE_LOCALIZATION_RUNS_DIR = DATA_DIR / "hole_localization_runs"
+# 多孔一次定位后可直接调用的最终孔位地图。它与旧的粗定位缓存分开，
+# 地图保存的是已经融合完成的孔位几何和执行所需的环境指纹。
+HOLE_LOCALIZATION_MAPS_DIR = DATA_DIR / "hole_localization_maps"
+# 当前可执行地图的稳定入口。它是一个小型指针文件，指向
+# HOLE_LOCALIZATION_MAPS_DIR 下最新一次完整建图结果，不复制/覆盖地图正文。
+HOLE_LOCALIZATION_CURRENT_MAP_PATH = HOLE_LOCALIZATION_MAPS_DIR / "current.json"
 # 旧两阶段的跨运行局部点云缓存。缓存中的几何均落在机器人 base 坐标系，
 # 每次复用前仍必须在340 mm现场验证。
 HOLE_LOCALIZATION_COARSE_CACHE_DIR = DATA_DIR / "hole_localization_coarse_cache"
@@ -60,6 +65,3 @@ HANDEYE_CANDIDATE_DIR = DATA_DIR / "e7_candidates"
 HANDEYE_40_POSE_PLAN_PATH = DATA_DIR / "handeye_40_pose_plan_current.json"
 HANDEYE_40_POSE_PROGRESS_PATH = DATA_DIR / "handeye_40_pose_progress_current.json"
 HANDEYE_40_POSE_CSV_PATH = DATA_DIR / "handeye_40_pose_plan_current.csv"
-
-# 夹爪驱动仍由 aubo_tools/JiaZhua 提供；主项目只记录依赖位置。
-GRIPPER_DRIVER_PATH = AUBO_TOOLS_DIR / "JiaZhua" / "z_erg_20c.py"

@@ -265,29 +265,6 @@ class AutoCaptureConfig:
     min_sharpness: float = 90.0
 
 
-@dataclass
-class CoarseCacheConfig:
-    """粗定位点云缓存配置。"""
-
-    # 自适应匹配距离
-    adaptive_match_distance_enabled: bool = True
-    base_match_distance_xy_mm: float = 8.0
-    dense_threshold_entries_per_100mm2: float = 0.8
-    sparse_multiplier: float = 1.5
-
-    # 缓存过期策略（默认不过期）
-    expiry_enabled: bool = False
-    max_age_hours: float = 72.0  # 3天
-    warning_age_hours: float = 48.0  # 2天
-    auto_refresh_on_stale: bool = False
-
-    # 验证统计增强
-    enable_freshness_tracking: bool = True
-
-    # 法向融合方法
-    use_robust_normal_fusion: bool = True  # True使用PCA方法，False使用简单中位数
-
-
 # 全局单例：整个应用共享同一份配置对象，GUI 表单/命令行都是直接改这些字段。
 BOARD_CFG = BoardConfig()
 CAMERA_CFG = CameraConfig()
@@ -298,7 +275,6 @@ E7_HAND_EYE_CFG = E7HandEyeConfig()
 AUTO_PRUNE_CFG = AutoPruneConfig()
 CONFLICT_DIAG_CFG = ConflictDiagnosisConfig()
 AUTO_CAPTURE_CFG = AutoCaptureConfig()
-COARSE_CACHE_CFG = CoarseCacheConfig()
 
 ESC_KEY = 27
 

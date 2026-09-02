@@ -278,7 +278,7 @@ def save_burst_single_frame_sample(
 
 
 def _run_burst_loop(
-    pipeline, align_filter, point_cloud_filter, board, dictionary,
+    pipeline, board, dictionary,
     samples: list[CalibSample], on_frame: Callable[[np.ndarray, int, int, int], None] | None,
     stop_check: Callable[[], bool] | None,
     log_prefix: str,
@@ -383,7 +383,7 @@ def capture_burst_samples(
         cv2.waitKey(1)
 
     captures = _run_burst_loop(
-        pipeline, align_filter, point_cloud_filter, board, dictionary, samples, on_frame, None, "BURST",
+        pipeline, board, dictionary, samples, on_frame, None, "BURST",
     )
     if len(captures) == target_count:
         print(f"[BURST] 手动5帧采集完成：成功取得 {len(captures)}/{target_count} 帧，准备选择 1 帧保存为样本。")
@@ -410,7 +410,7 @@ def capture_burst_samples_gui(
         return bool(stop_event is not None and stop_event.is_set())
 
     captures = _run_burst_loop(
-        pipeline, align_filter, point_cloud_filter, board, dictionary, samples, on_frame, stop_check, "GUI-BURST",
+        pipeline, board, dictionary, samples, on_frame, stop_check, "GUI-BURST",
     )
     if len(captures) == target_count:
         print(f"[GUI-BURST] 已取得 {len(captures)}/{target_count} 帧，开始选择 1 帧保存为样本。")

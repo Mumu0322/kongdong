@@ -591,7 +591,7 @@ class CoarseCacheTests(unittest.TestCase):
                 patch.object(localization, "load_cache_entries", return_value={1: entry}), \
                 patch.object(
                     localization, "_validate_coarse_cache_at_current_pose",
-                    return_value=(validation, cache_observations, np.array([640.0, 360.0])),
+                    return_value=(validation, cache_observations),
                 ) as live_validation, \
                 patch.object(localization, "_capture_coarse_burst") as full_coarse, \
                 patch.object(localization, "render_cache_cloud", return_value=None), \
@@ -615,7 +615,6 @@ class CoarseCacheTests(unittest.TestCase):
                 coarse_cache_entries={1: entry},
                 coarse_cache_dir=Path(directory) / "coarse_cache",
                 coarse_cache_gates=self.gates,
-                coarse_cache_metadata={},
             )
 
         self.assertEqual(result, 0)
@@ -675,7 +674,7 @@ class CoarseCacheTests(unittest.TestCase):
                 {"rgbd_pipeline": object(), "align": object(), "chain": object()}, object(), None,
                 np.eye(4), [self._workflow_hole()], self.intrinsics,
                 coarse_cache_entries={1: entry}, coarse_cache_dir=Path(directory) / "coarse_cache",
-                coarse_cache_gates=gates, coarse_cache_metadata={},
+                coarse_cache_gates=gates,
             )
         self.assertEqual(result, 0)
         per_hole_move.assert_not_called()
@@ -740,7 +739,6 @@ class CoarseCacheTests(unittest.TestCase):
                     np.eye(4), [self._workflow_hole(hole_id=1, x_mm=10.0), self._workflow_hole(hole_id=2, x_mm=60.0)], self.intrinsics,
                     coarse_cache_entries=entries, coarse_cache_dir=Path(directory) / "coarse_cache",
                     coarse_cache_gates=CacheValidationGates(validation_frames=3, min_valid_frames=2),
-                    coarse_cache_metadata={},
                 )
 
         self.assertEqual(per_hole_move.call_args.args[0], 2)
@@ -803,7 +801,6 @@ class CoarseCacheTests(unittest.TestCase):
                             )
                             for index in range(5)
                         ],
-                        np.array([640.0, 360.0]),
                     ),
                 ) as live_validation, \
                 patch.object(
@@ -832,7 +829,6 @@ class CoarseCacheTests(unittest.TestCase):
                 coarse_cache_entries={1: entry},
                 coarse_cache_dir=Path(directory) / "coarse_cache",
                 coarse_cache_gates=self.gates,
-                coarse_cache_metadata={},
             )
 
         self.assertEqual(result, 0)
@@ -880,7 +876,7 @@ class CoarseCacheTests(unittest.TestCase):
                 patch.object(localization, "load_cache_entries", side_effect=AssertionError("must not read current cache")), \
                 patch.object(
                     localization, "_validate_coarse_cache_at_current_pose",
-                    return_value=(validation, cache_observations, np.array([640.0, 360.0])),
+                    return_value=(validation, cache_observations),
                 ) as live_validation, \
                 patch.object(localization, "_capture_coarse_burst") as full_coarse, \
                 patch.object(localization, "render_cache_cloud", return_value=None), \
@@ -906,10 +902,8 @@ class CoarseCacheTests(unittest.TestCase):
                 coarse_cache_source_ids={1: 1},
                 coarse_cache_dir=Path(directory) / "coarse_cache",
                 coarse_cache_gates=self.gates,
-                coarse_cache_metadata={},
                 persistent_cache_entries={1: entry},
                 persistent_cache_dir=Path(directory) / "persistent_cache",
-                persistent_cache_metadata={},
             )
 
         self.assertEqual(result, 0)
