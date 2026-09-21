@@ -18,9 +18,8 @@ FINAL_TOOL_Y_AFTER_Z_MM = 0.0
 # 三孔逐孔安放时，所有低位横移前先抬到该安全余量。
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
 
-# 新副本默认没有历史补偿。只有通过环境变量或 current.json 显式提供的
-# report.json 才会加载矩阵；文件不存在、损坏或模型字段不完整时保留单位
-# 变换和零偏置用于离线规划，但不会被允许运动流程当成有效补偿。
+# 模型从 current.json 读取；运行默认使用，关闭纠偏时直接使用视觉孔中心。
+# 文件不存在或无效时保留单位变换供离线规划。
 CHARUCO_XY_MODEL_MATRIX = np.eye(2, dtype=np.float64)
 CHARUCO_XY_MODEL_BIAS_MM = np.zeros(2, dtype=np.float64)
 CHARUCO_XY_MODEL_SOURCE = Path(TCP_XY_MODEL_PATH)
@@ -46,17 +45,20 @@ CHARUCO_XY_MODEL_MATRIX, CHARUCO_XY_MODEL_BIAS_MM, CHARUCO_XY_MODEL_READY = _loa
 
 
 def plan_final_tcp_xy(T_base_tcp: np.ndarray, hole_center_base: np.ndarray,
-                      xy_offset_mm: tuple[float, float] | None = None) -> tuple[np.ndarray, np.ndarray]:
+                      xy_offset_mm: tuple[float, float] | None = None,
+                      *, use_charuco_model: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """只调整当前 TCP 的基坐标 XY，姿态（含 yaw）和 Z 保持不变。
 
-    默认使用 ChArUco 9 点仿射模型；显式提供固定偏置时覆盖该模型。
+    默认使用 ChArUco XY 模型；显式固定偏置优先于模型。
     """
     target = np.asarray(T_base_tcp, dtype=np.float64).copy()
     visual_xy = np.asarray(hole_center_base, dtype=np.float64)[:2]
-    if xy_offset_mm is None:
+    if xy_offset_mm is not None:
+        target[:2, 3] = visual_xy + np.asarray(xy_offset_mm, dtype=np.float64)
+    elif use_charuco_model:
         target[:2, 3] = CHARUCO_XY_MODEL_MATRIX @ visual_xy + CHARUCO_XY_MODEL_BIAS_MM
     else:
-        target[:2, 3] = visual_xy + np.asarray(xy_offset_mm, dtype=np.float64)
+        target[:2, 3] = visual_xy
     return target, np.asarray(T_base_tcp, dtype=np.float64)[:3, 3].copy()
 
 

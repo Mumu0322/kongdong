@@ -61,7 +61,9 @@ class FinalXyPlanningTests(unittest.TestCase):
         ])
         tcp[:3, 3] = np.array([100.0, 200.0, 300.0])
         visual_xy = np.array([443.0, -165.0])
-        target, before = plan_final_tcp_xy(tcp, np.array([*visual_xy, -99.0]))
+        target, before = plan_final_tcp_xy(
+            tcp, np.array([*visual_xy, -99.0]), use_charuco_model=True,
+        )
         expected_xy = CHARUCO_XY_MODEL_MATRIX @ visual_xy + CHARUCO_XY_MODEL_BIAS_MM
         self.assertTrue(CHARUCO_XY_MODEL_SOURCE.is_file())
         self.assertTrue(CHARUCO_XY_MODEL_READY)
@@ -70,9 +72,33 @@ class FinalXyPlanningTests(unittest.TestCase):
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
         np.testing.assert_allclose(before, tcp[:3, 3])
 
+    def test_charuco_correction_is_enabled_by_default_from_cli(self):
+        parser = build_parser()
+        self.assertTrue(parser.parse_args([]).use_charuco_xy_correction)
+        self.assertTrue(parser.parse_args([
+            "--use-charuco-xy-correction",
+        ]).use_charuco_xy_correction)
+        self.assertFalse(parser.parse_args([
+            "--no-charuco-xy-correction",
+        ]).use_charuco_xy_correction)
+
     def test_explicit_offset_overrides_charuco_model(self):
         tcp = np.eye(4)
         target, _ = plan_final_tcp_xy(tcp, np.array([443.0, -165.0, -99.0]), (0.0, 7.0))
+        np.testing.assert_allclose(target[:2, 3], np.array([443.0, -158.0]))
+
+    def test_explicitly_disabled_charuco_model_uses_visual_xy(self):
+        tcp = np.eye(4)
+        target, _ = plan_final_tcp_xy(
+            tcp, np.array([443.0, -165.0, -99.0]), use_charuco_model=False,
+        )
+        np.testing.assert_allclose(target[:2, 3], np.array([443.0, -165.0]))
+
+    def test_fixed_offset_overrides_enabled_charuco(self):
+        target, _ = plan_final_tcp_xy(
+            np.eye(4), np.array([443.0, -165.0, -99.0]), (0.0, 7.0),
+            use_charuco_model=True,
+        )
         np.testing.assert_allclose(target[:2, 3], np.array([443.0, -158.0]))
 
     def test_final_base_z_uses_hole_center_and_preserves_xy_orientation(self):

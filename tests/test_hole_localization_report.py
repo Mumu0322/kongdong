@@ -19,6 +19,27 @@ from aubo_workbench.hole_localization_models import TimingRecorder
 
 
 class HoleLocalizationReportTests(unittest.TestCase):
+    def test_failed_hole_summary_keeps_planned_tcp_distinct_from_actual(self) -> None:
+        report = {
+            "status": "failed",
+            "hole_count": 1,
+            "timing": {"total_elapsed_s": 1.0, "events": []},
+            "stages": {"processed_holes": {"holes": [{
+                "hole_id": 1,
+                "status": "deferred_unexpected_error",
+                "target_point_base_mm": [1.0, 2.0, 3.0],
+                "planned_final_point": {
+                    "planned_final_tcp_xyz_mm": [10.0, 20.0, 30.0],
+                    "planned_final_tcp_pose_m_rad": [0.01, 0.02, 0.03, 0.0, 0.0, 0.0],
+                },
+            }]}}
+        }
+        summary = build_result_summary(report)
+        hole = summary["holes"][0]
+        self.assertEqual(hole["final_point_base_mm"], [1.0, 2.0, 3.0])
+        self.assertEqual(hole["planned_final_tcp_xyz_mm"], [10.0, 20.0, 30.0])
+        self.assertIn("计划值不代表实际到位", render_result_summary_text(summary))
+
     def test_timing_recorder_persists_intervals_and_markers(self) -> None:
         timer = TimingRecorder()
         timer.mark("cycle/task_start")

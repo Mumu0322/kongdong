@@ -2323,17 +2323,19 @@ def _move_to_batch_final_tcp_direct(
     safe_margin_mm: float = THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM,
     descent_guard_mm: float = SHARED_OBSERVATION_MIN_DESCENT_MM,
 ) -> np.ndarray:
-    """沿安全路径直接到共享精拍计算出的最终TCP。
+    """沿安全路径直接到计算出的最终TCP。
 
     共享精拍结束后，粗定位参考位姿只用于生成每孔自己的姿态和粗定位Z，
-    不再需要让机器人先真实回到每个孔的260 mm观察位。最终TCP已经把
-    ChArUco XY补偿已经合并进去，因此可以在安全高度直接平移到
+    不再需要让机器人先真实回到每个孔的260 mm观察位。最终TCP已合并
+    ChArUco XY补偿，因此可以在安全高度直接平移到
     最终XY/姿态，再用纯基坐标Z下降到安全位和最终点。
 
-    该函数只由“共享精拍后的最终动作”调用，逐孔精定位和共享拍摄路径
-    继续使用原有函数，避免新路径改变其它模式。
+    共享精拍、粗定位直达，以及逐孔精定位时当前TCP低于最终目标的分支
+    共用此安全路径；横移前保证目标上方的TCP安全高度。
     """
-    actual = np.asarray(current_tcp, dtype=np.float64).reshape(4, 4).copy()
+    # 首段纯Z抬升必须从控制器当前实测TCP开始，不能依赖拍摄/规划缓存。
+    _, measured_tcp = _require_safe_snapshot(pose_session)
+    actual = np.asarray(measured_tcp, dtype=np.float64).reshape(4, 4).copy()
     desired = np.asarray(target_tcp, dtype=np.float64).reshape(4, 4).copy()
     margin = max(10.0, float(safe_margin_mm))
     guard_mm = max(10.0, float(descent_guard_mm))
@@ -2351,7 +2353,7 @@ def _move_to_batch_final_tcp_direct(
             args,
             motion_session,
             pose_session,
-            f"共享精拍最终TCP安全路径；纯Z抬升，安全余量={margin:.1f}mm",
+            f"最终TCP安全路径；纯Z抬升，安全余量={margin:.1f}mm",
             require_confirmation=False,
             motion_profile="transit",
         )
@@ -3516,10 +3518,11 @@ def _new_two_stage_report(
                 "matrix_2x2": CHARUCO_XY_MODEL_MATRIX,
                 "bias_mm": CHARUCO_XY_MODEL_BIAS_MM,
             }
-            if args.tcp_xy_offset_mm is None else {
+            if bool(getattr(args, "use_charuco_xy_correction", True)) and args.tcp_xy_offset_mm is None else {
                 "mode": "fixed_offset_override",
                 "tcp_xy_offset_mm": [float(value) for value in args.tcp_xy_offset_mm],
             }
+            if args.tcp_xy_offset_mm is not None else {"mode": "none"}
         ),
     }
 
@@ -4409,17 +4412,18 @@ def run_two_stage_hole_localization(
         and getattr(args, "tcp_xy_offset_mm", None) is not None
     ):
         raise ValueError(
-            "第四策略只允许使用ChArUco XY纠偏，不能同时指定TCP XY固定补偿"
+            "第四策略不能指定TCP XY固定补偿"
         )
     if (
         bool(getattr(args, "execute", False))
         and bool(getattr(args, "move_final_xy", False))
-        and getattr(args, "tcp_xy_offset_mm", None) is None
+        and bool(getattr(args, "use_charuco_xy_correction", True))
+        and args.tcp_xy_offset_mm is None
         and not CHARUCO_XY_MODEL_READY
     ):
         raise RuntimeError(
             "TCP-XY 补偿模型尚未完成或无效，拒绝执行最终 XY 微调；"
-            "请先重新采集并复核 current.json，或仅在受控实验中显式提供 --tcp-xy-offset-mm"
+            "请先复核 current.json，或关闭 --use-charuco-xy-correction"
         )
     cycle_index = 1
     run_dir = _new_two_stage_run_dir(cycle_index)

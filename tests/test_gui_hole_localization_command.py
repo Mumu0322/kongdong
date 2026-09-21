@@ -45,6 +45,7 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         panel.execute_var = _Value(True)
         panel.experimental_var = _Value(allow_experimental)
         panel.final_xy_var = _Value(final_xy_checked)
+        panel.charuco_xy_var = _Value(True)
         panel.hole_map_path_var = _Value(str(hole_map))
         panel.sector_id_var = _Value("1")
         panel.hole_map_ids_var = _Value(hole_ids)
@@ -96,6 +97,7 @@ class HoleLocalizationCommandTests(unittest.TestCase):
 
         self.assertIn("--allow-experimental-handeye", command)
         self.assertIn("--move-final-xy", command)
+        self.assertIn("--use-charuco-xy-correction", command)
         self.assertNotIn("--final-target-mode", command)
         margin_index = command.index("--per-hole-fine-safe-z-margin-mm")
         self.assertEqual(command[margin_index + 1], "20.0")

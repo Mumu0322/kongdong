@@ -693,8 +693,13 @@ def build_parser(
                    help="显式启用精定位后的最终 TCP XY 微调")
     p.add_argument("--no-move-final-xy", dest="move_final_xy", action="store_false",
                    help="仅排障使用：关闭精定位后的最终 TCP XY 微调")
+    p.add_argument("--use-charuco-xy-correction", dest="use_charuco_xy_correction",
+                   action="store_true", default=True,
+                   help="使用 ChArUco XY 纠偏（默认开启）")
+    p.add_argument("--no-charuco-xy-correction", dest="use_charuco_xy_correction",
+                   action="store_false", help="关闭 ChArUco XY 纠偏")
     p.add_argument("--tcp-xy-offset-mm", type=float, nargs=2, metavar=("DX", "DY"), default=None,
-                   help="临时固定TCP XY补偿(mm)；默认不施加任何XY偏置")
+                   help="临时固定TCP XY补偿(mm)；指定时覆盖ChArUco模型")
     # 工作台 GUI 可用这些参数覆盖本机默认连接配置；命令行既有用法保持兼容。
     p.add_argument("--robot-ip", type=str, help="AUBO RPC IP（工作台传入）")
     p.add_argument("--robot-port", type=int, help="AUBO RPC 端口（工作台传入）")

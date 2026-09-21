@@ -2293,7 +2293,9 @@ class TwoStageGeometryTests(unittest.TestCase):
             calls.append((label, np.asarray(actual).copy(), np.asarray(planned).copy(), kwargs))
             return np.asarray(planned).copy()
 
-        with patch.object(module, "_confirm_and_move_line", side_effect=fake_move):
+        with patch.object(module, "_confirm_and_move_line", side_effect=fake_move), patch.object(
+            module, "_require_safe_snapshot", return_value=({}, current),
+        ):
             result = module._move_to_batch_final_tcp_direct(
                 "2", current, target, args, object(), object(),
             )
@@ -2312,6 +2314,35 @@ class TwoStageGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(calls[1][2][2, 3], 50.0)
         self.assertTrue(np.allclose(calls[2][2], target))
         self.assertTrue(np.allclose(result, target))
+
+    def test_final_direct_path_from_below_lifts_before_xy(self) -> None:
+        current = make_transform(np.eye(3), np.array([300.0, 0.0, 10.0]))
+        stale_current = make_transform(np.eye(3), np.array([999.0, 999.0, 80.0]))
+        target = make_transform(self.R_down, np.array([100.0, 40.0, 40.0]))
+        args = SimpleNamespace(speed_m_s=0.08, acc_m_s2=0.25)
+        calls = []
+
+        def fake_move(label, actual, planned, *_args, **kwargs):
+            calls.append((np.asarray(actual).copy(), np.asarray(planned).copy()))
+            return np.asarray(planned).copy()
+
+        with patch.object(module, "_confirm_and_move_line", side_effect=fake_move), patch.object(
+            module, "_require_safe_snapshot", return_value=({}, current),
+        ):
+            result = module._move_to_batch_final_tcp_direct(
+                "2", stale_current, target, args, object(), object(),
+            )
+
+        self.assertEqual(len(calls), 4)
+        # 先沿原XY纯Z升至最终点上方60 mm，再允许横移和姿态变化。
+        np.testing.assert_allclose(calls[0][0], current)
+        np.testing.assert_allclose(calls[0][1][:2, 3], current[:2, 3])
+        self.assertAlmostEqual(calls[0][1][2, 3], 100.0)
+        np.testing.assert_allclose(calls[1][1][:2, 3], target[:2, 3])
+        self.assertAlmostEqual(calls[1][1][2, 3], 100.0)
+        self.assertAlmostEqual(calls[2][1][2, 3], 50.0)
+        np.testing.assert_allclose(calls[3][1], target)
+        np.testing.assert_allclose(result, target)
 
     def test_batch_coarse_per_hole_fusion_keeps_valid_shared_cache_hole(self) -> None:
         """A missing peer must not discard another hole's shared-pose frames."""

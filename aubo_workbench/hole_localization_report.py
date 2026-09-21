@@ -905,12 +905,19 @@ def build_result_summary(report: dict[str, Any]) -> dict[str, Any]:
             or _point(result.get("hole_center_base_mm"))
             or _point(result.get("final_point_base_mm"))
         )
+        planned_final = result.get("planned_final_point") or {}
         hole_rows.append({
             "hole_id": hole_id,
             "status": str(result.get("status", "unknown")),
             "source": _hole_source(result),
             "fine_quality_status": result.get("fine_quality_status"),
             "final_point_base_mm": final_point,
+            "planned_final_tcp_xyz_mm": _point(
+                planned_final.get("planned_final_tcp_xyz_mm")
+            ),
+            "planned_final_tcp_pose_m_rad": planned_final.get(
+                "planned_final_tcp_pose_m_rad"
+            ),
             "exclusive_visual_s": _round(exclusive_visual_s),
             "shared_visual_s": _round(allocated_s),
             "attributed_visual_s": _round(exclusive_visual_s + allocated_s),
@@ -1118,6 +1125,19 @@ def render_result_summary_text(summary: dict[str, Any]) -> str:
             f"{float(hole.get('shared_visual_s', hole.get('shared_allocated_time_s', 0.0))):>9.2f}  "
             f"{float(hole.get('attributed_visual_s', hole.get('attributed_total_s', 0.0))):>7.2f}"
         )
+    planned_holes = [
+        hole for hole in summary.get("holes") or []
+        if hole.get("planned_final_tcp_xyz_mm") is not None
+    ]
+    if planned_holes:
+        lines.extend(["", "计划最终点（基坐标 mm；计划值不代表实际到位）："])
+        for hole in planned_holes:
+            visual = hole.get("final_point_base_mm")
+            tcp = hole["planned_final_tcp_xyz_mm"]
+            lines.append(
+                f"H{int(hole.get('hole_id', 0)):02d} "
+                f"孔中心={visual}，计划TCP={tcp}，状态={hole.get('status', 'unknown')}"
+            )
     return "\n".join(lines) + "\n"
 
 

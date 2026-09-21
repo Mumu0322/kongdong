@@ -100,6 +100,100 @@ def install_runtime(symbols: dict[str, object]) -> None:
             globals()[name] = symbols[name]
 
 
+def _persist_planned_final_point(
+    ctx: Any,
+    hole: dict[str, Any],
+    visual_point_base: np.ndarray,
+    target_point_base: np.ndarray,
+    planned_tcp: np.ndarray,
+    *,
+    motion_path: str,
+) -> dict[str, Any]:
+    """Durably record the computed target before issuing any final motion."""
+    visual = np.asarray(visual_point_base, dtype=np.float64).reshape(3)
+    target = np.asarray(target_point_base, dtype=np.float64).reshape(3)
+    tcp = np.asarray(planned_tcp, dtype=np.float64).reshape(4, 4)
+    if not (np.isfinite(visual).all() and np.isfinite(target).all() and np.isfinite(tcp).all()):
+        raise ValueError("最终点规划包含非有限坐标，拒绝下发运动")
+    plan = {
+        "visual_hole_center_base_mm": visual.tolist(),
+        "target_point_base_mm": target.tolist(),
+        "planned_final_tcp_xyz_mm": tcp[:3, 3].tolist(),
+        "planned_final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(tcp),
+        "motion_path": str(motion_path),
+    }
+    hole["planned_final_point"] = plan
+    stages = ctx.report.setdefault("stages", {})
+    stages.setdefault(f"hole_{int(hole['hole_id'])}", {})["planned_final_point"] = plan
+    active = stages.get("active_hole")
+    if isinstance(active, dict):
+        active["planned_final_point"] = plan
+    _write_report(ctx.run_dir, ctx.report, ctx.rows, timing=ctx.timing)
+    print(
+        f"[FINAL_PLAN] 孔{int(hole['hole_id'])} 视觉孔中心={np.round(visual, 3).tolist()} mm; "
+        f"目标点={np.round(target, 3).tolist()} mm; "
+        f"计划TCP={np.round(tcp[:3, 3], 3).tolist()} mm（尚未到位）",
+        flush=True,
+    )
+    return plan
+
+
+def _execute_per_hole_final_motion(
+    hole_id: int,
+    order: int,
+    current_tcp: np.ndarray,
+    xy_target: np.ndarray,
+    final_target: np.ndarray,
+    compensation: str,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+    timing: Any,
+) -> tuple[np.ndarray, np.ndarray | None, str]:
+    """Choose the final route from measured base Z, preserving safe XY clearance."""
+    actual = np.asarray(current_tcp, dtype=np.float64).reshape(4, 4).copy()
+    final = np.asarray(final_target, dtype=np.float64).reshape(4, 4).copy()
+    if float(actual[2, 3]) < float(final[2, 3]):
+        with timing.measure(
+            f"hole_{hole_id:02d}/final_motion_safe_z_xy_z",
+            hole_id=hole_id,
+            processing_order=order,
+        ):
+            reached = _move_to_batch_final_tcp_direct(
+                str(hole_id), actual, final, args, motion_session, pose_session,
+            )
+        return reached, None, "safe_z_lift_xy_guarded_z_descent"
+
+    with timing.measure(
+        f"hole_{hole_id:02d}/final_motion_xy",
+        hole_id=hole_id,
+        processing_order=order,
+    ):
+        after_xy = _confirm_and_move_line(
+            f"孔{hole_id}精定位后移动到最终XY",
+            actual, xy_target, args, motion_session, pose_session,
+            f"保持孔{hole_id}精拍Z与姿态；{compensation}；"
+            "最终点使用定位结果，不附加X/Z偏移",
+            require_confirmation=False,
+            motion_profile="precision",
+        )
+    z_target = plan_final_tcp_base_z(after_xy, final[:3, 3])
+    with timing.measure(
+        f"hole_{hole_id:02d}/final_motion_z",
+        hole_id=hole_id,
+        processing_order=order,
+    ):
+        reached = _confirm_and_move_line(
+            f"孔{hole_id}移动到最终Z",
+            after_xy, z_target, args, motion_session, pose_session,
+            "最终点不附加基坐标Z偏移；"
+            f"目标TCP基坐标Z={z_target[2, 3]:.3f} mm",
+            require_confirmation=False,
+            motion_profile="precision",
+        )
+    return reached, after_xy, "xy_then_z"
+
+
 def _per_hole_fine_route(args: Any, batch_fine_available: bool) -> str:
     """区分共享精定位、逐孔兜底、粗定位直达和只建粗定位地图四条路径。"""
     if bool(getattr(args, "coarse_direct_final", False)):
@@ -362,9 +456,10 @@ def _run_coarse_direct_final(
     pose_point_base = coarse_center.copy()
     final_target_point_base = pose_point_base.copy()
     explicit_fixed_offset = getattr(args, "tcp_xy_offset_mm", None)
+    use_charuco_model = bool(getattr(args, "use_charuco_xy_correction", True))
     if explicit_fixed_offset is not None:
         raise RuntimeError(
-            "第四策略只允许使用ChArUco XY纠偏，不接受额外的TCP XY固定补偿"
+            "第四策略不接受TCP XY固定补偿"
         )
     if capture_only:
         # 评估模式只报告“如果执行最终动作会到哪里”，不调用补偿后的
@@ -372,16 +467,20 @@ def _run_coarse_direct_final(
         planned_xy_target = np.asarray(reference_tcp, dtype=np.float64).copy()
         planned_final_tcp = np.asarray(reference_tcp, dtype=np.float64).copy()
         correction_xy = None
-        compensation = "仅采集评估：未执行ChArUco补偿或最终动作"
+        compensation = "仅采集评估：未执行最终动作"
     else:
         planned_xy_target, _ = plan_final_tcp_xy(
             reference_tcp, final_target_point_base,
+            use_charuco_model=use_charuco_model,
         )
         planned_final_tcp = plan_final_tcp_base_z(
             planned_xy_target, final_target_point_base,
         )
         correction_xy = planned_xy_target[:2, 3] - final_target_point_base[:2]
-        compensation = f"ChArUco仿射模型修正={np.round(correction_xy, 3).tolist()} mm"
+        compensation = (
+            f"ChArUco仿射模型修正={np.round(correction_xy, 3).tolist()} mm"
+            if use_charuco_model else "不使用ChArUco纠偏"
+        )
     hole["coarse_direct_final_target_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
         planned_final_tcp
     )
@@ -397,6 +496,10 @@ def _run_coarse_direct_final(
     direct_guard_z = float(planned_final_tcp[2, 3]) + SHARED_OBSERVATION_MIN_DESCENT_MM
 
     if bool(getattr(args, "move_final_xy", False)) and not capture_only:
+        _persist_planned_final_point(
+            ctx, hole, coarse_center, final_target_point_base, planned_final_tcp,
+            motion_path="coarse_direct_safe_final_tcp",
+        )
         with timing.measure(
             f"hole_{hole_id:02d}/coarse_direct_final_motion",
             hole_id=hole_id,
@@ -414,11 +517,11 @@ def _run_coarse_direct_final(
             "pose_point_base_mm": pose_point_base,
             "target_point_base_mm": final_target_point_base,
             "batch_fine_joint_applied": False,
-            "compensation_mode": "charuco_affine_model",
+            "compensation_mode": "charuco_affine_model" if use_charuco_model else "none",
             "xy_correction_mm": correction_xy,
-            "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE),
-            "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX,
-            "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM,
+            "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE) if use_charuco_model else None,
+            "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX if use_charuco_model else None,
+            "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM if use_charuco_model else None,
             "tcp_xy_offset_mm": None,
             "motion_path": "coarse_direct_safe_final_tcp",
             "reference_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(reference_tcp),
@@ -516,10 +619,11 @@ def _run_coarse_direct_final(
         "batch_coarse_group_index": hole.get("batch_coarse_group_index"),
         "batch_coarse_group_hole_ids": hole.get("batch_coarse_group_hole_ids"),
         "coarse_direct_final_capture_only": capture_only,
-        "charuco_compensation_applied": bool(final_xy_motion is not None),
+        "charuco_compensation_applied": bool(final_xy_motion is not None and use_charuco_model),
         "charuco_model_ready": bool(globals().get("CHARUCO_XY_MODEL_READY", False)),
         "charuco_xy_correction_mm": correction_xy,
         "target_point_base_mm": final_target_point_base,
+        "planned_final_point": hole.get("planned_final_point"),
         "coarse_center_base_mm": coarse_center,
         "coarse_center_camera_mm": hole.get("coarse_center_camera_mm"),
         "pointcloud_center_base_mm": coarse_center.copy(),
@@ -2164,6 +2268,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
         final_motion_direct: dict[str, Any] | None = None
         if args.move_final_xy and batch_fine_available:
             assert coarse_fine_reference_tcp is not None
+            use_charuco_model = bool(getattr(args, "use_charuco_xy_correction", True)) and args.tcp_xy_offset_mm is None
             fixed_offset = (
                 None if args.tcp_xy_offset_mm is None
                 else (float(args.tcp_xy_offset_mm[0]), float(args.tcp_xy_offset_mm[1]))
@@ -2176,11 +2281,16 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             motion_start_tcp = np.asarray(current_tcp, dtype=np.float64).copy()
             xy_target, _ = plan_final_tcp_xy(
                 reference_tcp, final_target_point_base, fixed_offset,
+                use_charuco_model=use_charuco_model,
             )
             correction_xy = xy_target[:2, 3] - final_target_point_base[:2]
             z_target = plan_final_tcp_base_z(xy_target, final_target_point_base)
             # 最终目标只包含孔位规划和 ChArUco XY 纠偏，不再追加固定 Y 偏置。
             direct_target = z_target
+            _persist_planned_final_point(
+                ctx, hole, final_point_base, final_target_point_base, direct_target,
+                motion_path="batch_fine_direct_safe_final_tcp",
+            )
             direct_safe_z = max(
                 float(motion_start_tcp[2, 3]),
                 float(direct_target[2, 3]) + THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM,
@@ -2199,7 +2309,9 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             hole["batch_fine_final_motion_path"] = "direct_safe_final_tcp"
             compensation = (
                 f"ChArUco仿射模型修正={np.round(correction_xy, 3).tolist()} mm"
-                if fixed_offset is None else f"显式固定补偿={list(fixed_offset)} mm"
+                if use_charuco_model else
+                f"显式固定补偿={list(fixed_offset)} mm" if fixed_offset is not None
+                else "不使用ChArUco纠偏"
             )
             final_xy_motion = {
                 "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(direct_target),
@@ -2210,12 +2322,13 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "target_point_base_mm": final_target_point_base,
                 "batch_fine_joint_applied": batch_fine_joint_applied,
                 "compensation_mode": (
-                    "charuco_affine_model" if fixed_offset is None else "fixed_offset_override"
+                    "charuco_affine_model" if use_charuco_model else
+                    "fixed_offset_override" if fixed_offset is not None else "none"
                 ),
                 "xy_correction_mm": correction_xy,
-                "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE) if fixed_offset is None else None,
-                "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX if fixed_offset is None else None,
-                "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM if fixed_offset is None else None,
+                "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE) if use_charuco_model else None,
+                "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX if use_charuco_model else None,
+                "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM if use_charuco_model else None,
                 "tcp_xy_offset_mm": None if fixed_offset is None else list(fixed_offset),
                 "motion_path": "direct_safe_final_tcp",
                 "reference_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(reference_tcp),
@@ -2248,33 +2361,50 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "actual_final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
             }
         if args.move_final_xy and not batch_fine_available:
+            use_charuco_model = bool(getattr(args, "use_charuco_xy_correction", True)) and args.tcp_xy_offset_mm is None
+            # 按下发前实测TCP判断高低，避免异常恢复时缓存位姿导致路径选错。
+            _, measured_tcp = _require_safe_snapshot(pose_session)
+            current_tcp = np.asarray(measured_tcp, dtype=np.float64).copy()
             fixed_offset = (
                 None if args.tcp_xy_offset_mm is None
                 else (float(args.tcp_xy_offset_mm[0]), float(args.tcp_xy_offset_mm[1]))
             )
             xy_target, tcp_before = plan_final_tcp_xy(
                 current_tcp, final_target_point_base, fixed_offset,
+                use_charuco_model=use_charuco_model,
             )
             correction_xy = xy_target[:2, 3] - final_target_point_base[:2]
             compensation = (
                 f"ChArUco仿射模型修正={np.round(correction_xy, 3).tolist()} mm"
-                if fixed_offset is None else f"显式固定补偿={list(fixed_offset)} mm"
+                if use_charuco_model else
+                f"显式固定补偿={list(fixed_offset)} mm" if fixed_offset is not None
+                else "不使用ChArUco纠偏"
             )
-            with timing.measure(
-                f"hole_{hole_id:02d}/final_motion_xy",
-                hole_id=hole_id,
-                processing_order=order,
-            ):
-                current_tcp = _confirm_and_move_line(
-                    f"孔{hole_id}精定位后移动到最终XY",
-                    current_tcp, xy_target, args, motion_session, pose_session,
-                    f"保持孔{hole_id}精拍Z与姿态；{compensation}；"
-                    "最终点使用定位结果，不附加X/Z偏移",
-                    require_confirmation=False,
-                    motion_profile="precision",
+            planned_final_tcp = plan_final_tcp_base_z(
+                xy_target, final_target_point_base,
+            )
+            needs_safe_lift = bool(
+                float(current_tcp[2, 3]) < float(planned_final_tcp[2, 3])
+            )
+            final_path_policy = (
+                "safe_z_lift_xy_guarded_z_descent"
+                if needs_safe_lift else "xy_then_z"
+            )
+            _persist_planned_final_point(
+                ctx, hole, final_point_base, final_target_point_base, planned_final_tcp,
+                motion_path=final_path_policy,
+            )
+            motion_start_tcp = current_tcp.copy()
+            current_tcp, after_xy_tcp, executed_path_policy = (
+                _execute_per_hole_final_motion(
+                    hole_id, order, current_tcp, xy_target, planned_final_tcp,
+                    compensation, args, motion_session, pose_session, timing,
                 )
+            )
             final_xy_motion = {
-                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(xy_target),
+                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(
+                    planned_final_tcp if needs_safe_lift else xy_target
+                ),
                 "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                 "tcp_position_before_mm": tcp_before,
                 "hole_center_base_mm": final_point_base,
@@ -2282,37 +2412,51 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "target_point_base_mm": final_target_point_base,
                 "batch_fine_joint_applied": batch_fine_joint_applied,
                 "compensation_mode": (
-                    "charuco_affine_model" if fixed_offset is None else "fixed_offset_override"
+                    "charuco_affine_model" if use_charuco_model else
+                    "fixed_offset_override" if fixed_offset is not None else "none"
                 ),
                 "xy_correction_mm": correction_xy,
-                "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE) if fixed_offset is None else None,
-                "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX if fixed_offset is None else None,
-                "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM if fixed_offset is None else None,
+                "charuco_model_source": str(CHARUCO_XY_MODEL_SOURCE) if use_charuco_model else None,
+                "charuco_model_matrix_2x2": CHARUCO_XY_MODEL_MATRIX if use_charuco_model else None,
+                "charuco_model_bias_mm": CHARUCO_XY_MODEL_BIAS_MM if use_charuco_model else None,
                 "tcp_xy_offset_mm": None if fixed_offset is None else list(fixed_offset),
+                "motion_path": executed_path_policy,
             }
-            z_target = plan_final_tcp_base_z(current_tcp, final_target_point_base)
-            z_delta_mm = float(z_target[2, 3] - current_tcp[2, 3])
-            with timing.measure(
-                f"hole_{hole_id:02d}/final_motion_z",
-                hole_id=hole_id,
-                processing_order=order,
-            ):
-                current_tcp = _confirm_and_move_line(
-                    f"孔{hole_id}移动到最终Z",
-                    current_tcp, z_target, args, motion_session, pose_session,
-                    "最终点不附加基坐标Z偏移；"
-                    f"目标TCP基坐标Z={z_target[2, 3]:.3f} mm",
-                    require_confirmation=False,
-                    motion_profile="precision",
-                )
             final_z_motion = {
-                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(z_target),
+                "planned_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(planned_final_tcp),
                 "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
-                "target_base_z_mm": float(z_target[2, 3]),
+                "target_base_z_mm": float(planned_final_tcp[2, 3]),
                 "target_point_base_mm": final_target_point_base,
-                "delta_base_z_mm": z_delta_mm,
-                "motion_frame": "base_z_only",
+                "delta_base_z_mm": float(
+                    planned_final_tcp[2, 3] - (
+                        motion_start_tcp[2, 3] if after_xy_tcp is None
+                        else after_xy_tcp[2, 3]
+                    )
+                ),
+                "motion_frame": (
+                    "base_z_lift_xy_guarded_z_descent"
+                    if needs_safe_lift else "base_z_only"
+                ),
             }
+            if needs_safe_lift:
+                safe_z = max(
+                    float(motion_start_tcp[2, 3]),
+                    float(planned_final_tcp[2, 3]) + THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM,
+                )
+                final_motion_direct = {
+                    "path_policy": "pure_z_lift_safe_xy_guarded_pure_z_descent",
+                    "planned_final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(
+                        planned_final_tcp
+                    ),
+                    "planned_safe_z_mm": safe_z,
+                    "planned_guard_z_mm": float(planned_final_tcp[2, 3])
+                    + SHARED_OBSERVATION_MIN_DESCENT_MM,
+                    "safe_margin_mm": THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM,
+                    "descent_guard_mm": SHARED_OBSERVATION_MIN_DESCENT_MM,
+                    "actual_final_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(
+                        current_tcp
+                    ),
+                }
         if batch_coarse_available:
             coarse_source = "batch_coarse_localization"
             batch_fallback_reason = None
@@ -2426,6 +2570,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 if coarse_fine_reference_tcp is not None else None
             ),
             "target_point_base_mm": final_target_point_base,
+            "planned_final_point": hole.get("planned_final_point"),
             "hole_center_base_naive_mm": naive_final_point_base,
             "coarse_center_base_mm": hole["coarse_center_base_mm"],
             "coarse_center_camera_mm": hole["coarse_center_camera_mm"],
@@ -2620,6 +2765,11 @@ def _record_unexpected_hole_failure(
         "batch_fine_source": "not_completed",
         "timing": hole_timing,
     }
+    plan = hole.get("planned_final_point")
+    if isinstance(plan, dict):
+        result["planned_final_point"] = plan
+        result["hole_center_base_mm"] = plan.get("visual_hole_center_base_mm")
+        result["target_point_base_mm"] = plan.get("target_point_base_mm")
     try:
         _append_deferred_hole_result(
             hole,

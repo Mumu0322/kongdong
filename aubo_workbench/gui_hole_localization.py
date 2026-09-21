@@ -233,6 +233,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.shared_cache_validation_view_margin_var = tk.StringVar(value="50.0")
         self.auto_next_hole_var = tk.BooleanVar(value=False)
         self.final_xy_var = tk.BooleanVar(value=True)
+        self.charuco_xy_var = tk.BooleanVar(value=True)
         self.include_final_motion_var = tk.BooleanVar(value=False)
         self.hole_map_path_var = tk.StringVar(
             value=(
@@ -401,9 +402,14 @@ class HoleLocalizationPanel(ttk.Frame):
             text="使用当前最新实验手眼结果（含本次运动）",
             variable=self.experimental_var,
         ).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(options, text="最终 XY 应用最新 ChArUco XY 纠偏并执行最终动作（地图调用固定启用）", variable=self.final_xy_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0),
+        ttk.Checkbutton(options, text="执行最终点运动（地图调用固定启用）", variable=self.final_xy_var).grid(
+            row=1, column=0, sticky="w", pady=(6, 0),
         )
+        ttk.Checkbutton(
+            options,
+            text="使用 ChArUco XY 纠偏（默认开启）",
+            variable=self.charuco_xy_var,
+        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             options, text="按最近邻优化孔序（工艺允许时启用）",
             variable=self.optimize_hole_order_var,
@@ -1639,6 +1645,11 @@ class HoleLocalizationPanel(ttk.Frame):
                         else "--no-batch-coarse-localization"
                     ),
                 ])
+        command.append(
+            "--use-charuco-xy-correction"
+            if bool(getattr(getattr(self, "charuco_xy_var", None), "get", lambda: True)())
+            else "--no-charuco-xy-correction"
+        )
         return command
 
     def start(self) -> None:
