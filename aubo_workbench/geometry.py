@@ -16,6 +16,56 @@ def ensure_finite_array(values: np.ndarray, name: str) -> None:
         raise ValueError(f"{name} contains non-finite values")
 
 
+def valid_rigid_transform(value: Any) -> bool:
+    """返回值是否为有限、合法的 4x4 刚体变换。"""
+    try:
+        matrix = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        return False
+    rotation = matrix[:3, :3]
+    return bool(
+        np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
+        and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
+        and np.isclose(np.linalg.det(rotation), 1.0, atol=1e-4)
+    )
+
+
+def unit_vector(vec: np.ndarray, label: str = "vector") -> np.ndarray:
+    vec = np.asarray(vec, dtype=np.float64).reshape(3)
+    length = float(np.linalg.norm(vec))
+    if not np.isfinite(length) or length < 1e-9:
+        raise ValueError(f"{label} 无法归一化")
+    return vec / length
+
+
+def angle_between_deg(a: np.ndarray, b: np.ndarray) -> float:
+    return float(math.degrees(math.acos(np.clip(float(unit_vector(a) @ unit_vector(b)), -1.0, 1.0))))
+
+
+def matrix_to_rpy_zyx(R: np.ndarray) -> np.ndarray:
+    """AUBO 使用的 [rx, ry, rz]（Rz @ Ry @ Rx）逆变换。"""
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    sy = float(-R[2, 0])
+    ry = math.asin(float(np.clip(sy, -1.0, 1.0)))
+    cy = math.cos(ry)
+    if abs(cy) > 1e-7:
+        rx = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        rz = math.atan2(float(R[1, 0]), float(R[0, 0]))
+    else:
+        rx = math.atan2(float(-R[1, 2]), float(R[1, 1]))
+        rz = 0.0
+    return np.array([rx, ry, rz], dtype=np.float64)
+
+
+def transform_to_sdk_pose_m_rad(T_base_tcp: np.ndarray) -> list[float]:
+    """4x4 齐次矩阵（mm）转 AUBO SDK 位姿 [x, y, z, rx, ry, rz]（m + rad）。"""
+    T_base_tcp = np.asarray(T_base_tcp, dtype=np.float64).reshape(4, 4)
+    return ((T_base_tcp[:3, 3] / 1000.0).tolist()
+            + matrix_to_rpy_zyx(T_base_tcp[:3, :3]).tolist())
+
+
 def rotx(rad: float) -> np.ndarray:
     c, s = math.cos(rad), math.sin(rad)
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
@@ -86,12 +136,11 @@ def average_transforms(transforms: list[np.ndarray]) -> np.ndarray:
     if not transforms:
         return np.eye(4, dtype=np.float64)
     ts = np.asarray([T[:3, 3] for T in transforms], dtype=np.float64)
-    rvecs = []
-    for T in transforms:
-        rvec, _ = cv2.Rodrigues(T[:3, :3])
-        rvecs.append(rvec.reshape(3))
-    mean_rvec = np.mean(np.asarray(rvecs), axis=0)
-    R_mean, _ = cv2.Rodrigues(mean_rvec.reshape(3, 1))
+    # Project the matrix mean onto SO(3); rotation vectors wrap at 180 degrees.
+    rotations = np.asarray([T[:3, :3] for T in transforms], dtype=np.float64)
+    u, _, vt = np.linalg.svd(np.mean(rotations, axis=0))
+    correction = np.diag([1.0, 1.0, np.linalg.det(u @ vt)])
+    R_mean = u @ correction @ vt
     return make_transform(R_mean, np.mean(ts, axis=0))
 
 

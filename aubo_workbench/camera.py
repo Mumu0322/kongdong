@@ -17,6 +17,10 @@ import cv2
 import numpy as np
 
 from .config import CAMERA_CFG
+from .orbbec_paths import add_orbbec_runtime_path
+
+add_orbbec_runtime_path()
+
 _ORBBEC_IMPORT_ERROR: Exception | None = None
 try:
     from pyorbbecsdk import *  # type: ignore  # noqa: F401,F403

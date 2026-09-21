@@ -3,35 +3,44 @@ import unittest
 import numpy as np
 
 from run_yolo_eye_in_hand_optimized import (
+    COARSE_SURFACE_MODEL,
+    COARSE_SURFACE_SELECTION_POLICY,
+    FINAL_BASE_Y_AFTER_Z_MM,
+    FINAL_TOOL_Y_AFTER_Z_MM,
     Observation,
     TwoStageConfig,
     _fuse_fine,
     build_parser,
     fit_sphere,
-    apply_final_point_base_offsets,
-    final_point_offsets_for_mode,
+    compose_batch_fine_xy_with_coarse_z,
     plan_final_tcp_base_z,
     plan_final_tcp_base_y_trim,
+    plan_final_tcp_combined_y_trim,
     plan_final_tcp_xy,
+    hole_camera_point,
+)
+from aubo_workbench.camera import CameraIntrinsics
+from aubo_workbench.hole_localization_planning import (
+    CHARUCO_XY_MODEL_BIAS_MM,
+    CHARUCO_XY_MODEL_MATRIX,
+    CHARUCO_XY_MODEL_READY,
+    CHARUCO_XY_MODEL_SOURCE,
 )
 
 
 class FinalXyPlanningTests(unittest.TestCase):
-    def test_final_point_offsets_are_applied_before_motion_planning(self):
-        point = np.array([631.0, -110.7, 56.7])
-        target = apply_final_point_base_offsets(point)
-        np.testing.assert_allclose(target, np.array([695.0, -110.7, 106.7]))
-        np.testing.assert_allclose(point, np.array([631.0, -110.7, 56.7]))
+    def test_batch_fine_only_replaces_xy_and_keeps_coarse_z(self):
+        fine_point = np.array([631.7, -108.3, 59.8])
+        coarse_point = np.array([630.9, -109.1, 56.7])
+        target = compose_batch_fine_xy_with_coarse_z(fine_point, coarse_point)
+        np.testing.assert_allclose(target, np.array([631.7, -108.3, 56.7]))
+        np.testing.assert_allclose(fine_point, np.array([631.7, -108.3, 59.8]))
 
-    def test_final_point_mode_offsets(self):
-        self.assertEqual(final_point_offsets_for_mode("gripper"), (64.0, 50.0))
-        self.assertEqual(final_point_offsets_for_mode("normal"), (0.0, 0.0))
-
-    def test_final_xy_motion_is_enabled_by_default(self):
+    def test_motion_defaults_are_preview_only(self):
         args = build_parser().parse_args([])
         self.assertTrue(args.move_final_xy)
         self.assertTrue(args.two_stage_hole_localization)
-        self.assertTrue(args.execute)
+        self.assertFalse(args.execute)
         self.assertTrue(args.allow_experimental_handeye)
 
     def test_coarse_normal_gate_matches_measured_depth_repeatability(self):
@@ -43,7 +52,7 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertEqual(TwoStageConfig().coarse_settle_frames, 5)
         self.assertEqual(TwoStageConfig().coarse_max_attempt_multiplier, 4)
 
-    def test_default_charuco_model_preserves_z_and_orientation(self):
+    def test_current_charuco_model_is_applied_and_preserves_z_and_orientation(self):
         tcp = np.eye(4)
         tcp[:3, :3] = np.array([
             [0.0, -1.0, 0.0],
@@ -51,8 +60,12 @@ class FinalXyPlanningTests(unittest.TestCase):
             [0.0, 0.0, 1.0],
         ])
         tcp[:3, 3] = np.array([100.0, 200.0, 300.0])
-        target, before = plan_final_tcp_xy(tcp, np.array([443.0, -165.0, -99.0]))
-        np.testing.assert_allclose(target[:2, 3], np.array([443.62468824, -162.32352141]))
+        visual_xy = np.array([443.0, -165.0])
+        target, before = plan_final_tcp_xy(tcp, np.array([*visual_xy, -99.0]))
+        expected_xy = CHARUCO_XY_MODEL_MATRIX @ visual_xy + CHARUCO_XY_MODEL_BIAS_MM
+        self.assertTrue(CHARUCO_XY_MODEL_SOURCE.is_file())
+        self.assertTrue(CHARUCO_XY_MODEL_READY)
+        np.testing.assert_allclose(target[:2, 3], expected_xy)
         self.assertEqual(target[2, 3], 300.0)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
         np.testing.assert_allclose(before, tcp[:3, 3])
@@ -75,12 +88,72 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertAlmostEqual(target[2, 3], 56.7)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
 
-    def test_final_base_y_trim_preserves_x_z_and_orientation(self):
+    def test_old_two_stage_surface_policy_rejects_inner_hole_depth_cluster(self):
+        width = height = 220
+        intrinsics = CameraIntrinsics(width, height, 100.0, 100.0, 110.0, 110.0, ())
+        center = np.array([110.0, 110.0])
+        radius = 20.0
+        yy, xx = np.mgrid[:height, :width]
+        rr = np.hypot(xx - center[0], yy - center[1])
+        z = np.full((height, width), 500.0, dtype=np.float32)
+        # 模拟旧1.08R起始环带中占多数的孔壁/孔底深度簇。
+        z[(rr >= radius * 1.08) & (rr < radius * 1.25)] = 550.0
+        xyz = np.column_stack((
+            ((xx - intrinsics.cx) / intrinsics.fx * z).ravel(),
+            ((yy - intrinsics.cy) / intrinsics.fy * z).ravel(),
+            z.ravel(),
+        )).reshape(height, width, 3)
+
+        point, info = hole_camera_point(
+            tuple(center.tolist()), xyz, intrinsics, radius,
+            surface_selection_policy=COARSE_SURFACE_SELECTION_POLICY,
+            include_points=True,
+        )
+
+        self.assertEqual(info["surface_model"], COARSE_SURFACE_MODEL)
+        self.assertEqual(info["surface_selection_policy"], COARSE_SURFACE_SELECTION_POLICY)
+        self.assertAlmostEqual(info["ring_inner_factor"], 1.10)
+        self.assertAlmostEqual(info["ring_outer_factor"], 1.30)
+        self.assertLess(float(point[2]), 510.0)
+        self.assertLess(float(info["local_plane_point_camera_mm"][2]), 510.0)
+        self.assertGreaterEqual(info["surface_points_selected"], 80)
+
+    def test_legacy_surface_policy_remains_legacy(self):
+        width = height = 120
+        intrinsics = CameraIntrinsics(width, height, 100.0, 100.0, 60.0, 60.0, ())
+        yy, xx = np.mgrid[:height, :width]
+        z = np.full((height, width), 500.0, dtype=np.float32)
+        xyz = np.column_stack((
+            ((xx - intrinsics.cx) / intrinsics.fx * z).ravel(),
+            ((yy - intrinsics.cy) / intrinsics.fy * z).ravel(),
+            z.ravel(),
+        )).reshape(height, width, 3)
+        _, info = hole_camera_point((60.0, 60.0), xyz, intrinsics, 12.0)
+        self.assertEqual(info["surface_model"], "local_tangent_plane")
+        self.assertEqual(info["surface_selection_policy"], "legacy")
+
+    def test_disabled_final_base_y_trim_preserves_full_pose(self):
         tcp = np.eye(4)
         tcp[:3, 3] = np.array([631.7, -108.3, 56.7])
         target = plan_final_tcp_base_y_trim(tcp)
-        np.testing.assert_allclose(target[:3, 3], np.array([631.7, -108.1, 56.7]))
+        self.assertEqual(FINAL_BASE_Y_AFTER_Z_MM, 0.0)
+        np.testing.assert_allclose(target, tcp)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
+
+    def test_disabled_combined_y_trim_preserves_full_pose(self):
+        angle = np.radians(30.0)
+        rot_z = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        tcp = np.eye(4)
+        tcp[:3, :3] = rot_z
+        tcp[:3, 3] = np.array([631.7, -108.3, 56.7])
+        target = plan_final_tcp_combined_y_trim(tcp)
+        self.assertEqual(FINAL_BASE_Y_AFTER_Z_MM, 0.0)
+        self.assertEqual(FINAL_TOOL_Y_AFTER_Z_MM, 0.0)
+        np.testing.assert_allclose(target, tcp)
 
     def test_fine_fusion_does_not_make_p95_worse_after_outlier_filtering(self):
         # 回归样本：原始P95小于1 px，但旧算法剔除1帧后中位数偏向一簇，

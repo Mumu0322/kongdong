@@ -17,8 +17,8 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
-from .config import ROBOT_CFG
-from .geometry import ensure_finite_array, make_transform, rotx, roty, rotz
+from .config import E7_HAND_EYE_CFG, ROBOT_CFG
+from .geometry import ensure_finite_array, make_transform, rotation_error_deg, rotx, roty, rotz
 from .sdk_paths import add_aubo_sdk_to_path, aubo_sdk_hint
 
 SDK_DIR = add_aubo_sdk_to_path()
@@ -185,7 +185,24 @@ class AuboPoseSession:
         collision = bool(self.state.isCollisionOccurred())
         tool_pose = [float(v) for v in list(self.state.getToolPose())]
         tcp_pose = [float(v) for v in list(self.state.getTcpPose())]
-        selected_pose = tcp_pose if ROBOT_CFG.pose_source.lower() == "tcp" else tool_pose
+        actual_offset = [float(v) for v in self.state.getActualTcpOffset()]
+        for label, values in (("TCP位姿", tcp_pose), ("法兰位姿", tool_pose), ("实际TCP偏置", actual_offset)):
+            if len(values) != 6 or not all(math.isfinite(v) for v in values):
+                raise RuntimeError(f"控制器{label}无效，不能采集")
+        T_base_tcp = self.pose_sdk_to_transform_mm(tcp_pose)
+        predicted = self.pose_sdk_to_transform_mm(tool_pose) @ self.pose_sdk_to_transform_mm(actual_offset)
+        xyz_error = float(max(abs(predicted[:3, 3] - T_base_tcp[:3, 3])))
+        rotation_error = rotation_error_deg(predicted[:3, :3], T_base_tcp[:3, :3])
+        chain_ok = (
+            xyz_error <= E7_HAND_EYE_CFG.maximum_pose_bracket_xyz_mm
+            and rotation_error <= E7_HAND_EYE_CFG.maximum_pose_bracket_abc_deg
+        )
+        if steady and not chain_ok:
+            raise RuntimeError(
+                f"控制器TCP、法兰和实际偏置读数不一致：位置差 {xyz_error:.3f} mm，"
+                f"角度差 {rotation_error:.4f}°；请停止运动并确认当前工具设置后重试"
+            )
+        selected_pose = tcp_pose
         pose_values_mm_deg = [
             selected_pose[0] * 1000.0,
             selected_pose[1] * 1000.0,
@@ -205,7 +222,17 @@ class AuboPoseSession:
             "robot_brand": "AUBO",
             "robot_name": self.robot_name,
             "robot_type": self.robot_type,
-            "pose_source": ROBOT_CFG.pose_source.lower(),
+            "pose_source": "tcp",
+            "pose_source_selection": "controller_active_tcp",
+            "pose_reference_frame": "robot_base",
+            "pose_read_api": "RobotState.getTcpPose",
+            "tcp_offset_read_api": "RobotState.getActualTcpOffset",
+            "actual_tcp_offset_sdk_m_rad": actual_offset,
+            "pose_chain_check": {
+                "ok": chain_ok,
+                "max_xyz_error_mm": xyz_error,
+                "rotation_error_deg": rotation_error,
+            },
             "pose_units": {"xyz": "mm", "rpy": "deg"},
             "pose_values": [float(v) for v in pose_values_mm_deg],
             "pose_values_sdk_m_rad": [float(v) for v in selected_pose[:6]],
@@ -223,10 +250,6 @@ class AuboPoseSession:
         except Exception:
             snapshot["joints_rad"] = []
         try:
-            snapshot["actual_tcp_offset_sdk_m_rad"] = [float(v) for v in list(self.state.getActualTcpOffset())]
-        except Exception:
-            snapshot["actual_tcp_offset_sdk_m_rad"] = []
-        try:
             if self.config is not None:
                 snapshot["configured_tcp_offset_sdk_m_rad"] = [float(v) for v in list(self.config.getTcpOffset())]
         except Exception:
@@ -243,66 +266,24 @@ def close_aubo_session() -> None:
 
 
 def get_capture_pose_transform():
-    """返回 (^B T_T, snapshot, status)，平移单位 mm。失败时 T 为 None。"""
-    if ROBOT_CFG.robot_pose_read_enable:
-        try:
-            snap = AUBO_SESSION.read_pose_snapshot()
-            if ROBOT_CFG.require_power_on and not bool(snap.get("power_on", False)):
-                return None, snap, "aubo_power_off"
-            if ROBOT_CFG.require_steady and not bool(snap.get("steady", False)):
-                return None, snap, "aubo_not_steady"
-            if ROBOT_CFG.reject_collision and bool(snap.get("collision", False)):
-                return None, snap, "aubo_collision_flag"
-            vals = snap.get("pose_values_sdk_m_rad", [])
-            if not isinstance(vals, (list, tuple)) or len(vals) < 6:
-                return None, snap, "aubo_pose_values_less_than_6"
-            numeric_vals = [float(v) for v in vals[:6]]
-            if not all(math.isfinite(v) for v in numeric_vals):
-                return None, snap, "aubo_pose_values_non_finite"
-            # AUBO 状态接口偶尔会在关节状态有效时瞬时返回全零 Tool/TCP 位姿。
-            # 对当前机械臂而言全零位姿不可能是有效采集姿态，必须拒绝，不能作为稳定样本保存。
-            if all(abs(v) <= 1e-12 for v in numeric_vals):
-                return None, snap, "aubo_pose_values_all_zero"
-            T = AUBO_SESSION.pose_sdk_to_transform_mm(numeric_vals)
-            return T, snap, "aubo_pose_ok"
-        except Exception as exc:
-            print("[WARN] 自动读取 AUBO TCP 失败:", exc)
-
-    if ROBOT_CFG.manual_pose_sdk_m_rad is not None:
-        vals = [float(v) for v in ROBOT_CFG.manual_pose_sdk_m_rad]
-        T = AUBO_SESSION.pose_sdk_to_transform_mm(vals)
-        pose_values_mm_deg = [
-            vals[0] * 1000.0,
-            vals[1] * 1000.0,
-            vals[2] * 1000.0,
-            math.degrees(vals[3]),
-            math.degrees(vals[4]),
-            math.degrees(vals[5]),
-        ]
-        snap = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            "controller": {"protocol": "manual_aubo_pose"},
-            "robot_brand": "AUBO",
-            "pose_source": "manual",
-            "pose_units": {"xyz": "mm", "rpy": "deg"},
-            "pose_values": [float(v) for v in pose_values_mm_deg],
-            "pose_values_sdk_m_rad": vals,
-        }
-        return T, snap, "manual_aubo_pose_ok"
-
-    return None, None, "no_aubo_pose"
-
-
-def set_manual_pose_from_console() -> None:
-    text = input("请输入当前 AUBO TCP 位姿 x y z rx ry rz，单位 m rad，用空格分隔：\n> ").strip()
-    parts = text.replace(",", " ").split()
-    if len(parts) != 6:
-        print("[WARN] 输入数量不是 6，未更新 manual_pose_sdk_m_rad")
-        return
+    """只读取控制器当前TCP；失败时不回退到法兰或手动位姿。"""
     try:
-        vals = tuple(float(v) for v in parts)
-    except ValueError:
-        print("[WARN] 输入包含非数字，未更新 manual_pose_sdk_m_rad")
-        return
-    ROBOT_CFG.manual_pose_sdk_m_rad = vals  # type: ignore[assignment]
-    print("[INFO] manual_pose_sdk_m_rad 已更新:", vals)
+        snap = AUBO_SESSION.read_pose_snapshot()
+        if ROBOT_CFG.require_power_on and not bool(snap.get("power_on", False)):
+            return None, snap, "aubo_power_off"
+        if ROBOT_CFG.require_steady and not bool(snap.get("steady", False)):
+            return None, snap, "aubo_not_steady"
+        if ROBOT_CFG.reject_collision and bool(snap.get("collision", False)):
+            return None, snap, "aubo_collision_flag"
+        vals = snap.get("pose_values_sdk_m_rad", [])
+        if not isinstance(vals, (list, tuple)) or len(vals) != 6:
+            return None, snap, "aubo_pose_values_less_than_6"
+        numeric_vals = [float(v) for v in vals]
+        if not all(math.isfinite(v) for v in numeric_vals):
+            return None, snap, "aubo_pose_values_non_finite"
+        if all(abs(v) <= 1e-12 for v in numeric_vals):
+            return None, snap, "aubo_pose_values_all_zero"
+        return AUBO_SESSION.pose_sdk_to_transform_mm(numeric_vals), snap, "aubo_pose_ok"
+    except Exception as exc:
+        print("[WARN] 读取控制器当前TCP失败:", exc)
+        return None, None, "aubo_pose_read_failed"

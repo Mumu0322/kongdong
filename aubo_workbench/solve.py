@@ -12,21 +12,21 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .config import AUTO_CAPTURE_CFG, AUTO_PRUNE_CFG, BOARD_CFG, CAMERA_CFG, CONFLICT_DIAG_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOLVE_CFG
+from .config import AUTO_CAPTURE_CFG, BOARD_CFG, CAMERA_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOLVE_CFG
 from .geometry import (
     angle_span_deg,
     average_transforms,
-    fmt_vec,
     invert_transform,
     make_transform,
     rotation_angle_deg,
     rotation_error_deg,
     transform_to_pose6_rzryrx,
     transform_to_vec6,
+    valid_rigid_transform as _valid_rigid_transform,
     vec6_to_transform,
 )
-from .io_utils import atomic_write_json, matrix_to_list, timestamp_str
-from .samples import CalibSample, archive_removed_samples, rewrite_sample_csv
+from .io_utils import atomic_write_json, matrix_to_list
+from .samples import CalibSample
 
 
 def sample_calibration_frame(sample: CalibSample) -> str:
@@ -116,7 +116,17 @@ def solve_handeye_opencv(samples: list[CalibSample]) -> tuple[np.ndarray, str, d
                 R_gripper2base, t_gripper2base, R_target2cam, t_target2cam, method=method,
             )
             T_pose_source_sensor = make_transform(R_cam2gripper, np.asarray(t_cam2gripper).reshape(3))
+            if not _valid_rigid_transform(T_pose_source_sensor):
+                raise ValueError("calibrateHandEye returned an invalid rigid transform")
             stats = compute_board_base_stats(samples, T_pose_source_sensor, calibration_frame)
+            if not all(
+                np.isfinite(float(stats[key]))
+                for key in (
+                    "translation_mean_mm", "translation_rmse_mm", "translation_max_mm",
+                    "rotation_mean_deg", "rotation_rmse_deg", "rotation_max_deg",
+                )
+            ):
+                raise ValueError("hand-eye quality contains NaN or Inf")
             score = stats["translation_rmse_mm"] + 10.0 * stats["rotation_rmse_deg"]
             results[name] = {
                 "ok": True,
@@ -206,6 +216,18 @@ def choose_refined_result(
         return T_init, init_stats, info
 
     reasons: list[str] = []
+    if not info.get("success", False):
+        reasons.append("nonlinear_solver_not_successful")
+    if not _valid_rigid_transform(T_candidate):
+        reasons.append("invalid_refined_transform")
+    if not all(
+        np.isfinite(float(candidate_stats[key]))
+        for key in (
+            "translation_mean_mm", "translation_rmse_mm", "translation_max_mm",
+            "rotation_mean_deg", "rotation_rmse_deg", "rotation_max_deg",
+        )
+    ):
+        reasons.append("refined_quality_not_finite")
     if candidate_stats["translation_mean_mm"] > init_stats["translation_mean_mm"] + 0.03:
         reasons.append("translation_mean_worse")
     if candidate_stats["translation_rmse_mm"] > init_stats["translation_rmse_mm"] + 0.03:
@@ -239,6 +261,8 @@ def solve_handeye_estimate(samples: list[CalibSample], quiet: bool = False) -> d
         T_final, final_stats, refine_info = choose_refined_result(
             T_init, init_stats, T_candidate, candidate_stats, refine_info
         )
+        if not _valid_rigid_transform(T_final):
+            raise RuntimeError("最终手眼变换不是合法的刚体变换")
         return {
             "best_method": best_method,
             "all_method_results": all_method_results,
@@ -259,21 +283,6 @@ def solve_handeye_estimate(samples: list[CalibSample], quiet: bool = False) -> d
         return _run()
 
 
-def _quality_summary(estimate: dict[str, Any], sample_count: int, removed_indices: list[int] | None = None) -> dict[str, Any]:
-    q = estimate["quality"]
-    return {
-        "sample_count": int(sample_count),
-        "best_method": estimate["best_method"],
-        "translation_mean_mm": float(q["translation_mean_mm"]),
-        "translation_rmse_mm": float(q["translation_rmse_mm"]),
-        "translation_max_mm": float(q["translation_max_mm"]),
-        "rotation_mean_deg": float(q["rotation_mean_deg"]),
-        "rotation_rmse_deg": float(q["rotation_rmse_deg"]),
-        "rotation_max_deg": float(q["rotation_max_deg"]),
-        "removed_indices": [int(v) for v in (removed_indices or [])],
-    }
-
-
 def sample_quality_flags(sample: CalibSample) -> list[str]:
     flags: list[str] = []
     if sample_calibration_frame(sample) == "rgb_camera":
@@ -290,12 +299,12 @@ def sample_quality_flags(sample: CalibSample) -> list[str]:
         ):
             flags.append(f"rgb_reprojection_max>{AUTO_CAPTURE_CFG.max_rgb_reprojection_error_px}")
         return flags
-    if sample.valid_3d_count < AUTO_PRUNE_CFG.min_valid_3d_count:
-        flags.append(f"valid3d<{AUTO_PRUNE_CFG.min_valid_3d_count}")
-    if np.isfinite(sample.corner_rmse_mm) and sample.corner_rmse_mm > AUTO_PRUNE_CFG.max_corner_rmse_mm:
-        flags.append(f"corner_rmse>{AUTO_PRUNE_CFG.max_corner_rmse_mm}")
-    if np.isfinite(sample.plane_rmse_mm) and sample.plane_rmse_mm > AUTO_PRUNE_CFG.max_plane_rmse_mm:
-        flags.append(f"plane_rmse>{AUTO_PRUNE_CFG.max_plane_rmse_mm}")
+    if sample.valid_3d_count < AUTO_CAPTURE_CFG.min_valid_3d_corners:
+        flags.append(f"valid3d<{AUTO_CAPTURE_CFG.min_valid_3d_corners}")
+    if np.isfinite(sample.corner_rmse_mm) and sample.corner_rmse_mm > AUTO_CAPTURE_CFG.max_corner_rmse_mm:
+        flags.append(f"corner_rmse>{AUTO_CAPTURE_CFG.max_corner_rmse_mm}")
+    if np.isfinite(sample.plane_rmse_mm) and sample.plane_rmse_mm > AUTO_CAPTURE_CFG.max_plane_rmse_mm:
+        flags.append(f"plane_rmse>{AUTO_CAPTURE_CFG.max_plane_rmse_mm}")
     return flags
 
 
@@ -305,6 +314,36 @@ def sample_pose_values(sample: CalibSample) -> list[float]:
     if isinstance(values, (list, tuple)):
         return [float(v) for v in values[:6]]
     return []
+
+
+def _relative_rotation_axis_report(rotations: list[np.ndarray]) -> dict[str, Any]:
+    """判断相对旋转是否几乎都绕同一根轴，避免只看欧拉角跨度。"""
+    axes: list[np.ndarray] = []
+    for i in range(len(rotations)):
+        for j in range(i + 1, len(rotations)):
+            rvec, _ = cv2.Rodrigues(rotations[i].T @ rotations[j])
+            vector = rvec.reshape(3).astype(np.float64)
+            angle_deg = float(np.linalg.norm(vector) * 180.0 / np.pi)
+            if angle_deg < 5.0:
+                continue
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-12:
+                axes.append(vector / norm)
+    if len(axes) < 3:
+        return {
+            "usable_pair_count": len(axes),
+            "singular_values": [],
+            "secondary_to_primary_ratio": 0.0,
+            "axes_nearly_collinear": len(axes) > 0,
+        }
+    singular_values = np.linalg.svd(np.asarray(axes, dtype=np.float64), compute_uv=False)
+    ratio = float(singular_values[1] / max(singular_values[0], 1e-12))
+    return {
+        "usable_pair_count": len(axes),
+        "singular_values": [float(value) for value in singular_values],
+        "secondary_to_primary_ratio": ratio,
+        "axes_nearly_collinear": bool(ratio < 0.15),
+    }
 
 
 def pose_coverage_report(samples: list[CalibSample]) -> dict[str, Any]:
@@ -322,6 +361,7 @@ def pose_coverage_report(samples: list[CalibSample]) -> dict[str, Any]:
         }
 
     rotations = [s.T_base_tool[:3, :3].astype(np.float64) for s in samples]
+    axis_report = _relative_rotation_axis_report(rotations)
     rel_angles = [
         rotation_angle_deg(rotations[i].T @ rotations[j])
         for i in range(len(rotations)) for j in range(i + 1, len(rotations))
@@ -335,6 +375,8 @@ def pose_coverage_report(samples: list[CalibSample]) -> dict[str, Any]:
         warnings.append("C_circular_span_lt_50deg")
     if rel.size and float(np.mean(rel)) < 15.0:
         warnings.append("relative_rotation_mean_lt_15deg")
+    if axis_report["axes_nearly_collinear"]:
+        warnings.append("relative_rotation_axes_nearly_collinear")
 
     return {
         "ok": True,
@@ -351,296 +393,70 @@ def pose_coverage_report(samples: list[CalibSample]) -> dict[str, Any]:
             "pair_count_lt_5deg": int(np.sum(rel < 5.0)) if rel.size else 0,
             "pair_count_lt_10deg": int(np.sum(rel < 10.0)) if rel.size else 0,
         },
+        "relative_rotation_axis_coverage": axis_report,
         "warnings": warnings,
     }
 
 
-def sample_residual_report(samples: list[CalibSample], quality: dict[str, Any]) -> list[dict[str, Any]]:
-    trans = quality.get("per_sample_translation_error_mm", [])
-    trans_xyz = quality.get("per_sample_translation_error_xyz_mm", [])
-    rots = quality.get("per_sample_rotation_error_deg", [])
-    rows: list[dict[str, Any]] = []
-    for i, sample in enumerate(samples):
-        residual = float(trans[i]) if i < len(trans) else float("nan")
-        residual_xyz = trans_xyz[i] if i < len(trans_xyz) else [float("nan")] * 3
-        rot = float(rots[i]) if i < len(rots) else float("nan")
-        severity = "ok"
-        if np.isfinite(residual) and residual >= CONFLICT_DIAG_CFG.bad_residual_mm:
-            severity = "bad"
-        elif np.isfinite(residual) and residual >= CONFLICT_DIAG_CFG.suspect_residual_mm:
-            severity = "suspect"
-        rows.append({
-            "index": int(sample.index), "timestamp": sample.timestamp, "residual_mm": residual,
-            "residual_xyz_mm": [float(v) for v in residual_xyz], "rotation_error_deg": rot,
-            "severity": severity, "pose_values": sample_pose_values(sample),
-            "quality_flags": sample_quality_flags(sample), "board_status": sample.board_status,
-            "calibration_frame": sample_calibration_frame(sample),
-            "charuco_count": int(sample.charuco_count), "valid_3d_count": int(sample.valid_3d_count),
-            "corner_rmse_mm": float(sample.corner_rmse_mm), "plane_rmse_mm": float(sample.plane_rmse_mm),
-            "rgb_pnp_inlier_count": int(sample.rgb_pnp_inlier_count),
-            "rgb_reprojection_rmse_px": float(sample.rgb_reprojection_rmse_px),
-            "rgb_reprojection_max_px": float(sample.rgb_reprojection_max_px),
+def solve_and_save(
+    samples: list[CalibSample],
+    *,
+    validation_samples: list[CalibSample] | None = None,
+    fixed_validation_split: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    fit_samples = list(samples)
+    held_out_samples = list(validation_samples or [])
+    active_samples = sorted(
+        [*fit_samples, *held_out_samples], key=lambda item: int(item.index),
+    )
+
+    # 先检查整批样本的位姿源，再尝试复用固定 E7 留出集。否则当工作区残留
+    # 旧 split 文件、当前诊断样本只有 8 组时，错误会被“至少需要 11 组”遮住，
+    # 现场会看不到真正的 tcp/tool 混用原因。
+    if active_samples:
+        active_pose_sources = sorted({
+            str((sample.robot_snapshot or {}).get("pose_source") or "").strip().lower()
+            for sample in active_samples
         })
-    return sorted(rows, key=lambda item: item["residual_mm"], reverse=True)
-
-
-def diagnose_sample_conflicts(samples: list[CalibSample], baseline_estimate: dict[str, Any]) -> dict[str, Any]:
-    cfg = CONFLICT_DIAG_CFG
-    report: dict[str, Any] = {"enabled": bool(cfg.enable_on_solve), "config": asdict(cfg)}
-    if not cfg.enable_on_solve:
-        return report
-    if len(samples) < SOLVE_CFG.min_samples_for_solve:
-        report["status"] = "not_enough_samples"
-        return report
-
-    remaining = list(samples)
-    removed: list[dict[str, Any]] = []
-    current = baseline_estimate
-    path: list[dict[str, Any]] = [_quality_summary(current, len(remaining), [])]
-
-    max_remove = min(int(cfg.max_remove_for_report), max(0, len(samples) - int(cfg.min_report_samples)))
-    for _ in range(max_remove):
-        if len(remaining) <= max(SOLVE_CFG.min_samples_for_solve, int(cfg.min_report_samples)):
-            break
-
-        current_quality = current["quality"]
-        current_errors = current_quality.get("per_sample_translation_error_mm", [])
-        best: dict[str, Any] | None = None
-        for i, sample in enumerate(remaining):
-            test_samples = remaining[:i] + remaining[i + 1:]
-            if len(test_samples) < SOLVE_CFG.min_samples_for_solve:
-                continue
-            try:
-                estimate = solve_handeye_estimate(test_samples, quiet=True)
-            except Exception:
-                continue
-            q = estimate["quality"]
-            mean_improve = float(current_quality["translation_mean_mm"] - q["translation_mean_mm"])
-            rmse_improve = float(current_quality["translation_rmse_mm"] - q["translation_rmse_mm"])
-            max_improve = float(current_quality["translation_max_mm"] - q["translation_max_mm"])
-            key = (
-                float(q["translation_mean_mm"]), float(q["translation_rmse_mm"]),
-                float(q["translation_max_mm"]), float(q["rotation_mean_deg"]),
+        if len(active_pose_sources) != 1 or not active_pose_sources[0]:
+            raise RuntimeError(
+                f"样本位姿源必须唯一且显式，当前={active_pose_sources}"
             )
-            item = {
-                "key": key, "sample": sample, "sample_pos": i, "estimate": estimate,
-                "residual_before_remove_mm": float(current_errors[i]) if i < len(current_errors) else float("nan"),
-                "mean_improve_mm": mean_improve, "rmse_improve_mm": rmse_improve, "max_improve_mm": max_improve,
-            }
-            if best is None or item["key"] < best["key"]:
-                best = item
 
-        if best is None:
-            break
-        if best["mean_improve_mm"] < 0.005 and best["rmse_improve_mm"] < 0.005 and best["max_improve_mm"] < 0.05:
-            break
+    if fixed_validation_split is None and held_out_samples == []:
+        from .e7_handeye import fixed_validation_split_path, get_or_create_fixed_e7_split
 
-        sample = best["sample"]
-        removed.append({
-            "index": int(sample.index), "timestamp": sample.timestamp,
-            "residual_before_remove_mm": float(best["residual_before_remove_mm"]),
-            "mean_improve_mm": float(best["mean_improve_mm"]), "rmse_improve_mm": float(best["rmse_improve_mm"]),
-            "max_improve_mm": float(best["max_improve_mm"]), "pose_values": sample_pose_values(sample),
-            "quality_flags": sample_quality_flags(sample),
-        })
-        remaining.pop(int(best["sample_pos"]))
-        current = best["estimate"]
-        path.append(_quality_summary(current, len(remaining), [item["index"] for item in removed]))
-
-    initial_rows = sample_residual_report(samples, baseline_estimate["quality"])
-    accepted_entries = [
-        item for item in path
-        if item["sample_count"] >= cfg.min_accept_samples
-        and item["translation_mean_mm"] <= cfg.target_translation_mean_mm
-        and item["translation_rmse_mm"] <= cfg.target_translation_rmse_mm
-        and item["translation_max_mm"] <= cfg.target_translation_max_mm
-    ]
-    best_with_enough_samples = min(
-        (item for item in path if item["sample_count"] >= cfg.min_accept_samples),
-        key=lambda item: (item["translation_mean_mm"], item["translation_rmse_mm"], item["translation_max_mm"]),
-        default=None,
-    )
-    best_any = min(path, key=lambda item: (item["translation_mean_mm"], item["translation_rmse_mm"], item["translation_max_mm"]))
-
-    if accepted_entries:
-        status = "accepted_consensus_found"
-        recommended = accepted_entries[0]
-    elif (
-        best_any["translation_mean_mm"] <= cfg.target_translation_mean_mm
-        and best_any["translation_rmse_mm"] <= cfg.target_translation_rmse_mm
-        and best_any["translation_max_mm"] <= cfg.target_translation_max_mm
-    ):
-        status = "only_small_subset_meets_target"
-        recommended = best_any
-    else:
-        status = "no_consensus_meets_target"
-        recommended = best_with_enough_samples or best_any
-
-    report.update({
-        "status": status,
-        "baseline": path[0],
-        "pose_coverage": pose_coverage_report(samples),
-        "initial_residuals_sorted": initial_rows,
-        "initial_suspect_indices": [int(item["index"]) for item in initial_rows if item["severity"] in ("suspect", "bad")],
-        "initial_bad_indices": [int(item["index"]) for item in initial_rows if item["severity"] == "bad"],
-        "greedy_removed_order": removed,
-        "greedy_path": path,
-        "best_with_enough_samples": best_with_enough_samples,
-        "best_any_subset": best_any,
-        "recommended_entry": recommended,
-        "accepted_for_replacing_final_result": bool(status == "accepted_consensus_found"),
-        "note": (
-            "该诊断只用于识别冲突样本；如果达到 1 mm 的子集样本数过少，"
-            "应补拍同类姿态的新样本，而不是直接把少量点作为通用手眼结果。"
-        ),
-    })
-    return report
-
-
-def auto_prune_samples(samples: list[CalibSample]) -> tuple[list[CalibSample], list[dict[str, Any]], dict[str, Any]]:
-    if len(samples) < SOLVE_CFG.min_samples_for_solve:
-        print(f"[WARN] 样本不足，不能自动剔除：{len(samples)} < {SOLVE_CFG.min_samples_for_solve}")
-        return samples, [], {}
-
-    remaining = list(samples)
-    removed: list[dict[str, Any]] = []
-    minimum_remaining = max(
-        SOLVE_CFG.min_samples_for_solve,
-        E7_HAND_EYE_CFG.minimum_total_poses,
-        AUTO_PRUNE_CFG.min_remaining_samples,
-    )
-    before_estimate = solve_handeye_estimate(remaining, quiet=False)
-    before_quality = before_estimate["quality"]
-
-    print(
-        f"[AUTO] 剔除前: n={len(remaining)}, mean={before_quality['translation_mean_mm']:.4f} mm, "
-        f"rmse={before_quality['translation_rmse_mm']:.4f} mm, max={before_quality['translation_max_mm']:.4f} mm, "
-        f"rot_mean={before_quality['rotation_mean_deg']:.4f} deg"
-    )
-
-    current_estimate = before_estimate
-    for _ in range(AUTO_PRUNE_CFG.max_remove_per_run):
-        if len(remaining) <= minimum_remaining:
-            print(f"[AUTO] 已达到最低保留样本数 {minimum_remaining}，停止剔除。")
-            break
-
-        current_quality = current_estimate["quality"]
-        if (
-            current_quality["translation_mean_mm"] <= AUTO_PRUNE_CFG.target_translation_mean_mm
-            and current_quality["translation_max_mm"] <= AUTO_PRUNE_CFG.target_translation_max_mm
-        ):
-            break
-
-        trans_errors = current_quality["per_sample_translation_error_mm"]
-        candidates: list[dict[str, Any]] = []
-
-        for i, sample in enumerate(remaining):
-            residual = float(trans_errors[i])
-            flags = sample_quality_flags(sample)
-            is_candidate = (
-                residual >= AUTO_PRUNE_CFG.max_translation_error_mm
-                or flags
-                or (
-                    current_quality["translation_max_mm"] > AUTO_PRUNE_CFG.target_translation_max_mm
-                    and residual >= AUTO_PRUNE_CFG.target_translation_max_mm
-                )
+        split_path = fixed_validation_split_path(active_samples)
+        if len(active_samples) < SOLVE_CFG.min_samples_for_solve:
+            if split_path.is_file():
+                get_or_create_fixed_e7_split(active_samples, E7_HAND_EYE_CFG, persist=True)
+            print(
+                f"[WARN] 样本不足，至少需要 {SOLVE_CFG.min_samples_for_solve} 个，"
+                f"当前 {len(active_samples)} 个"
             )
-            if not is_candidate:
-                continue
-
-            test_samples = remaining[:i] + remaining[i + 1:]
-            if len(test_samples) < minimum_remaining:
-                continue
-            try:
-                test_estimate = solve_handeye_estimate(test_samples, quiet=True)
-            except Exception as exc:
-                print(f"[WARN] 自动剔除评估失败 index={sample.index}: {exc}")
-                continue
-
-            test_quality = test_estimate["quality"]
-            mean_improve = current_quality["translation_mean_mm"] - test_quality["translation_mean_mm"]
-            rmse_improve = current_quality["translation_rmse_mm"] - test_quality["translation_rmse_mm"]
-            max_improve = current_quality["translation_max_mm"] - test_quality["translation_max_mm"]
-            rot_improve = current_quality["rotation_mean_deg"] - test_quality["rotation_mean_deg"]
-            accepted = (
-                mean_improve >= AUTO_PRUNE_CFG.min_mean_improvement_mm
-                or max_improve >= AUTO_PRUNE_CFG.min_max_improvement_mm
-                or (flags and mean_improve >= -0.02 and max_improve >= -0.10)
+            return None
+        if len(active_samples) >= int(E7_HAND_EYE_CFG.minimum_total_poses) or split_path.is_file():
+            fit_samples, held_out_samples, fixed_validation_split = get_or_create_fixed_e7_split(
+                active_samples, E7_HAND_EYE_CFG, persist=True,
             )
-            if not accepted:
-                continue
-
-            score = mean_improve * 3.0 + rmse_improve * 1.5 + max_improve * 0.4 + max(rot_improve, 0.0) * 0.02
-            candidates.append({
-                "sample": sample, "index": sample.index, "timestamp": sample.timestamp,
-                "pose_values": sample_pose_values(sample), "residual_mm": residual, "quality_flags": flags,
-                "mean_improve_mm": float(mean_improve), "rmse_improve_mm": float(rmse_improve),
-                "max_improve_mm": float(max_improve), "rotation_mean_improve_deg": float(rot_improve),
-                "score": float(score), "test_estimate": test_estimate,
-            })
-
-        if not candidates:
-            break
-
-        best = max(candidates, key=lambda item: item["score"])
-        sample = best["sample"]
-        remaining = [s for s in remaining if s is not sample]
-        current_estimate = best["test_estimate"]
-        removed.append({k: v for k, v in best.items() if k != "test_estimate"})
+            active_samples = sorted(
+                [*fit_samples, *held_out_samples], key=lambda item: int(item.index),
+            )
+    if len(fit_samples) < SOLVE_CFG.min_samples_for_solve:
         print(
-            f"[AUTO] 剔除 index={sample.index}, residual={best['residual_mm']:.4f} mm, "
-            f"d_mean={best['mean_improve_mm']:.4f}, d_max={best['max_improve_mm']:.4f}, flags={best['quality_flags']}"
+            f"[WARN] 固定验证集占用后标定样本不足，至少需要 {SOLVE_CFG.min_samples_for_solve} 个，"
+            f"当前 {len(fit_samples)} 个"
         )
-
-    after_estimate = solve_handeye_estimate(remaining, quiet=True)
-    after_quality = after_estimate["quality"]
-    report = {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "config": asdict(AUTO_PRUNE_CFG),
-        "before": {
-            "sample_count": len(samples), "best_method": before_estimate["best_method"],
-            "translation_mean_mm": before_quality["translation_mean_mm"],
-            "translation_rmse_mm": before_quality["translation_rmse_mm"],
-            "translation_max_mm": before_quality["translation_max_mm"],
-            "rotation_mean_deg": before_quality["rotation_mean_deg"],
-        },
-        "after": {
-            "sample_count": len(remaining), "best_method": after_estimate["best_method"],
-            "translation_mean_mm": after_quality["translation_mean_mm"],
-            "translation_rmse_mm": after_quality["translation_rmse_mm"],
-            "translation_max_mm": after_quality["translation_max_mm"],
-            "rotation_mean_deg": after_quality["rotation_mean_deg"],
-        },
-    }
-    return remaining, removed, report
-
-
-def auto_prune_and_save(samples: list[CalibSample]) -> list[CalibSample]:
-    remaining, removed, report = auto_prune_samples(samples)
-    if removed:
-        archive_dir = archive_removed_samples(removed, report, timestamp_str())
-        rewrite_sample_csv(remaining)
-        print(f"[AUTO] 已归档坏样本 {len(removed)} 个: {archive_dir}")
-        print(f"[AUTO] CSV 已重写，剩余有效样本 {len(remaining)} 个")
-    else:
-        print("[AUTO] 未发现满足自动剔除条件的坏样本")
-    solve_and_save(remaining)
-    return remaining
-
-
-def solve_and_save(samples: list[CalibSample]) -> dict[str, Any] | None:
-    if len(samples) < SOLVE_CFG.min_samples_for_solve:
-        print(f"[WARN] 样本不足，至少需要 {SOLVE_CFG.min_samples_for_solve} 个，当前 {len(samples)} 个")
         return None
 
     pose_sources = sorted({
         str((sample.robot_snapshot or {}).get("pose_source") or "").strip().lower()
-        for sample in samples
+        for sample in fit_samples
     })
     if len(pose_sources) != 1 or not pose_sources[0]:
         raise RuntimeError(f"样本位姿源必须唯一且显式，当前={pose_sources}")
     pose_source = pose_sources[0]
-    calibration_frame = calibration_frame_for_samples(samples)
+    calibration_frame = calibration_frame_for_samples(fit_samples)
     is_rgb = calibration_frame == "rgb_camera"
     sensor_frame_name = "gemini435le_rgb_optical_frame" if is_rgb else "gemini435le_pointcloud_xyz_map_frame"
     method_name = "charuco_rgb_pnp_handeye" if is_rgb else "legacy_charuco_pointcloud_handeye_diagnostic"
@@ -650,49 +466,48 @@ def solve_and_save(samples: list[CalibSample]) -> dict[str, Any] | None:
         "manual": "manual_pose_reference",
     }.get(pose_source, f"robot_pose_source:{pose_source}")
 
-    print("=" * 70)
-    print(
-        f"[SOLVE] 开始诊断求 T_pose_source_sensor，pose_source={pose_source}，"
-        f"calibration_frame={calibration_frame}，样本数={len(samples)}"
+    estimate = solve_handeye_estimate(fit_samples, quiet=True)
+    T_final = estimate["T_final"]
+    quality = {k: v for k, v in estimate["quality"].items() if k != "T_base_board_mean"}
+    validation_quality = None
+    if held_out_samples:
+        from .e7_handeye import validation_stats_against_reference
+
+        validation_quality = validation_stats_against_reference(
+            held_out_samples, T_final, estimate["quality"]["T_base_board_mean"],
+        )
+        validation_quality = {
+            key: value for key, value in validation_quality.items()
+            if key not in {"T_base_board_reference", "transforms"}
+        }
+    rms_limit = float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm)
+    max_limit = float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_max_mm)
+    measured = [quality] + ([validation_quality] if validation_quality is not None else [])
+    numeric_pass = all(
+        np.isfinite(q["translation_rmse_mm"]) and np.isfinite(q["translation_max_mm"])
+        and q["translation_rmse_mm"] <= rms_limit and q["translation_max_mm"] <= max_limit
+        for q in measured
     )
-    T_init, best_method, all_method_results = solve_handeye_opencv(samples)
-    init_stats = compute_board_base_stats(samples, T_init)
+    enough_validation = (
+        len(active_samples) >= E7_HAND_EYE_CFG.minimum_total_poses
+        and len(held_out_samples) >= E7_HAND_EYE_CFG.minimum_validation_poses
+        and len(held_out_samples) / len(active_samples) >= E7_HAND_EYE_CFG.minimum_validation_fraction
+    )
+    if not numeric_pass:
+        conclusion = "未达标"
+        next_action = "检查图像与机器人位姿对应、相机安装和标定板尺寸，补采重复姿态核对。"
+    elif not enough_validation:
+        conclusion = "待验证"
+        next_action = "独立验证样本不足，继续采集不同姿态。"
+    else:
+        conclusion = "数值达标，待完整验证"
+        next_action = "执行独立验证，核对采集条件与姿态覆盖。"
 
-    T_candidate, refine_info = refine_handeye_nonlinear(samples, T_init)
-    candidate_stats = compute_board_base_stats(samples, T_candidate)
-    T_final, final_stats, refine_info = choose_refined_result(T_init, init_stats, T_candidate, candidate_stats, refine_info)
-    pose6 = transform_to_pose6_rzryrx(T_final)
-    raw_sample_count = len(samples)
-    used_samples = list(samples)
-    all_sample_quality = {k: v for k, v in final_stats.items() if k != "T_base_board_mean"}
-    all_sample_estimate = {
-        "best_method": best_method, "all_method_results": all_method_results, "T_init": T_init, "T_final": T_final,
-        "initial_quality": init_stats, "quality": final_stats, "nonlinear_refine": refine_info,
-    }
-    conflict_report = diagnose_sample_conflicts(samples, all_sample_estimate)
-    conflict_report["final_result_uses_consensus_subset"] = False
+    session_consistency = None
+    if is_rgb:
+        from .e7_handeye import _tcp_offset_consistency
 
-    if conflict_report.get("accepted_for_replacing_final_result"):
-        recommended = conflict_report.get("recommended_entry") or {}
-        excluded_indices = {int(v) for v in recommended.get("removed_indices", [])}
-        robust_samples = [s for s in samples if s.index not in excluded_indices]
-        if len(robust_samples) >= CONFLICT_DIAG_CFG.min_accept_samples and len(robust_samples) < len(samples):
-            print(
-                f"[ROBUST] 找到达标一致子集：保留 {len(robust_samples)}/{len(samples)} 个样本，"
-                f"排除 {sorted(excluded_indices)}，使用该子集输出最终矩阵。"
-            )
-            robust_estimate = solve_handeye_estimate(robust_samples, quiet=True)
-            used_samples = robust_samples
-            best_method = robust_estimate["best_method"]
-            all_method_results = robust_estimate["all_method_results"]
-            T_init = robust_estimate["T_init"]
-            T_final = robust_estimate["T_final"]
-            init_stats = robust_estimate["initial_quality"]
-            final_stats = robust_estimate["quality"]
-            refine_info = robust_estimate["nonlinear_refine"]
-            pose6 = transform_to_pose6_rzryrx(T_final)
-            conflict_report["final_result_uses_consensus_subset"] = True
-
+        session_consistency = _tcp_offset_consistency(active_samples, E7_HAND_EYE_CFG)
     output = {
         "record_type": "handeye_rgb_diagnostic_result" if is_rgb else "handeye_pointcloud_legacy_diagnostic_result",
         "record_policy": "diagnostic_current_replace_on_refresh",
@@ -700,155 +515,78 @@ def solve_and_save(samples: list[CalibSample]) -> dict[str, Any] | None:
         "do_not_use_for_motion": True,
         "production_eligible": False,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "conclusion": conclusion,
+        "next_action": next_action,
+        "precision_target": {"translation_rmse_mm_max": rms_limit, "translation_max_mm_max": max_limit},
         "method": method_name,
         "calibration_frame": calibration_frame,
-        "rgb_coordinate_convention": (
-            "opencv_optical_x_right_y_down_z_forward" if is_rgb else None
-        ),
+        "rgb_coordinate_convention": "opencv_optical_x_right_y_down_z_forward" if is_rgb else None,
         "frame_definition": {
             "B": "robot_base_or_world", "T": reference_frame, "S": sensor_frame_name,
             "Q": "charuco_board", "T_pose_source_sensor": "^T T_S",
             "runtime_formula": "P_base = T_base_pose_source @ T_pose_source_sensor @ P_sensor",
         },
         "pose_source": pose_source,
-        "raw_sample_count": raw_sample_count,
-        "sample_count": len(used_samples),
-        "used_sample_indices": [int(s.index) for s in used_samples],
-        "excluded_sample_indices": [int(s.index) for s in samples if s.index not in {u.index for u in used_samples}],
-        "best_opencv_method": best_method,
+        "raw_sample_count": len(active_samples),
+        "sample_count": len(fit_samples),
+        "used_sample_indices": [int(s.index) for s in fit_samples],
+        "calibration_sample_indices": [int(s.index) for s in fit_samples],
+        "validation_sample_indices": [int(s.index) for s in held_out_samples],
+        "validation_poses_excluded_from_fit": bool(held_out_samples),
+        "fixed_validation_split": fixed_validation_split,
+        "best_opencv_method": estimate["best_method"],
         "T_pose_source_sensor": matrix_to_list(T_final),
-        "T_pose_source_sensor_pose6_rzryrx_mm_deg": [float(v) for v in pose6],
-        "T_pose_source_sensor_pose_note": (
-            "该字段只是把矩阵近似展开为 [x, y, z, rz, ry, rx] 便于人工查看；"
-            "该文件仅用于诊断，不能直接用于运动。"
-        ),
-        "T_pose_source_sensor_initial_opencv": matrix_to_list(T_init),
-        "initial_quality": {k: v for k, v in init_stats.items() if k != "T_base_board_mean"},
-        "quality": {k: v for k, v in final_stats.items() if k != "T_base_board_mean"},
-        "all_sample_quality_before_conflict_filter": all_sample_quality,
-        "sample_conflict_diagnosis": conflict_report,
-        "diagnostic_consistency_gate_1mm": {
-            "production_acceptance": False,
-            "translation_mean_mm_max": AUTO_CAPTURE_CFG.diagnostic_result_mean_mm,
-            "translation_rmse_mm_max": AUTO_CAPTURE_CFG.diagnostic_result_rmse_mm,
-            "translation_max_mm_max": AUTO_CAPTURE_CFG.diagnostic_result_max_mm,
-            "meets_diagnostic_gate": (
-                final_stats["translation_mean_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_mean_mm
-                and final_stats["translation_rmse_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_rmse_mm
-                and final_stats["translation_max_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_max_mm
-            ),
-            "note": "仅用于发现冲突样本，不能解锁运动。",
-        },
-        "production_e7_requirement": {
-            "independent_cross_validation_required": True,
-            "validation_pose_scatter_rms_mm_max": E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm,
-            "minimum_total_poses": E7_HAND_EYE_CFG.minimum_total_poses,
-            "minimum_validation_fraction": E7_HAND_EYE_CFG.minimum_validation_fraction,
-            "minimum_validation_poses": E7_HAND_EYE_CFG.minimum_validation_poses,
-            "production_eligible_from_this_solver_output_alone": False,
-        },
-        "T_base_board_mean": matrix_to_list(final_stats["T_base_board_mean"]),
-        "nonlinear_refine": refine_info,
-        "opencv_method_results": all_method_results,
+        "T_pose_source_sensor_pose6_rzryrx_mm_deg": list(transform_to_pose6_rzryrx(T_final)),
+        "T_pose_source_sensor_initial_opencv": matrix_to_list(estimate["T_init"]),
+        "quality": quality,
+        "validation_quality": validation_quality,
+        "pose_coverage": pose_coverage_report(fit_samples),
+        "T_base_board_mean": matrix_to_list(estimate["quality"]["T_base_board_mean"]),
+        "nonlinear_refine": estimate["nonlinear_refine"],
+        "opencv_method_results": estimate["all_method_results"],
         "board": asdict(BOARD_CFG),
         "camera": asdict(CAMERA_CFG),
-        "capture": {
-            "manual_burst_frames": AUTO_CAPTURE_CFG.manual_burst_frames,
-            "manual_burst_max_attempts": AUTO_CAPTURE_CFG.manual_burst_max_attempts,
-            "burst_interval_s": AUTO_CAPTURE_CFG.burst_interval_s,
-            "burst_pose_stability_xyz_mm": AUTO_CAPTURE_CFG.burst_pose_stability_xyz_mm,
-            "burst_pose_stability_abc_deg": AUTO_CAPTURE_CFG.burst_pose_stability_abc_deg,
-            "reject_unstable_burst_pose": AUTO_CAPTURE_CFG.reject_unstable_burst_pose,
-            "burst_pose_cluster_xyz_mm": AUTO_CAPTURE_CFG.burst_pose_cluster_xyz_mm,
-            "burst_pose_cluster_abc_deg": AUTO_CAPTURE_CFG.burst_pose_cluster_abc_deg,
-            "burst_min_pose_cluster_frames": AUTO_CAPTURE_CFG.burst_min_pose_cluster_frames,
-            "require_quality_ok_for_burst": AUTO_CAPTURE_CFG.require_quality_ok_for_burst,
-            "min_rgb_pnp_inliers": AUTO_CAPTURE_CFG.min_rgb_pnp_inliers,
-            "max_rgb_reprojection_rmse_px": AUTO_CAPTURE_CFG.max_rgb_reprojection_rmse_px,
-            "max_rgb_reprojection_error_px": AUTO_CAPTURE_CFG.max_rgb_reprojection_error_px,
-        },
+        "capture": asdict(AUTO_CAPTURE_CFG),
+        "session_consistency": session_consistency,
         "robot": {
             "robot_brand": "AUBO", "ip": ROBOT_CFG.ip, "rpc_port": ROBOT_CFG.rpc_port,
             "pose_source": pose_source, "sdk_pose_units": {"xyz": "m", "rpy": "rad"},
             "solver_pose_units": {"xyz": "mm", "rotation": "matrix"},
-            "read_api": "RobotState.getTcpPose()" if pose_source == "tcp" else "RobotState.getToolPose()",
-            "request_timeout_ms": ROBOT_CFG.request_timeout_ms,
-            "require_power_on": ROBOT_CFG.require_power_on, "require_steady": ROBOT_CFG.require_steady,
-            "reject_collision": ROBOT_CFG.reject_collision,
         },
     }
-
-    if pose_source == "tcp" and is_rgb:
-        output["T_tcp_rgb_camera"] = output["T_pose_source_sensor"]
-    elif pose_source == "tcp":
-        output["T_tcp_pointcloud"] = output["T_pose_source_sensor"]
-    elif pose_source == "tool" and is_rgb:
-        output["T_robot_tool_rgb_camera"] = output["T_pose_source_sensor"]
+    if pose_source == "tcp":
+        output["T_tcp_rgb_camera" if is_rgb else "T_tcp_pointcloud"] = output["T_pose_source_sensor"]
     elif pose_source == "tool":
-        output["T_robot_tool_pointcloud"] = output["T_pose_source_sensor"]
-
+        output["T_robot_tool_rgb_camera" if is_rgb else "T_robot_tool_pointcloud"] = output["T_pose_source_sensor"]
     if SOLVE_CFG.also_write_compatible_key_t_tooltcp_cam and pose_source == "tcp" and is_rgb:
         output["t_tooltcp_cam"] = output["T_tcp_rgb_camera"]
-        output["compatible_note"] = (
-            "t_tooltcp_cam is kept only for old runtime compatibility; "
-            "it means T_tcp_rgb_camera (^T T_Crgb)."
-        )
 
     out_path = atomic_write_json(Path(SOLVE_CFG.output_json), output)
-
-    print("=" * 70)
-    print("[RESULT] 已原子更新唯一诊断结果:", out_path)
-    print(
-        f"[RESULT] T_pose_source_sensor, pose_source={pose_source}, "
-        f"sensor={sensor_frame_name}, reference={reference_frame}"
-    )
-    print(np.asarray(T_final))
-    print("[RESULT] pose6 approx mm/deg:", fmt_vec(pose6, 6))
-    print(
-        f"[QUALITY] trans_mean={final_stats['translation_mean_mm']:.4f} mm, "
-        f"trans_rmse={final_stats['translation_rmse_mm']:.4f} mm, trans_max={final_stats['translation_max_mm']:.4f} mm"
-    )
-    print(
-        f"[QUALITY] rot_mean={final_stats['rotation_mean_deg']:.6f} deg, "
-        f"rot_rmse={final_stats['rotation_rmse_deg']:.6f} deg, rot_max={final_stats['rotation_max_deg']:.6f} deg"
-    )
-    diag_status = conflict_report.get("status")
-    bad_indices = conflict_report.get("initial_bad_indices") or []
-    suspect_indices = conflict_report.get("initial_suspect_indices") or []
-    recommended_entry = conflict_report.get("recommended_entry") or {}
-    if diag_status:
-        print(f"[CONFLICT] status={diag_status}, bad={bad_indices[:12]}, suspect={suspect_indices[:12]}")
-        if recommended_entry:
-            print(
-                f"[CONFLICT] best_preview: n={recommended_entry.get('sample_count')}, "
-                f"mean={recommended_entry.get('translation_mean_mm'):.4f} mm, "
-                f"rmse={recommended_entry.get('translation_rmse_mm'):.4f} mm, "
-                f"max={recommended_entry.get('translation_max_mm'):.4f} mm, "
-                f"removed={recommended_entry.get('removed_indices')}"
-            )
-        if diag_status == "only_small_subset_meets_target":
-            print("[CONFLICT] 少量样本能凑到 1 mm，但样本数不足，不建议作为通用手眼结果；请补拍同类姿态的新样本。")
-        elif diag_status == "no_consensus_meets_target":
-            print("[CONFLICT] 当前样本集合没有足够稳定的一致子集；请先处理 bad/suspect 点位并补拍。")
-    diagnostic_ok = (
-        final_stats["translation_mean_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_mean_mm
-        and final_stats["translation_rmse_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_rmse_mm
-        and final_stats["translation_max_mm"] <= AUTO_CAPTURE_CFG.diagnostic_result_max_mm
-    )
-    if diagnostic_ok:
-        print(
-            f"[DIAGNOSTIC] 通过毫米级一致性门："
-            f"mean<={AUTO_CAPTURE_CFG.diagnostic_result_mean_mm:.2f}, "
-            f"rmse<={AUTO_CAPTURE_CFG.diagnostic_result_rmse_mm:.2f}, "
-            f"max<={AUTO_CAPTURE_CFG.diagnostic_result_max_mm:.2f} mm。"
-        )
-        print("[LOCK] 该结果仍不能解锁运动；必须另做E7独立交叉验证，验证姿态RMS<=0.10 mm。")
-    else:
-        print(
-            f"[DIAGNOSTIC] 未通过毫米级一致性门；建议按 a 自动剔除坏样本并补采。门槛："
-            f"mean<={AUTO_CAPTURE_CFG.diagnostic_result_mean_mm:.2f}, "
-            f"rmse<={AUTO_CAPTURE_CFG.diagnostic_result_rmse_mm:.2f}, "
-            f"max<={AUTO_CAPTURE_CFG.diagnostic_result_max_mm:.2f} mm。"
-        )
-    print("=" * 70)
+    print(format_handeye_summary(output))
+    print(f"[结果文件] {out_path}")
     return output
+
+
+def format_handeye_summary(result: dict[str, Any]) -> str:
+    """界面和日志共用同一份结论，拟合误差与独立验证误差分开显示。"""
+    quality = result["quality"]
+    target = result["precision_target"]
+    lines = [
+        f"结论：{result['conclusion']}",
+        f"拟合 {result['sample_count']} 组：平移 RMS {quality['translation_rmse_mm']:.3f} mm，"
+        f"最大 {quality['translation_max_mm']:.3f} mm",
+    ]
+    validation = result.get("validation_quality")
+    if validation is None:
+        lines.append("独立验证：样本不足")
+    else:
+        lines.append(
+            f"验证 {len(result['validation_sample_indices'])} 组：平移 RMS "
+            f"{validation['translation_rmse_mm']:.3f} mm，最大 {validation['translation_max_mm']:.3f} mm"
+        )
+    lines.extend([
+        f"目标：RMS ≤ {target['translation_rmse_mm_max']:.2f} mm，"
+        f"最大 ≤ {target['translation_max_mm_max']:.2f} mm",
+        result["next_action"],
+    ])
+    return "\n".join(lines)

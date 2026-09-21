@@ -15,6 +15,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from typing import Any
+
+from .paths import (
+    CHARUCO_CALIBRATION_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+    DATA_DIR,
+    HANDEYE_CANDIDATE_DIR,
+    HANDEYE_VALIDATION_PATH,
+)
 
 
 @dataclass
@@ -50,7 +64,7 @@ class BoardConfig:
 
 @dataclass
 class CameraConfig:
-    save_dir: str = r"C:\MM\aubo_tools\charuco_pointcloud_calib"
+    save_dir: str = str(CHARUCO_CALIBRATION_DIR)
     min_valid_z_mm: float = 250.0
     max_valid_z_mm: float = 1200.0
     depth_vis_min_mm: float = 250.0
@@ -82,41 +96,32 @@ class CameraConfig:
 @dataclass
 class RobotConfig:
     # 默认自动读取 AUBO 当前 TCP 位姿。只读，不写 TCP，不控制运动。
-    robot_pose_read_enable: bool = True
-    ip: str = "192.168.50.200"
-    rpc_port: int = 30004
-    user: str = "AUBO"
-    password: str = "123456"
-    request_timeout_ms: int = 1500
+    ip: str = DEFAULT_ROBOT_IP
+    rpc_port: int = DEFAULT_ROBOT_PORT
+    user: str = DEFAULT_ROBOT_USER
+    password: str = DEFAULT_ROBOT_PASSWORD
+    request_timeout_ms: int = DEFAULT_ROBOT_TIMEOUT_MS
     network_precheck_timeout_s: float = 1.0
-
-    # tcp：读取当前 TCP 在基坐标系下的位姿，推荐用于眼在手。
-    # tool：读取当前工具/法兰位姿；只有明确要以法兰为手眼末端时才使用。
-    pose_source: str = "tcp"
 
     require_power_on: bool = True
     require_steady: bool = True
     reject_collision: bool = True
-
-    # 自动读取失败时，可按 m 手动输入 AUBO SDK 位姿，单位 m / rad。
-    manual_pose_sdk_m_rad: tuple[float, float, float, float, float, float] | None = None
 
 
 @dataclass
 class RobotCameraIntegrationConfig:
     """自动入孔所需权威证据文件位置；不使用可手工翻转的解锁布尔值。"""
 
-    production_camera_serial: str = "CP4B85P001L"
-    handeye_validation_evidence_path: str = (
-        r"C:\MM\aubo_tools\data\e7_handeye_validation_current.json"
-    )
+    # 新副本不预设旧设备序列号；现场核对后通过环境变量绑定实际相机。
+    production_camera_serial: str = os.environ.get("AUBO_WORKBENCH_CAMERA_SERIAL", "").strip()
+    handeye_validation_evidence_path: str = str(HANDEYE_VALIDATION_PATH)
 
 
 @dataclass
 class SolveConfig:
     # 8组只允许做诊断求解；正式E7由 E7HandEyeConfig 单独控制。
     min_samples_for_solve: int = 8
-    output_json: str = r"C:\MM\aubo_tools\data\handeye_diagnostic_current.json"
+    output_json: str = str(DATA_DIR / "handeye_diagnostic_current.json")
     also_write_compatible_key_t_tooltcp_cam: bool = False
     enable_nonlinear_refine: bool = True
     nonlinear_rotation_weight_mm: float = 80.0
@@ -133,9 +138,10 @@ class E7HandEyeConfig:
     minimum_validation_fraction: float = 0.20
     minimum_validation_poses: int = 3
     maximum_validation_center_scatter_rms_mm: float = 0.10
+    maximum_validation_center_scatter_max_mm: float = 0.20
     require_tcp_pose_source: bool = True
     allow_manual_pose: bool = False
-    candidate_dir: str = r"C:\MM\aubo_tools\data\e7_candidates"
+    candidate_dir: str = str(HANDEYE_CANDIDATE_DIR)
 
     # 视野覆盖必须能由原始样本自动计算，不能由人工布尔值直接声称通过。
     center_region_half_width_ratio: float = 0.22
@@ -146,56 +152,22 @@ class E7HandEyeConfig:
     maximum_pose_bracket_xyz_mm: float = 0.05
     maximum_pose_bracket_abc_deg: float = 0.01
 
+    # 板固定程度数值验证门槛
+    maximum_board_position_scatter_rms_mm: float = 0.5
+    maximum_board_position_scatter_max_mm: float = 1.0
+    maximum_board_orientation_scatter_rms_deg: float = 0.3
+    maximum_board_orientation_scatter_max_deg: float = 0.6
+    maximum_time_gap_hours: float = 2.0
 
-@dataclass
-class AutoPruneConfig:
-    # 按 a 自动剔除时使用；普通 h 求解不受影响。
-    max_remove_per_run: int = 8
-    # 与当前E7最低总样本数保持一致；18张数据允许剔除，最低保留11张。
-    min_remaining_samples: int = 11
-
-    # 仅用于发现毫米级冲突样本；不能作为本项目生产手眼验收：
-    # mean 控制整体稳定性，max 控制最差样本，max_translation_error 控制明显坏样本。
-    target_translation_mean_mm: float = 0.70
-    target_translation_max_mm: float = 1.00
-    max_translation_error_mm: float = 1.20
-
-    # ChArUco / 点云质量硬门槛。超过这些值的样本会优先作为候选。
-    min_valid_3d_count: int = 80
-    max_corner_rmse_mm: float = 0.65
-    max_plane_rmse_mm: float = 0.70
-
-    # 删除一个样本后至少要让整体指标有可见改善，避免误删正常覆盖点。
-    min_mean_improvement_mm: float = 0.02
-    min_max_improvement_mm: float = 0.12
-
-
-@dataclass
-class ConflictDiagnosisConfig:
-    # 每次按 h 求解时，自动分析哪些样本和主一致集合冲突；只写报告，不移动/删除原始样本。
-    enable_on_solve: bool = True
-
-    # 诊断时最多尝试剔除多少个样本；这是为了找出冲突来源，不代表建议最终只保留这么少。
-    max_remove_for_report: int = 12
-    min_report_samples: int = 9
-
-    # 只有剩余样本数足够多且指标达标时，才认为稳健子集可作为“可靠标定结果”。
-    # 少量点即使内残差很好，也可能只是过拟合，不应当作为通用 0.5 mm 方案。
-    min_accept_samples: int = 18
-    target_translation_mean_mm: float = 0.70
-    target_translation_rmse_mm: float = 0.80
-    target_translation_max_mm: float = 1.00
-
-    # 初始全样本残差超过这些阈值的样本，会在报告里标为疑似冲突/严重冲突。
-    suspect_residual_mm: float = 2.00
-    bad_residual_mm: float = 3.00
+    # 每个采集会话锁定的TCP/相机元数据一致性门槛。
+    require_tcp_offset_metadata: bool = True
+    maximum_tcp_offset_xyz_delta_mm: float = 0.02
+    maximum_tcp_offset_rpy_delta_deg: float = 0.02
+    require_camera_serial_metadata: bool = True
 
 
 @dataclass
 class AutoCaptureConfig:
-    # 当前版本已经删除自动抓拍；本配置只保留毫米级诊断门槛和手动批量采集参数。
-    enable: bool = False
-
     # 手动批量采集：按一次 c，连续取 5 帧合格观测，再从同一稳定 TCP 姿态簇中选 1 帧保存。
     manual_burst_frames: int = 5
 
@@ -217,11 +189,6 @@ class AutoCaptureConfig:
 
     # True：只有满足毫米级单帧诊断门槛才保存；这不是正式E7手眼验收。
     require_quality_ok_for_burst: bool = True
-
-    # 毫米级一致性诊断，只用于剔除冲突样本。生产必须另做E7独立交叉验证，RMS<=0.10mm。
-    diagnostic_result_mean_mm: float = 0.70
-    diagnostic_result_rmse_mm: float = 0.80
-    diagnostic_result_max_mm: float = 1.00
 
     # 综合评分与图像质量门槛。
     min_score: float = 90.0
@@ -256,8 +223,25 @@ ROBOT_CFG = RobotConfig()
 ROBOT_CAMERA_INTEGRATION_CFG = RobotCameraIntegrationConfig()
 SOLVE_CFG = SolveConfig()
 E7_HAND_EYE_CFG = E7HandEyeConfig()
-AUTO_PRUNE_CFG = AutoPruneConfig()
-CONFLICT_DIAG_CFG = ConflictDiagnosisConfig()
 AUTO_CAPTURE_CFG = AutoCaptureConfig()
 
-ESC_KEY = 27
+# argparse 参数名 -> RobotConfig 字段名。工作台顶栏的连接参数通过命令行传给
+# 子进程脚本后，用下面的函数写回全局 ROBOT_CFG。
+_ROBOT_CONNECTION_ARG_MAP: tuple[tuple[str, str], ...] = (
+    ("robot_ip", "ip"),
+    ("robot_port", "rpc_port"),
+    ("robot_user", "user"),
+    ("robot_password", "password"),
+    ("robot_timeout_ms", "request_timeout_ms"),
+)
+
+
+def apply_robot_connection_overrides(args: Any) -> None:
+    """把命令行传入的连接参数写回全局 ROBOT_CFG；未提供的参数保持默认。
+
+    仅覆盖显式给出（非 None）的字段，因此可以只传部分参数。
+    """
+    for arg_name, config_name in _ROBOT_CONNECTION_ARG_MAP:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(ROBOT_CFG, config_name, value)

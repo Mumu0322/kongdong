@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """粗定位后精定位视野偏移容忍度测试。
 
-该脚本是独立诊断入口，不执行正式流程的最终 XY、最终 Z 和基坐标 Y+0.2 mm
+该脚本是独立诊断入口，不执行正式流程的最终 XY、最终 Z 和基坐标 Y+0.3 mm
 动作。它先按正式流程完成单孔粗定位并下降到精定位高度，然后把相机在自身
 X/Y 平面内横向偏移，使孔洞分别落在 0/5/10/15/20 mm 的圆形范围内，逐点
 运行当前 RGB 精定位质量门，输出 JSON、CSV 和极坐标图。
@@ -11,7 +11,6 @@ X/Y 平面内横向偏移，使孔洞分别落在 0/5/10/15/20 mm 的圆形范�
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import sys
@@ -31,6 +30,7 @@ import run_yolo_eye_in_hand_optimized as loc  # noqa: E402
 from aubo_workbench.camera import get_device_identity, init_pipeline  # noqa: E402
 from aubo_workbench.charuco_point_experiment import load_handeye_experiment_result  # noqa: E402
 from aubo_workbench.config import ROBOT_CFG  # noqa: E402
+from aubo_workbench.io_utils import write_dict_rows  # noqa: E402
 
 
 DEFAULT_RADII_MM = (0.0, 5.0, 10.0, 15.0, 20.0)
@@ -366,13 +366,13 @@ def _execute_final_motion(
     fine_point_base: np.ndarray, timing: loc.TimingRecorder,
     sample_id: int, motion_session: Any, pose_session: Any,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """按正式流程执行最终XY、降Z和基坐标Y+0.2，并停在最终目标点。"""
+    """按正式流程执行最终 XY 和降 Z，并停在最终目标点。"""
     fixed_offset = (
         None if args.tcp_xy_offset_mm is None
         else (float(args.tcp_xy_offset_mm[0]), float(args.tcp_xy_offset_mm[1]))
     )
     motion: dict[str, Any] = {
-        "motion_sequence": ["final_xy", "final_z", "final_y_plus_0_2", "retract", "return"],
+        "motion_sequence": ["final_xy", "final_z", "retract", "return"],
         "hole_center_base_mm": np.asarray(fine_point_base, dtype=np.float64),
         "compensation_mode": (
             "charuco_affine_model" if fixed_offset is None else "fixed_offset_override"
@@ -389,7 +389,7 @@ def _execute_final_motion(
         current_tcp = loc._confirm_and_move_line(
             f"偏移测试点 {sample_id}：最终XY",
             current_tcp, xy_target, args, motion_session, pose_session,
-            "按正式流程执行最终XY；随后继续最终Z和Y+0.2 mm",
+            "按正式流程执行最终XY；随后继续最终Z，不再追加Y偏置",
             require_confirmation=False, motion_profile="precision",
         )
     motion["final_xy"] = {
@@ -417,22 +417,6 @@ def _execute_final_motion(
         "pose_error": _motion_pose_error(z_target, current_tcp),
     }
 
-    y_target = loc.plan_final_tcp_base_y_trim(current_tcp)
-    with timing.measure(
-        f"sample_{sample_id:02d}/final_motion_y_plus_0_2", sample_id=sample_id,
-    ):
-        current_tcp = loc._confirm_and_move_line(
-            f"偏移测试点 {sample_id}：最终基坐标+Y 0.2 mm",
-            current_tcp, y_target, args, motion_session, pose_session,
-            "保持X、Z和姿态；基坐标Y增加0.2 mm",
-            require_confirmation=False, motion_profile="precision",
-        )
-    motion["final_y_plus_0_2"] = {
-        "planned_tcp_pose_m_rad": loc.transform_to_sdk_pose_m_rad(y_target),
-        "actual_tcp_pose_m_rad": loc.transform_to_sdk_pose_m_rad(current_tcp),
-        "delta_base_y_mm": loc.FINAL_BASE_Y_AFTER_Z_MM,
-        "pose_error": _motion_pose_error(y_target, current_tcp),
-    }
     motion["final_pose_before_retract_m_rad"] = loc.transform_to_sdk_pose_m_rad(current_tcp)
     return current_tcp, motion
 
@@ -481,11 +465,8 @@ def _recover_after_final_target(
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    keys = sorted({key for row in rows for key in row}) if rows else ["sample_id", "status"]
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+    """按本脚本的空表回退列写 CSV；落盘细节统一在 io_utils.write_dict_rows。"""
+    write_dict_rows(path, rows, fallback_fields=("sample_id", "status"))
 
 
 def _write_polar_plot(
@@ -581,11 +562,10 @@ def _summarize_radii(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _summarize_final_motion(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总最终XY、Z和Y微调相对规划位姿的实际到位误差。"""
+    """汇总最终 XY、Z 相对规划位姿的实际到位误差。"""
     step_names = {
         "final_xy": "final_xy",
         "final_z": "final_z",
-        "final_y_plus_0_2": "final_y_plus_0_2",
     }
     summary: dict[str, Any] = {
         "enabled": False,
@@ -751,7 +731,17 @@ def run_offset_test(args: Any) -> int:
             ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
             ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms,
         )
-        current_tcp = loc._confirm_and_move_home(home, args, motion_session, pose_session)
+        controller_home_joints = motion_session.get_controller_home_joints()
+        report["home_point_source"] = "controller_home"
+        report["controller_home_joints_rad"] = list(controller_home_joints)
+        current_tcp = loc._confirm_and_move_home(
+            home,
+            motion_session,
+            pose_session,
+            timing=timing,
+            target_joints=controller_home_joints,
+            home_source="controller_home",
+        )
 
         with timing.measure("camera/start_rgbd_pipeline"):
             pipeline, align, chain = init_pipeline()
@@ -994,7 +984,7 @@ def run_offset_test(args: Any) -> int:
             current_tcp = loc._confirm_and_move_line(
                 "偏移测试结束：返回精定位中心",
                 current_tcp, reference_tcp, args, motion_session, pose_session,
-                "测试结束，不执行最终 XY、最终 Z 和 Y+0.2 mm",
+                "测试结束，不执行最终 XY、最终 Z 和 Y+0.3 mm",
                 require_confirmation=False, motion_profile="precision",
             )
         report["status"] = "completed"
@@ -1058,7 +1048,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--include-final-motion", action="store_true",
-        help="实机测试中按正式流程执行最终XY、降Z和基坐标Y+0.2 mm，并安全回到中心",
+        help="实机测试中按正式流程执行最终XY、降Z和基坐标Y+0.3 mm，并安全回到中心",
     )
     parser.add_argument(
         "--auto-continue-offset", dest="confirm_each_offset", action="store_false",

@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,159 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, np.integer):
         return int(value)
     return value
+
+
+_SAMPLE_FILE_FIELDS = ("sample_json_path", "rgb_path", "overlay_path", "depth_vis_path")
+
+
+def _sample_file_root(path: Path) -> Path:
+    if path.parent.name in {"samples", "images"}:
+        return path.parent.parent.resolve()
+    return path.parent.resolve()
+
+
+def active_sample_data_root(samples: list[CalibSample] | None = None) -> Path:
+    """返回当前活动采集目录；允许样本文件整体搬迁后继续按文件名定位。"""
+    configured_root = Path(CAMERA_CFG.save_dir).resolve()
+    existing_sample_json_roots: set[Path] = set()
+    existing_roots: set[Path] = set()
+    for sample in samples or []:
+        for field_name in _SAMPLE_FILE_FIELDS:
+            raw_path = str(getattr(sample, field_name, "") or "").strip()
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if not path.is_file():
+                continue
+            root = _sample_file_root(path)
+            existing_roots.add(root)
+            if field_name == "sample_json_path":
+                existing_sample_json_roots.add(root)
+    if len(existing_sample_json_roots) == 1:
+        return next(iter(existing_sample_json_roots))
+    if len(existing_roots) == 1:
+        return next(iter(existing_roots))
+    return configured_root
+
+
+def resolve_sample_data_path(
+    sample: CalibSample,
+    field_name: str,
+    data_root: Path | None = None,
+) -> Path | None:
+    """按活动目录优先、原记录路径兜底解析样本文件，忽略目录搬迁本身。"""
+    raw_path = str(getattr(sample, field_name, "") or "").strip()
+    if not raw_path:
+        return None
+    root = Path(data_root).resolve() if data_root is not None else active_sample_data_root([sample])
+    folder = "samples" if field_name == "sample_json_path" else "images"
+    candidates = [root / folder / Path(raw_path).name, Path(raw_path)]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def sample_file_manifest(sample: CalibSample, data_root: Path | None = None) -> dict[str, Any]:
+    """返回单个样本的原始文件清单；比较身份时只使用 kind/size/hash，不使用路径。"""
+    fields = ["sample_json_path", "rgb_path", "overlay_path"]
+    if str(sample.calibration_frame or "").strip().lower() != "rgb_camera":
+        fields.append("depth_vis_path")
+    entries: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for field_name in fields:
+        path = resolve_sample_data_path(sample, field_name, data_root)
+        if path is None:
+            missing.append(f"{field_name}:missing")
+            continue
+        try:
+            entries.append({
+                "kind": field_name,
+                "path": str(path),
+                "size_bytes": int(path.stat().st_size),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        except OSError as exc:
+            missing.append(f"{field_name}:{exc}")
+    return {
+        "files": entries,
+        "missing_files": missing,
+        "complete": bool(entries) and not missing,
+    }
+
+
+def sample_session_info(sample: CalibSample) -> dict[str, Any]:
+    """提取可用于固定分组身份核对的机器人/相机/TCP会话元数据。"""
+    snapshot = sample.robot_snapshot or {}
+    camera = sample.camera_metadata or {}
+    device = camera.get("device") if isinstance(camera.get("device"), dict) else {}
+    return _json_safe({
+        "robot_brand": snapshot.get("robot_brand"),
+        "robot_name": snapshot.get("robot_name"),
+        "robot_type": snapshot.get("robot_type"),
+        "pose_source": snapshot.get("pose_source"),
+        "actual_tcp_offset_sdk_m_rad": snapshot.get("actual_tcp_offset_sdk_m_rad"),
+        "configured_tcp_offset_sdk_m_rad": snapshot.get("configured_tcp_offset_sdk_m_rad"),
+        "camera_serial": device.get("serial_number"),
+        "camera_profile": {
+            "width": camera.get("width"),
+            "height": camera.get("height"),
+            "capture_mode": camera.get("capture_mode"),
+            "device_name": device.get("name"),
+            "device_pid": device.get("pid"),
+            "connection_type": device.get("connection_type"),
+            "intrinsics": camera.get("intrinsics"),
+        },
+    })
+
+
+def sample_content_identity(sample: CalibSample, data_root: Path | None = None) -> dict[str, Any]:
+    """生成与目录位置无关、但覆盖样本内容和原始文件 hash 的稳定身份。"""
+    raw_manifest = sample_file_manifest(sample, data_root)
+    raw_files = [
+        {
+            "kind": str(entry["kind"]),
+            "size_bytes": int(entry["size_bytes"]),
+            "sha256": str(entry["sha256"]),
+        }
+        for entry in raw_manifest["files"]
+    ]
+    semantic = sample_to_json_dict(sample)
+    for field_name in _SAMPLE_FILE_FIELDS:
+        semantic.pop(field_name, None)
+    semantic["raw_files"] = raw_files
+    semantic["session"] = sample_session_info(sample)
+    canonical = json.dumps(
+        _json_safe(semantic), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return {
+        "index": int(sample.index),
+        "timestamp": str(sample.timestamp),
+        "content_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "raw_files": raw_files,
+        "session": sample_session_info(sample),
+        "missing_files": list(raw_manifest["missing_files"]),
+    }
+
+
+def next_available_sample_index(samples: list[CalibSample] | None = None) -> int:
+    """返回不会复用活动目录或归档目录中已有文件名编号的下一个样本编号。"""
+    maximum = max((int(sample.index) for sample in (samples or [])), default=0)
+    root = Path(CAMERA_CFG.save_dir)
+    if root.is_dir():
+        for path in root.rglob("sample_*.json"):
+            match = re.match(r"^sample_(\d+)(?:_|\.json$)", path.name)
+            if match:
+                maximum = max(maximum, int(match.group(1)))
+    return maximum + 1
 
 
 def sample_to_json_dict(sample: CalibSample) -> dict[str, Any]:
@@ -313,38 +467,6 @@ def sample_disk_paths(sample: CalibSample) -> list[Path]:
     return unique
 
 
-def archive_removed_samples(removed: list[dict[str, Any]], report: dict[str, Any], timestamp_str: str) -> Path:
-    """把自动剔除的坏样本挪到归档目录，附带剔除报告。"""
-    archive_dir = Path(CAMERA_CFG.save_dir) / f"archived_auto_prune_{timestamp_str}"
-    sample_archive_dir = archive_dir / "samples"
-    image_archive_dir = archive_dir / "images"
-    make_dir(sample_archive_dir)
-    make_dir(image_archive_dir)
-
-    csv_path = Path(CAMERA_CFG.save_dir) / "charuco_pointcloud_samples.csv"
-    if csv_path.exists():
-        import shutil
-
-        shutil.copy2(str(csv_path), str(archive_dir / "charuco_pointcloud_samples_before_prune.csv"))
-
-    moved: list[dict[str, Any]] = []
-    for item in removed:
-        sample: CalibSample = item["sample"]
-        moved_paths: list[str] = []
-        for path in sample_disk_paths(sample):
-            target_dir = sample_archive_dir if path.suffix.lower() == ".json" else image_archive_dir
-            moved_paths.append(move_path_to_dir(path, target_dir))
-        item_report = {k: v for k, v in item.items() if k != "sample"}
-        item_report["moved_paths"] = moved_paths
-        moved.append(item_report)
-
-    report = dict(report)
-    report["removed"] = moved
-    report_path = archive_dir / "auto_prune_report.json"
-    atomic_write_json(report_path, report)
-    return archive_dir
-
-
 def archive_samples(
     samples_to_archive: list[CalibSample],
     remaining_samples: list[CalibSample],
@@ -388,18 +510,15 @@ def build_raw_data_manifest(samples: list[CalibSample]) -> dict[str, Any]:
     """计算活动样本文件清单及组合SHA256，供E7候选证据追溯。"""
     entries: list[dict[str, Any]] = []
     missing: list[str] = []
+    data_root = active_sample_data_root(samples)
     for sample in sorted(samples, key=lambda item: item.index):
         fields = ["sample_json_path", "rgb_path", "overlay_path"]
         if sample.calibration_frame != "rgb_camera":
             fields.append("depth_vis_path")
         for field_name in fields:
-            raw_path = str(getattr(sample, field_name, "") or "").strip()
-            if not raw_path:
+            path = resolve_sample_data_path(sample, field_name, data_root)
+            if path is None:
                 missing.append(f"sample={sample.index}:{field_name}:empty")
-                continue
-            path = Path(raw_path)
-            if not path.is_file():
-                missing.append(f"sample={sample.index}:{field_name}:{path}")
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             entries.append({

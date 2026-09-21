@@ -1,6 +1,8 @@
 # Python runtime cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
 
 # Camera/SDK runtime logs
 Log/
@@ -11,3 +13,11 @@ Log/
 .vscode/
 .venv/
 venv/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Locally generated inference artifacts
+*.engine

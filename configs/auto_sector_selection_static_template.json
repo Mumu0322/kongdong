@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "coordinate_mode": "static_image",
+  "partition_mode": "polygons",
+  "regions": [],
+  "image_size_px": null,
+  "origin_px": null,
+  "zero_angle_deg": 0.0,
+  "sector_count": 6,
+  "boundary_margin_deg": 2.0,
+  "dedup_distance_px": 25.0,
+  "dedup_iou_threshold": 0.5,
+  "dedup_min_size_ratio": 0.5,
+  "min_confidence": 0.35,
+  "active_sector_ids": null,
+  "roi_polygon_px": null,
+  "include_boundary_candidates": true,
+  "reference_match_distance_px": 40.0,
+  "reference_holes": [],
+  "sector_pose_records": [],
+  "notes": {
+    "partition_mode": "当前推荐polygons：用GUI视频流确认位姿并用鼠标绘制各工作区域",
+    "regions": "由GUI生成；每个区域保存前必须绑定一条当前视频帧和机械臂位姿记录",
+    "image_size_px": "由GUI从确认的视频帧写入，输入图像分辨率不一致时拒绝运行",
+    "origin_px": "仅旧radial角度模式使用；polygons模式不需要伞架中心",
+    "zero_angle_deg": "图像坐标中从origin_px指向右侧为0度，逆时针为正",
+    "roi_polygon_px": "可选；填写伞架有效区域多边形，避免背景或边缘结构被当作孔",
+    "dedup_iou_threshold": "重复检测至少需要达到该检测框IoU；中心距离不是唯一去重条件",
+    "dedup_min_size_ratio": "重复检测的短边尺寸比下限，避免不同尺度目标被误合并",
+    "reference_holes": "可选；填写工件坐标中的稳定孔位表后，报告才可核对跨次漏孔",
+    "sector_pose_records": "GUI确认当前位姿时自动写入TCP位姿、关节角、帧时间戳和帧图片路径"
+  }
+}

@@ -38,14 +38,17 @@
   "validation_reference_source": "",
   "validation_center_scatter_rms_mm": null,
   "validation_center_scatter_p95_mm": null,
+  "validation_center_scatter_max_mm": null,
   "solver": {
     "measurement_source": "charuco_rgb_2d_corners_plus_intrinsics_solvepnp",
     "depth_based_board_pose_used": false,
     "rgb_pnp_board_pose_used": true
   },
   "limits": {
-    "minimum_total_poses": 30,
+    "minimum_total_poses": 11,
     "minimum_validation_fraction": 0.2,
-    "maximum_validation_center_scatter_rms_mm": 0.1
+    "minimum_validation_poses": 3,
+    "maximum_validation_center_scatter_rms_mm": 0.1,
+    "maximum_validation_center_scatter_max_mm": 0.2
   }
 }

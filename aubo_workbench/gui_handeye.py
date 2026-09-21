@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""手眼标定的两种界面：
-1. HandEyeGuiPanel/HandEyeGuiApp —— 独立 Tk 窗口（默认入口）。
-2. main_opencv_window —— 老版 OpenCV 窗口 + 键盘快捷键，用 `--opencv-ui` 触发。
-
-两者共用同一套底层逻辑（camera / charuco_detect / quality / capture / solve），
-不重复实现任何标定算法。
-"""
+"""RGB手眼标定界面：采集、求解、独立验证。"""
 
 from __future__ import annotations
 
@@ -16,24 +10,23 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
-from .capture import capture_burst_samples, capture_burst_samples_gui
+from .capture import capture_burst_samples_gui
 from .camera import get_rgb_frame_bundle, init_rgb_handeye_pipeline, print_device_info
 from .charuco_detect import create_charuco_board, estimate_rgb_board_pose
-from .config import CAMERA_CFG, E7_HAND_EYE_CFG, ESC_KEY, ROBOT_CFG, SOLVE_CFG
+from .config import CAMERA_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOLVE_CFG
 from .e7_handeye import run_e7_cross_validation
-from .gui_common import GuiLogWriter, parse_manual_pose_text
+from .gui_common import GuiLogWriter
 from .io_utils import make_dir
 from .quality import evaluate_image_quality
 from .robot import AUBO_SESSION, close_aubo_session
-from .samples import CalibSample, archive_samples, load_existing_samples
-from .solve import auto_prune_and_save, solve_and_save
-from .visualization import compose_display
-
+from .samples import CalibSample, archive_samples, load_existing_samples, next_available_sample_index
+from .solve import format_handeye_summary, solve_and_save
 try:
     from PIL import Image, ImageTk  # type: ignore
 except Exception:  # pragma: no cover
@@ -41,17 +34,23 @@ except Exception:  # pragma: no cover
     ImageTk = None  # type: ignore
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 def _format_e7_candidate_summary(result: dict[str, Any]) -> str:
     """格式化当前扁平E7候选结构；避免GUI继续依赖已经移除的旧嵌套字段。"""
     validation_rms = float(result["validation_center_scatter_rms_mm"])
+    raw_validation_max = result.get("validation_center_scatter_max_mm")
+    validation_max = (
+        f"{float(raw_validation_max):.3f} mm"
+        if raw_validation_max is not None else "未知"
+    )
     validation_pass = bool(result.get("validation_numeric_pass", False))
     return (
-        f"[E7] 候选已生成，validation RMS={validation_rms:.6f} mm；"
-        f"数值验证={'通过' if validation_pass else '不通过'}；"
-        "仍需独立复核后才能安装。"
+        f"结论：独立验证{'数值达标，待复核' if validation_pass else '未达标'}\n"
+        f"验证平移 RMS {validation_rms:.3f} mm，最大 {validation_max}\n"
+        f"目标：RMS ≤ {E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm:.2f} mm，"
+        f"最大 ≤ {E7_HAND_EYE_CFG.maximum_validation_center_scatter_max_mm:.2f} mm"
     )
 
 
@@ -66,6 +65,8 @@ def load_active_rgb_samples() -> list[CalibSample]:
         sample for sample in loaded
         if str(sample.calibration_frame or "").strip().lower() != "rgb_camera"
     ]
+    if not rgb_samples:
+        print("[E7] 当前没有活动RGB样本；保留已有固定验证分组，避免自动重选留出集。")
     if legacy_samples:
         archive_dir = archive_samples(
             legacy_samples,
@@ -91,13 +92,16 @@ class HandEyeGuiPanel(ttk.Frame):
         self.command_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
+        self.worker_sample_dir: Path | None = None
         self.photo_image: Any | None = None
 
         self.ip_var = tk.StringVar(value=ROBOT_CFG.ip)
         self.port_var = tk.StringVar(value=str(ROBOT_CFG.rpc_port))
         self.user_var = tk.StringVar(value=ROBOT_CFG.user)
         self.password_var = tk.StringVar(value=ROBOT_CFG.password)
-        self.pose_source_var = tk.StringVar(value=ROBOT_CFG.pose_source)
+        self.controller_pose_var = tk.StringVar(value="未连接")
+        self.controller_offset_var = tk.StringVar(value="未读取")
+        self._last_pose_poll = 0.0
         self.save_dir_var = tk.StringVar(value=CAMERA_CFG.save_dir)
         self.output_json_var = tk.StringVar(value=SOLVE_CFG.output_json)
 
@@ -106,6 +110,7 @@ class HandEyeGuiPanel(ttk.Frame):
         self.sample_status_var = tk.StringVar(value="0")
         self.quality_status_var = tk.StringVar(value="等待画面")
         self.output_status_var = tk.StringVar(value=SOLVE_CFG.output_json)
+        self.result_var = tk.StringVar(value="尚未求解")
 
         self._build_ui()
         self.after(120, self._poll_queues)
@@ -132,8 +137,9 @@ class HandEyeGuiPanel(ttk.Frame):
         ttk.Label(config, text="机械臂连接参数使用工作台顶部统一设置。", foreground="#555555").grid(
             row=0, column=0, columnspan=4, sticky="w", padx=(0, 12), pady=3
         )
-        ttk.Label(config, text="位姿源").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=3)
-        ttk.Combobox(config, textvariable=self.pose_source_var, values=("tcp", "tool"), width=8, state="readonly").grid(row=0, column=5, sticky="w", pady=3)
+        ttk.Label(config, text="位姿源：控制器当前 TCP / 基坐标系").grid(
+            row=0, column=4, columnspan=2, sticky="w", pady=3,
+        )
 
         ttk.Label(config, text="采集目录").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=3)
         ttk.Entry(config, textvariable=self.save_dir_var).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=3)
@@ -154,22 +160,21 @@ class HandEyeGuiPanel(ttk.Frame):
         self.connect_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.disconnect_btn = ttk.Button(toolbar, text="断开机械臂", command=lambda: self.enqueue_command("disconnect"))
         self.disconnect_btn.pack(side=tk.LEFT, padx=(0, 14))
-        self.capture_btn = ttk.Button(toolbar, text="采集5帧选1帧", command=lambda: self.enqueue_command("capture"))
+        self.capture_btn = ttk.Button(
+            toolbar, text="采集5帧选1帧", command=lambda: self.enqueue_command("capture"),
+        )
         self.capture_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.solve_btn = ttk.Button(toolbar, text="诊断求解(≥8)", command=lambda: self.enqueue_command("solve"))
+        self.solve_btn = ttk.Button(toolbar, text="求解标定", command=lambda: self.enqueue_command("solve"))
         self.solve_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.e7_btn = ttk.Button(
             toolbar,
-            text=f"E7独立验证(≥{E7_HAND_EYE_CFG.minimum_total_poses})",
+            text="独立验证",
             command=self.request_e7_validation,
         )
         self.e7_btn.pack(side=tk.LEFT, padx=(0, 12))
         self.maintenance_btn = ttk.Menubutton(toolbar, text="样本维护")
         maintenance_menu = tk.Menu(self.maintenance_btn, tearoff=False)
-        maintenance_menu.add_command(label="自动剔除并诊断", command=lambda: self.enqueue_command("prune"))
         maintenance_menu.add_command(label="归档最后样本", command=lambda: self.enqueue_command("delete_last"))
-        maintenance_menu.add_separator()
-        maintenance_menu.add_command(label="手动 TCP 位姿", command=self.set_manual_pose_gui)
         self.maintenance_btn.configure(menu=maintenance_menu)
         self.maintenance_btn.pack(side=tk.LEFT)
 
@@ -182,6 +187,8 @@ class HandEyeGuiPanel(ttk.Frame):
         self._status_label(status, 0, 4, "样本数", self.sample_status_var)
         self._status_label(status, 0, 6, "质量", self.quality_status_var)
         self._status_label(status, 1, 0, "输出", self.output_status_var, columnspan=7)
+        self._status_label(status, 2, 0, "当前TCP", self.controller_pose_var, columnspan=7)
+        self._status_label(status, 3, 0, "实际偏置", self.controller_offset_var, columnspan=7)
 
         content = ttk.Frame(root)
         content.pack(fill=tk.BOTH, expand=True)
@@ -191,25 +198,40 @@ class HandEyeGuiPanel(ttk.Frame):
         self.video_label = ttk.Label(left, anchor="center", background="#111111")
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        right = ttk.Frame(content, width=380)
-        right.pack(side=tk.RIGHT, fill=tk.Y)
-        right.pack_propagate(False)
-
-        guide = ttk.LabelFrame(right, text="操作流程")
-        guide.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(
-            guide,
-            text=(
-                "1. 启动相机并确认画面合格\n"
-                "2. 点击连接机械臂\n"
-                "3. 每换一个稳定姿态，采集5帧选1帧（RGB角点+PnP）\n"
-                f"4. ≥{SOLVE_CFG.min_samples_for_solve}组只能诊断；"
-                f"E7需≥{E7_HAND_EYE_CFG.minimum_total_poses}组并预先独立留出验证集\n"
-                "5. E7只接受TCP位姿、RGB内参、完整原始文件和稳定夹持记录\n"
-                "6. E7候选仍需复核，不会直接解锁运动"
+        right_shell = ttk.Frame(content, width=400)
+        right_shell.pack(side=tk.RIGHT, fill=tk.Y)
+        right_shell.pack_propagate(False)
+        right_canvas = tk.Canvas(
+            right_shell, highlightthickness=0, borderwidth=0,
+        )
+        right_scrollbar = ttk.Scrollbar(
+            right_shell, orient=tk.VERTICAL, command=right_canvas.yview,
+        )
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        right = ttk.Frame(right_canvas)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind(
+            "<Configure>",
+            lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")),
+        )
+        right_canvas.bind(
+            "<Configure>",
+            lambda event: right_canvas.itemconfigure(
+                right_window, width=max(1, int(event.width)),
             ),
-            justify=tk.LEFT,
-        ).pack(anchor="w", padx=6, pady=6)
+        )
+        self.right_canvas = right_canvas
+        self.right_scrollbar = right_scrollbar
+
+        result_frame = ttk.LabelFrame(right, text="标定结果")
+        result_frame.pack(fill=tk.X, pady=(0, 8))
+        result_label = ttk.Label(result_frame, textvariable=self.result_var, justify=tk.LEFT)
+        result_label.pack(fill=tk.X, padx=6, pady=6)
+        result_frame.bind(
+            "<Configure>", lambda event: result_label.configure(wraplength=max(100, event.width - 32)),
+        )
 
         log_frame = ttk.LabelFrame(right, text="日志")
         log_frame.pack(fill=tk.BOTH, expand=True)
@@ -257,7 +279,6 @@ class HandEyeGuiPanel(ttk.Frame):
         ip = self.ip_var.get().strip()
         user = self.user_var.get().strip()
         password = self.password_var.get()
-        pose_source = self.pose_source_var.get().strip().lower()
         save_dir = self.save_dir_var.get().strip()
         output_json = self.output_json_var.get().strip()
         try:
@@ -266,8 +287,6 @@ class HandEyeGuiPanel(ttk.Frame):
                 raise ValueError("机械臂 IP 不能为空")
             if port <= 0 or port > 65535:
                 raise ValueError("端口必须在 1-65535")
-            if pose_source not in ("tcp", "tool"):
-                raise ValueError("位姿源只能是 tcp 或 tool")
             if not save_dir:
                 raise ValueError("采集目录不能为空")
             if not output_json:
@@ -276,31 +295,42 @@ class HandEyeGuiPanel(ttk.Frame):
             messagebox.showerror("配置错误", str(exc))
             return False
 
+        configured_dir = Path(save_dir).expanduser().resolve()
+        if (
+            self.worker_thread is not None
+            and self.worker_alive()
+            and self.worker_sample_dir is not None
+            and configured_dir != self.worker_sample_dir
+        ):
+            messagebox.showerror(
+                "不能切换采集目录",
+                "相机运行期间不能更改采集目录。请先停止相机，修改目录后重新启动，"
+                "避免内存样本和磁盘样本混用。",
+            )
+            return False
+
         ROBOT_CFG.ip = ip
         ROBOT_CFG.rpc_port = port
         ROBOT_CFG.user = user
         ROBOT_CFG.password = password
-        ROBOT_CFG.pose_source = pose_source
         CAMERA_CFG.save_dir = save_dir
         SOLVE_CFG.output_json = output_json
         self.output_status_var.set(output_json)
         return True
 
-    def set_manual_pose_gui(self) -> None:
-        text = simpledialog.askstring(
-            "手动TCP位姿", "请输入 AUBO 当前 TCP 位姿：x y z rx ry rz\n单位：m / rad，可用空格或逗号分隔", parent=self,
+    def _publish_controller_pose(self, snapshot: dict[str, Any]) -> None:
+        pose = snapshot["pose_values"]
+        offset = snapshot["actual_tcp_offset_sdk_m_rad"]
+        offset_mm_deg = [v * 1000.0 for v in offset[:3]] + np.rad2deg(offset[3:]).tolist()
+
+        def format_pose(values) -> str:
+            xyz = ", ".join(f"{v:.3f}" for v in values[:3])
+            rpy = ", ".join(f"{v:.3f}" for v in values[3:])
+            return f"XYZ [mm]: {xyz}    Rx/Ry/Rz [deg]: {rpy}"
+
+        self._worker_status(
+            controller_pose=format_pose(pose), controller_offset=format_pose(offset_mm_deg),
         )
-        if text is None:
-            return
-        try:
-            vals = parse_manual_pose_text(text)
-        except ValueError as exc:
-            messagebox.showerror("输入错误", str(exc))
-            return
-        ROBOT_CFG.manual_pose_sdk_m_rad = vals  # type: ignore[assignment]
-        self.log_queue.put(f"[GUI] 已设置手动 TCP 位姿 m/rad: {vals}\n")
-        if self.worker_alive():
-            self.command_queue.put(("manual_pose", vals))
 
     # ---------------- 后台线程管理 ----------------
 
@@ -312,6 +342,7 @@ class HandEyeGuiPanel(ttk.Frame):
             return
         if not self.apply_form_config():
             return
+        self.worker_sample_dir = Path(CAMERA_CFG.save_dir).expanduser().resolve()
         self.stop_event.clear()
         self.worker_thread = threading.Thread(target=self._worker_main, name="handeye-gui-worker", daemon=True)
         self.worker_thread.start()
@@ -353,7 +384,7 @@ class HandEyeGuiPanel(ttk.Frame):
             pass
 
     def _drain_worker_commands(
-        self, pipeline, align_filter, point_cloud_filter, board, dictionary,
+        self, pipeline, board, dictionary,
         next_index: int, samples: list[CalibSample],
     ) -> tuple[int, list[CalibSample]]:
         while True:
@@ -373,37 +404,36 @@ class HandEyeGuiPanel(ttk.Frame):
                     pose_values = snap.get("named_pose_values", {})
                     print(f"[AUBO] GUI连接成功：{AUBO_SESSION.robot_name} {AUBO_SESSION.robot_type} pose={pose_values}")
                     self._worker_status(robot=f"已连接 {AUBO_SESSION.robot_name} {AUBO_SESSION.robot_type}")
+                    self._publish_controller_pose(snap)
                 elif command == "disconnect":
                     close_aubo_session()
                     print("[AUBO] 已断开机械臂")
                     self._worker_status(robot="已断开")
-                elif command == "manual_pose":
-                    ROBOT_CFG.manual_pose_sdk_m_rad = payload  # type: ignore[assignment]
-                    print(f"[GUI] 手动 TCP 位姿已更新：{payload}")
+                    self._worker_status(controller_pose="未连接", controller_offset="未读取")
                 elif command == "capture":
                     if pipeline is None:
                         print("[GUI] 相机未就绪，不能采集样本。")
                     else:
                         next_index = capture_burst_samples_gui(
-                            pipeline, align_filter, point_cloud_filter, board, dictionary,
+                            pipeline, board, dictionary,
                             next_index, samples, publish_display=self._put_display, stop_event=self.stop_event,
                         )
-                        self._worker_status(samples=str(len(samples)))
+                        self._worker_status(samples=str(len(samples)), result="样本已更新，请重新求解")
                 elif command == "solve":
                     result = solve_and_save(samples)
                     if result is not None:
-                        self._worker_status(output=SOLVE_CFG.output_json)
+                        self._worker_status(output=SOLVE_CFG.output_json, result=format_handeye_summary(result))
+                    else:
+                        self._worker_status(result="样本不足，无法求解")
                 elif command == "validate_e7":
                     result = run_e7_cross_validation(
                         samples,
                         fixed_board_confirmed=bool((payload or {}).get("fixed_board_confirmed", False)),
                     )
                     print(_format_e7_candidate_summary(result))
-                    self._worker_status(output=str(result.get("candidate_path", "")))
-                elif command == "prune":
-                    samples = auto_prune_and_save(samples)
-                    next_index = max([s.index for s in samples], default=0) + 1
-                    self._worker_status(samples=str(len(samples)), output=SOLVE_CFG.output_json)
+                    self._worker_status(
+                        output=str(result.get("candidate_path", "")), result=_format_e7_candidate_summary(result),
+                    )
                 elif command == "delete_last":
                     if samples:
                         removed = samples[-1]
@@ -412,23 +442,22 @@ class HandEyeGuiPanel(ttk.Frame):
                             [removed], remaining, reason="user_removed_last_sample",
                         )
                         samples = remaining
-                        next_index = max([s.index for s in samples], default=0) + 1
+                        next_index = next_available_sample_index(samples)
                         print(
                             f"[GUI] 已归档最后一个样本 index={removed.index}，"
                             f"活动CSV已同步：{archive_dir}"
                         )
                     else:
                         print("[GUI] 当前没有可删除样本。")
-                    self._worker_status(samples=str(len(samples)))
+                    self._worker_status(samples=str(len(samples)), result="样本已更新，请重新求解")
             except Exception as exc:
+                self._worker_status(result=f"操作失败：{exc}")
                 print(f"[GUI-ERROR] 命令 {command} 执行失败：{exc}")
                 print(traceback.format_exc())
         return next_index, samples
 
     def _worker_main(self) -> None:
         pipeline = None
-        align_filter = None
-        point_cloud_filter = None
         samples: list[CalibSample] = []
         next_index = 1
         try:
@@ -436,17 +465,16 @@ class HandEyeGuiPanel(ttk.Frame):
             print("AUBO 眼在手 RGB-PnP 手眼标定 GUI")
             print("Camera save_dir:", CAMERA_CFG.save_dir)
             print("Output json:", SOLVE_CFG.output_json)
-            print(f"AUBO: {ROBOT_CFG.ip}:{ROBOT_CFG.rpc_port}, pose_source={ROBOT_CFG.pose_source}")
+            print(f"AUBO: {ROBOT_CFG.ip}:{ROBOT_CFG.rpc_port}, 自动读取控制器当前TCP")
             print("=" * 70)
 
+            self.worker_sample_dir = Path(CAMERA_CFG.save_dir).expanduser().resolve()
             make_dir(CAMERA_CFG.save_dir)
-            from pathlib import Path
-
             make_dir(Path(SOLVE_CFG.output_json).parent)
             board, dictionary = create_charuco_board()
             samples = load_active_rgb_samples()
-            next_index = max([s.index for s in samples], default=0) + 1
-            self._worker_status(samples=str(len(samples)), output=SOLVE_CFG.output_json)
+            next_index = next_available_sample_index(samples)
+            self._worker_status(samples=str(len(samples)), output=SOLVE_CFG.output_json, result="尚未求解")
 
             if print_device_info():
                 try:
@@ -464,8 +492,14 @@ class HandEyeGuiPanel(ttk.Frame):
 
             while not self.stop_event.is_set():
                 next_index, samples = self._drain_worker_commands(
-                    pipeline, align_filter, point_cloud_filter, board, dictionary, next_index, samples,
+                    pipeline, board, dictionary, next_index, samples,
                 )
+                if AUBO_SESSION.connected and time.monotonic() - self._last_pose_poll >= 1.0:
+                    self._last_pose_poll = time.monotonic()
+                    try:
+                        self._publish_controller_pose(AUBO_SESSION.read_pose_snapshot())
+                    except Exception as exc:
+                        self._worker_status(controller_pose=f"读取失败：{exc}", controller_offset="未读取")
                 if pipeline is None:
                     time.sleep(0.15)
                     continue
@@ -475,14 +509,9 @@ class HandEyeGuiPanel(ttk.Frame):
                     time.sleep(0.01)
                     continue
                 color_bgr = bundle.color_bgr
-                depth_mm = np.zeros(color_bgr.shape[:2], dtype=np.float32)
                 pose_result = estimate_rgb_board_pose(color_bgr, bundle.intrinsics, board, dictionary)
                 quality = evaluate_image_quality(color_bgr, pose_result)
-                display = compose_display(
-                    pose_result.rgb_overlay, depth_mm, len(samples), quality=quality,
-                    good_frame_count=0, auto_enabled=False, cooldown_left_s=0.0,
-                )
-                self._put_display(display)
+                self._put_display(pose_result.rgb_overlay)
                 self._worker_status(samples=str(len(samples)), quality=f"{quality.score:.1f}/100 {quality.label}")
         except Exception as exc:
             print("[GUI-ERROR] 工作线程异常：", exc)
@@ -495,7 +524,8 @@ class HandEyeGuiPanel(ttk.Frame):
             except Exception:
                 pass
             close_aubo_session()
-            self._worker_status(camera="已停止", robot="已断开")
+            self.worker_sample_dir = None
+            self._worker_status(camera="已停止", robot="已断开", controller_pose="未连接", controller_offset="未读取")
             print("[GUI] 已停止相机并断开 AUBO 会话。")
 
     # ---------------- UI 刷新 ----------------
@@ -533,7 +563,12 @@ class HandEyeGuiPanel(ttk.Frame):
                 self.quality_status_var.set(status["quality"])
             if "output" in status:
                 self.output_status_var.set(status["output"])
-
+            if "result" in status:
+                self.result_var.set(status["result"])
+            if "controller_pose" in status:
+                self.controller_pose_var.set(status["controller_pose"])
+            if "controller_offset" in status:
+                self.controller_offset_var.set(status["controller_offset"])
         self._update_button_state()
         self.after(80, self._poll_queues)
 
@@ -605,106 +640,5 @@ def main_gui() -> None:
         sys.stderr = old_stderr
 
 
-def main_opencv_window() -> None:
-    """老版纯 OpenCV 窗口 + 键盘操作，保留给不想用 Tk 的场景。"""
-    make_dir(CAMERA_CFG.save_dir)
-    print("=" * 70)
-    print("Gemini 435Le + AUBO ChArUco RGB-PnP 手眼标定")
-    print("Camera save_dir:", CAMERA_CFG.save_dir)
-    print("Output json:", SOLVE_CFG.output_json)
-    print(f"AUBO: {ROBOT_CFG.ip}:{ROBOT_CFG.rpc_port}, pose_source={ROBOT_CFG.pose_source}")
-    print("操作：c采集5帧选1帧，h诊断求解，v执行E7独立验证，a自动剔除并诊断，d归档最后样本，m手动输入TCP，q/ESC退出")
-    print("=" * 70)
-
-    board, dictionary = create_charuco_board()
-    if not print_device_info():
-        return
-
-    samples = load_active_rgb_samples()
-    next_index = max([s.index for s in samples], default=0) + 1
-
-    pipeline = init_rgb_handeye_pipeline()
-    align_filter = None
-    point_cloud_filter = None
-    window_name = "Gemini435Le AUBO ChArUco RGB PnP HandEye"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1600, 900)
-
-    try:
-        while True:
-            bundle = get_rgb_frame_bundle(pipeline)
-            if bundle is None:
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ESC_KEY):
-                    break
-                continue
-            color_bgr = bundle.color_bgr
-            depth_mm = np.zeros(color_bgr.shape[:2], dtype=np.float32)
-            pose_result = estimate_rgb_board_pose(color_bgr, bundle.intrinsics, board, dictionary)
-            quality = evaluate_image_quality(color_bgr, pose_result)
-
-            display = compose_display(
-                pose_result.rgb_overlay, depth_mm, len(samples), quality=quality,
-                good_frame_count=0, auto_enabled=False, cooldown_left_s=0.0,
-            )
-            cv2.imshow(window_name, display)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key in (ord("q"), ESC_KEY):
-                break
-            if key == ord("m"):
-                from .robot import set_manual_pose_from_console
-
-                set_manual_pose_from_console()
-                continue
-            if key == ord("d"):
-                if samples:
-                    removed = samples[-1]
-                    remaining = list(samples[:-1])
-                    archive_dir = archive_samples(
-                        [removed], remaining, reason="user_removed_last_sample_opencv_ui",
-                    )
-                    samples = remaining
-                    next_index = max([s.index for s in samples], default=0) + 1
-                    print(f"[INFO] 已归档最后一个样本 index={removed.index}：{archive_dir}")
-                else:
-                    print("[INFO] 当前没有可归档样本")
-                continue
-            if key == ord("h"):
-                solve_and_save(samples)
-                continue
-            if key == ord("v"):
-                confirmation = input("确认本批全部样本采集期间标定板始终固定？输入 YES 继续：").strip()
-                if confirmation == "YES":
-                    result = run_e7_cross_validation(samples, fixed_board_confirmed=True)
-                    print(f"[E7] 已生成待复核候选：{result.get('candidate_path')}")
-                else:
-                    print("[E7] 未确认固定标定板，已取消。")
-                continue
-            if key == ord("a"):
-                samples = auto_prune_and_save(samples)
-                next_index = max([s.index for s in samples], default=0) + 1
-                continue
-            if key == ord("c"):
-                next_index = capture_burst_samples(
-                    pipeline, align_filter, point_cloud_filter, board, dictionary, next_index, samples, window_name,
-                )
-                continue
-
-    except KeyboardInterrupt:
-        print("[INFO] 用户中断")
-    finally:
-        try:
-            pipeline.stop()
-        except Exception:
-            pass
-        close_aubo_session()
-        cv2.destroyAllWindows()
-        print("[INFO] pipeline 已关闭")
-
-
 def main() -> None:
-    if "--opencv-ui" in sys.argv:
-        main_opencv_window()
-        return
     main_gui()

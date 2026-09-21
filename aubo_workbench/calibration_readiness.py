@@ -9,24 +9,8 @@ import math
 import re
 from pathlib import Path
 
-import numpy as np
-
 from .config import E7_HAND_EYE_CFG, ROBOT_CAMERA_INTEGRATION_CFG, RobotCameraIntegrationConfig
-
-
-def _valid_rigid_transform(value) -> bool:
-    try:
-        matrix = np.asarray(value, dtype=np.float64)
-    except (TypeError, ValueError):
-        return False
-    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
-        return False
-    rotation = matrix[:3, :3]
-    return bool(
-        np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
-        and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
-        and np.isclose(np.linalg.det(rotation), 1.0, atol=1e-4)
-    )
+from .geometry import valid_rigid_transform as _valid_rigid_transform
 
 
 def _read_json(path: Path) -> tuple[dict | None, str | None]:
@@ -127,6 +111,7 @@ def assess_handeye_cross_validation(
     result_indices = None
     result_rows_valid = False
     result_rows_rms_matches = False
+    result_rows_max_matches = False
     validation_regions: set[str] = set()
     if isinstance(result_rows, list):
         try:
@@ -147,10 +132,17 @@ def assess_handeye_cross_validation(
                 rel_tol=1e-9,
                 abs_tol=1e-9,
             )
+            result_rows_max_matches = math.isclose(
+                max(row_scatter),
+                float(data.get("validation_center_scatter_max_mm")),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             result_indices = None
             result_rows_valid = False
             result_rows_rms_matches = False
+            result_rows_max_matches = False
     manifest = data.get("raw_data_manifest")
     manifest_files = manifest.get("files") if isinstance(manifest, dict) else None
     manifest_complete = bool(
@@ -171,7 +163,8 @@ def assess_handeye_cross_validation(
     try:
         split_valid = (
             int(total_poses) == int(calibration_poses) + int(validation_poses)
-            and int(validation_poses) / int(total_poses) >= 0.20
+            and int(validation_poses) / int(total_poses)
+            >= float(E7_HAND_EYE_CFG.minimum_validation_fraction)
         )
         calibration_count_int = int(calibration_poses)
         validation_count_int = int(validation_poses)
@@ -179,6 +172,8 @@ def assess_handeye_cross_validation(
         split_valid = False
         calibration_count_int = -1
         validation_count_int = -1
+    dataset_preflight = data.get("dataset_preflight")
+    preflight_checks = dataset_preflight.get("checks", {}) if isinstance(dataset_preflight, dict) else {}
     checks = {
         "evidence_available": payload is not None,
         "record_type_valid": data.get("record_type") == "e7_handeye_cross_validation",
@@ -187,7 +182,8 @@ def assess_handeye_cross_validation(
         "candidate_motion_lock_explicitly_cleared": data.get("do_not_use_for_motion") is False,
         "production_eligible_explicitly_confirmed": data.get("production_eligible") is True,
         "production_camera_serial_matches": (
-            str(data.get("camera_serial") or "").strip()
+            bool(str(cfg.production_camera_serial).strip())
+            and str(data.get("camera_serial") or "").strip()
             == str(cfg.production_camera_serial).strip()
         ),
         "robot_identified": _string(data, "robot_id"),
@@ -228,6 +224,7 @@ def assess_handeye_cross_validation(
             and sorted(result_indices) == sorted(validation_indices)
         ),
         "validation_result_rows_match_reported_rms": bool(result_rows_valid and result_rows_rms_matches),
+        "validation_result_rows_match_reported_max": bool(result_rows_valid and result_rows_max_matches),
         "validation_rows_cover_center_and_two_edges": bool(
             "center" in validation_regions
             and len(validation_regions & {"left", "right", "top", "bottom"}) >= 2
@@ -243,12 +240,26 @@ def assess_handeye_cross_validation(
             and data["solver"].get("rgb_pnp_board_pose_used") is True
             and data["solver"].get("depth_based_board_pose_used") is False
         ),
+        "dataset_preflight_camera_session_consistent": bool(
+            preflight_checks.get("camera_profile_consistent") is True
+            and preflight_checks.get("camera_serial_recorded") is True
+        ),
+        "dataset_preflight_tcp_session_consistent": bool(
+            preflight_checks.get("tcp_offset_metadata_complete") is True
+            and preflight_checks.get("tcp_offset_consistent") is True
+            and preflight_checks.get("actual_configured_tcp_offset_match") is True
+        ),
         "validation_reference_is_from_calibration_set": bool(
             data.get("validation_reference_source") == "calibration_set_T_base_board_mean"
             and _valid_rigid_transform(data.get("T_base_board_reference_from_calibration"))
         ),
         "validation_scatter_rms_within_0_10_mm": _at_most(
-            data.get("validation_center_scatter_rms_mm"), 0.10,
+            data.get("validation_center_scatter_rms_mm"),
+            float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm),
+        ),
+        "validation_scatter_max_within_0_20_mm": _at_most(
+            data.get("validation_center_scatter_max_mm"),
+            float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_max_mm),
         ),
     }
     return _evidence_result(

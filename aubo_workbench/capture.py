@@ -8,17 +8,15 @@ from dataclasses import asdict
 import time
 from typing import Any, Callable
 
-import cv2
 import numpy as np
 
 from .charuco_detect import BoardPoseResult, estimate_rgb_board_pose
 from .config import AUTO_CAPTURE_CFG, E7_HAND_EYE_CFG, SOLVE_CFG
 from .drawing import draw_unicode_text
-from .geometry import circular_angle_abs_diff_deg, angle_span_deg as circular_angle_span_deg
+from .geometry import circular_angle_abs_diff_deg, angle_span_deg as circular_angle_span_deg, rotation_error_deg
 from .quality import evaluate_image_quality
 from .robot import get_capture_pose_transform
 from .samples import CalibSample, save_sample
-from .visualization import compose_display
 from .io_utils import timestamp_str
 
 
@@ -52,6 +50,44 @@ def board_view_metadata(pose_result: BoardPoseResult, image_shape: tuple[int, ..
     }
 
 
+def _session_consistency_errors(samples: list[CalibSample], candidate: CalibSample) -> list[str]:
+    """阻止把不同TCP、相机或位姿源混进同一手眼数据集。"""
+    try:
+        from .e7_handeye import _camera_profile_signature, _camera_serial, _tcp_offset_consistency
+
+        all_samples = [*samples, candidate]
+        errors: list[str] = []
+        pose_sources = {
+            str((sample.robot_snapshot or {}).get("pose_source") or "").strip().lower()
+            for sample in all_samples
+        }
+        if len(pose_sources) != 1:
+            errors.append(f"位姿源不一致: {sorted(pose_sources)}")
+
+        camera_serials = [_camera_serial(sample) for sample in all_samples]
+        if not camera_serials or not all(camera_serials) or len(set(camera_serials)) != 1:
+            errors.append(f"相机序列号不一致或缺失: {sorted(set(camera_serials))}")
+
+        profile_signatures = {_camera_profile_signature(sample) for sample in all_samples}
+        if len(profile_signatures) != 1:
+            errors.append("相机分辨率、内参、设备信息或RGB采集模式发生变化")
+
+        tcp_report = _tcp_offset_consistency(all_samples, E7_HAND_EYE_CFG)
+        if not tcp_report["actual_metadata_complete"]:
+            errors.append("存在样本缺少实际TCP偏移记录")
+        elif not tcp_report["actual_offset_consistent"]:
+            errors.append(
+                "实际TCP偏移发生变化: "
+                f"XYZ最大差={tcp_report['actual_offset_max_xyz_delta_mm']:.4f} mm, "
+                f"RPY最大差={tcp_report['actual_offset_max_rpy_delta_deg']:.4f} deg"
+            )
+        if tcp_report["configured_metadata_complete"] and not tcp_report["actual_configured_offsets_match"]:
+            errors.append("控制器配置TCP与实际TCP偏移不一致")
+        return errors
+    except Exception as exc:
+        return [f"采集会话一致性检查失败: {exc}"]
+
+
 def pose_bracket_report(
     before_snapshot: dict[str, Any] | None,
     after_snapshot: dict[str, Any] | None,
@@ -69,8 +105,31 @@ def pose_bracket_report(
     xyz_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_xyz_mm)
     abc_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_abc_deg)
     ok = float(np.max(xyz_delta)) <= xyz_limit and float(np.max(abc_delta)) <= abc_limit
+    active_tcp = any(
+        (snapshot or {}).get("pose_source_selection") == "controller_active_tcp"
+        for snapshot in (before_snapshot, after_snapshot)
+    )
+    offset_stable = True
+    if active_tcp:
+        from .robot import AUBO_SESSION
+
+        try:
+            offsets = [
+                AUBO_SESSION.pose_sdk_to_transform_mm(snapshot["actual_tcp_offset_sdk_m_rad"])
+                for snapshot in (before_snapshot, after_snapshot)
+            ]
+            offset_stable = bool(
+                np.max(np.abs(offsets[0][:3, 3] - offsets[1][:3, 3]))
+                <= E7_HAND_EYE_CFG.maximum_tcp_offset_xyz_delta_mm
+                and rotation_error_deg(offsets[0][:3, :3], offsets[1][:3, :3])
+                <= E7_HAND_EYE_CFG.maximum_tcp_offset_rpy_delta_deg
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            offset_stable = False
+        ok = ok and offset_stable
     return {
         "ok": bool(ok),
+        "actual_tcp_offset_stable": offset_stable if active_tcp else None,
         "xyz_delta_mm": xyz_delta.tolist(),
         "abc_delta_deg": abc_delta.tolist(),
         "xyz_limit_mm": xyz_limit,
@@ -194,17 +253,17 @@ def save_burst_single_frame_sample(
     reject_unstable = bool(AUTO_CAPTURE_CFG.reject_unstable_burst_pose)
     if not ok and reject_unstable:
         print(f"[BURST-REJECT] 五帧期间 TCP 未稳定，本次不保存。{stability_msg}")
-        print("[BURST-REJECT] 请确认机器人完全停止后等待 1~2 秒，再按 c 采集。")
+        print("[BURST-REJECT] 请确认机器人完全停止后等待 1~2 秒，再点击采集。")
         return None, next_index
     if not ok:
         print(f"[BURST-WARN] 五帧期间 TCP 波动超过建议阈值，但当前配置允许保存。{stability_msg}")
-        print("[BURST-WARN] 该样本会写入 warning 标记，后续求解时如残差偏大再剔除。")
+        print("[BURST-WARN] 该样本会保留不稳定标记，请检查采集条件。")
 
     best_item, selection_info = select_burst_representative_frame(captures)
     if best_item is None:
         reason = selection_info.get("reason", "unknown")
         print(f"[BURST-REJECT] 五帧内没有找到重复稳定的 TCP 姿态簇，本次不保存。reason={reason}")
-        print("[BURST-REJECT] 请确认机器人完全停止后等待 1~2 秒，再按 c 采集；或检查控制器当前 TCP 读数是否在多个点之间跳变。")
+        print("[BURST-REJECT] 请确认机器人完全停止后等待 1~2 秒，再点击采集；或检查控制器当前 TCP 读数是否跳变。")
         return None, next_index
 
     selected_pose_result: BoardPoseResult = best_item["pose_result"]
@@ -250,6 +309,13 @@ def save_burst_single_frame_sample(
         board_center_uv=view["board_center_uv"], image_size_wh=view["image_size_wh"],
         view_region=view["view_region"],
     )
+    consistency_errors = _session_consistency_errors(samples, sample)
+    if consistency_errors:
+        print("[CAPTURE-REJECT] 当前帧与已有手眼采集会话不一致，本次不保存：")
+        for error in consistency_errors:
+            print(f"[CAPTURE-REJECT] - {error}")
+        print("[CAPTURE-REJECT] 如确实更换了TCP/相机，请先归档当前会话后重新开始。")
+        return None, next_index
     sample = save_sample(sample, best_item["color_bgr"], best_item["overlay_bgr"], best_item["depth_mm"])
     samples.append(sample)
     if sample.calibration_frame == "rgb_camera":
@@ -271,19 +337,19 @@ def save_burst_single_frame_sample(
     next_index += 1
     if len(samples) >= SOLVE_CFG.min_samples_for_solve:
         print(
-            f"[INFO] 样本数已满足诊断求解条件，可按 h；"
+            f"[INFO] 样本数已满足求解条件；"
             f"E7正式验证仍需至少{E7_HAND_EYE_CFG.minimum_total_poses}组及完整证据。"
         )
     return sample, next_index
 
 
 def _run_burst_loop(
-    pipeline, align_filter, point_cloud_filter, board, dictionary,
+    pipeline, board, dictionary,
     samples: list[CalibSample], on_frame: Callable[[np.ndarray, int, int, int], None] | None,
     stop_check: Callable[[], bool] | None,
     log_prefix: str,
 ) -> list[dict[str, Any]]:
-    """5 帧采集的共享主循环；OpenCV 窗口版和 GUI 版都复用这段逻辑，只是展示方式不同。"""
+    """连续读取5帧合格观测，同时核对取帧前后的机器人位姿。"""
     from .camera import get_device_identity, get_rgb_frame_bundle
 
     target_count = int(AUTO_CAPTURE_CFG.manual_burst_frames)
@@ -322,18 +388,14 @@ def _run_burst_loop(
             continue
 
         color_bgr = bundle.color_bgr
-        depth_for_display = np.zeros(color_bgr.shape[:2], dtype=np.float32)
         pose_result = estimate_rgb_board_pose(color_bgr, bundle.intrinsics, board, dictionary)
         quality = evaluate_image_quality(color_bgr, pose_result)
 
         if on_frame is not None:
-            display = compose_display(
-                pose_result.rgb_overlay.copy(), depth_for_display, len(samples), quality=quality,
-                good_frame_count=len(captures), auto_enabled=False, cooldown_left_s=0.0,
-            )
+            display = pose_result.rgb_overlay.copy()
             draw_unicode_text(
                 display, f"批量采集：第 {attempt}/{max_attempts} 次尝试，已取得 {len(captures)}/{target_count}",
-                (24, 36), (0, 220, 255), 22, 1,
+                (24, display.shape[0] - 30), (0, 220, 255), 22, 1,
             )
             on_frame(display, attempt, max_attempts, len(captures))
 
@@ -371,35 +433,13 @@ def _run_burst_loop(
     return captures
 
 
-def capture_burst_samples(
-    pipeline, align_filter, point_cloud_filter, board, dictionary,
-    next_index: int, samples: list[CalibSample], window_name: str,
-) -> int:
-    """OpenCV 窗口版：按一次 c 后连续抓取 5 帧，并从稳定姿态簇中选 1 帧保存。"""
-    target_count = int(AUTO_CAPTURE_CFG.manual_burst_frames)
-
-    def on_frame(display: np.ndarray, attempt: int, max_attempts: int, saved: int) -> None:
-        cv2.imshow(window_name, display)
-        cv2.waitKey(1)
-
-    captures = _run_burst_loop(
-        pipeline, align_filter, point_cloud_filter, board, dictionary, samples, on_frame, None, "BURST",
-    )
-    if len(captures) == target_count:
-        print(f"[BURST] 手动5帧采集完成：成功取得 {len(captures)}/{target_count} 帧，准备选择 1 帧保存为样本。")
-        _, next_index = save_burst_single_frame_sample(captures, next_index, samples)
-    else:
-        print(f"[BURST] 手动5帧采集未满：成功取得 {len(captures)}/{target_count} 帧。请按画面建议调整后再按 c 重试。")
-    return next_index
-
-
 def capture_burst_samples_gui(
-    pipeline, align_filter, point_cloud_filter, board, dictionary,
+    pipeline, board, dictionary,
     next_index: int, samples: list[CalibSample],
     publish_display: Callable[[np.ndarray], None] | None = None,
     stop_event: Any | None = None,
 ) -> int:
-    """GUI 按钮触发的 5 帧采集；算法与 OpenCV 窗口版一致，只是展示方式换成回调。"""
+    """GUI按钮触发5帧采集，从静止姿态中选一帧保存。"""
     target_count = int(AUTO_CAPTURE_CFG.manual_burst_frames)
 
     def on_frame(display: np.ndarray, attempt: int, max_attempts: int, saved: int) -> None:
@@ -410,7 +450,7 @@ def capture_burst_samples_gui(
         return bool(stop_event is not None and stop_event.is_set())
 
     captures = _run_burst_loop(
-        pipeline, align_filter, point_cloud_filter, board, dictionary, samples, on_frame, stop_check, "GUI-BURST",
+        pipeline, board, dictionary, samples, on_frame, stop_check, "GUI-BURST",
     )
     if len(captures) == target_count:
         print(f"[GUI-BURST] 已取得 {len(captures)}/{target_count} 帧，开始选择 1 帧保存为样本。")

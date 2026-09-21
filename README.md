@@ -1,187 +1,178 @@
-# AUBO + Gemini 435Le 工具集（重构版）
+# AUBO Workbench：两阶段孔洞定位工具
 
-对原来 3000+ 行单文件脚本做的整体重构。机械臂信息读取、机械臂运动控制、
-TCP 示教和手眼标定模块均保留。当前正式手眼链路使用“RGB ChArUco二维角点 +
-RGB内参 + solvePnP”，求得 `T_tcp_rgb_camera`，与YOLO/椭圆2D孔中心使用同一RGB
-光学坐标系；旧点云手眼只保留为归档诊断。手眼流程仍拆成“≥8组诊断求解”和
-“≥11组E7独立验证”，诊断结果不能直接用于运动。
+当前项目使用 AUBO 机械臂、Orbbec Gemini 435Le、YOLO 和 RGB-D 完成孔洞定位、在手标定、TCP 示教以及夹爪控制。
 
-## 目录结构
+自动流程的“原点”优先读取 AUBO 控制器中保存的 `getHomePosition()` 关节原点；
+`data/aubo_home_point.json` 只作为控制器读取失败时的软件备用点。两者不是同一份数据，
+修改示教器原点后无需把旧 JSON 当作新的控制器原点，但应在启动定位前确认控制器原点和当前 TCP 配置一致。
 
-```
-aubo_workbench_project/
-├── run_workbench.py      # 默认入口：工作台（机械臂信息/运动控制/TCP示教/手眼标定）
-├── run_handeye.py         # 只启动手眼标定（Tk GUI 或 --opencv-ui 旧版窗口）
-├── run_robot_info.py      # 命令行只读查询机械臂信息
-└── aubo_workbench/        # 核心包
-    ├── config.py           # 所有可调参数（dataclass 单例，集中管理）
-    ├── geometry.py         # 4x4 变换、旋转、位姿格式转换（纯数学，无副作用）
-    ├── io_utils.py         # 文件系统小工具
-    ├── camera.py           # Gemini 435Le 相机封装
-    ├── robot.py            # AUBO 只读位姿会话（手眼标定专用）
-    ├── charuco_detect.py   # ChArUco检测 + 正式RGB-PnP板位姿 + 旧点云诊断
-    ├── drawing.py          # OpenCV 中文绘制、面板等 UI 基础组件
-    ├── visualization.py    # 采集主界面合成（RGB+深度+质量看板）
-    ├── quality.py          # 画面质量评分
-    ├── samples.py          # 标定样本持久化（JSON/CSV/归档）
-    ├── solve.py            # RGB/旧点云坐标源隔离的诊断求解与冲突分析
-    ├── e7_handeye.py       # RGB手眼E7预先留出验证、原始数据清单和候选输出
-    ├── capture.py          # 单帧/五帧批量采集
-    ├── gui_common.py       # GUI 通用小工具
-    ├── gui_handeye.py      # 手眼标定 GUI + OpenCV 窗口入口
-    ├── robot_info.py       # 机械臂信息只读查询（CLI + 库函数）
-    ├── motion_control.py   # 机械臂上下电、点动、点位和复位控制
-    ├── tcp_teach.py        # TCP 示教工具（4点法/3点法）
-    └── workbench.py        # 工作台主窗口
-```
+## 手眼标定
 
-TCP 示教页会分别显示机器人基坐标系下的当前法兰和 TCP `XYZ (mm)`，并保留
-SDK 原始的 `m/rad` 六维位姿用于核查。AUBO `tcpOffsetIdentify()` 四点法返回
-TCP 相对法兰的平移 `XYZ` 三项；程序会保留当前 TCP 的姿态三项，组成可继续
-做姿态标定的完整六维偏移。计算后还会单独显示多姿态共同接触点在机器人
-基坐标系下的 `XYZ (mm)`，避免把法兰系 TCP 偏移误当成基坐标位置。
+工作台手眼页保留采集、求解、独立验证和手动归档样本。旧 `--opencv-ui` 界面、
+自动按残差删点、贪心试删子集和空深度看板已移除。历史采集文件与归档保留。
 
-## 这次做了什么
+位姿自动读取控制器当前生效的 TCP（`getTcpPose`，相对机器人基坐标系），
+同时读取实际 TCP 偏置 `getActualTcpOffset`，并校验法兰位姿乘偏置是否与 TCP 一致。
+界面显示实时 XYZ / RxRyRz 和实际偏置，无需选择 `tcp/tool` 或填写工具名称。
+SDK 未提供示教器工具坐标名称的读取接口；请用显示的数值核对当前生效配置。
+读取失败时拒绝采集，不回退到手动位姿或法兰。采集中切换 TCP 会被拒绝；
+更换 TCP 后需要使用新的采集会话。
 
-### 1. 结构 / 可维护性
-- **去掉了 `exec(compile(embedded_source, ...))` 的内嵌脚本反模式。**
-  原文件把"机械臂信息读取 CLI"和"TCP 示教 GUI"整段整段地写成字符串，
-  在运行时 `exec` 成两个隐藏模块（`_embedded_aubo_robot_info` /
-  `_embedded_tcp_teach_gui`），只是为了塞进同一个 .py 文件里还不冲突命名。
-  现在这两块就是普通模块（`robot_info.py` / `tcp_teach.py`），可以正常
-  `import`、正常被 IDE 跳转、正常被单独测试，不再需要这种 hack。
-- **按职责拆成 17 个模块**（数学 / 相机 / 机械臂 / 检测 / 求解 / 采集 / GUI
-  各自独立），原来 3000 行找一个函数要靠搜索，现在文件名基本就能定位。
-- **采集循环去重**：原来 OpenCV 窗口版和 GUI 按钮版各写了一遍几乎一样的
-  "连续抓 5 帧再选 1 帧"逻辑（`capture_burst_samples` /
-  `capture_burst_samples_gui`），现在两者共享同一个 `capture._run_burst_loop`，
-  只是把"怎么把画面显示出去"换成了不同的回调，以后改采集逻辑只用改一处。
-- **配置依旧是模块级单例**（`config.py` 里的 `BOARD_CFG` / `CAMERA_CFG` /
-  `ROBOT_CFG` / ...），这是刻意保留的：GUI 表单改 IP、改保存路径都是直接
-  写这些字段，全局单例是最省事的方式；但现在它们集中定义在一个文件里，
-  不再散落。
+“求解标定”使用固定拟合集计算矩阵，留出组不参与拟合。结果区直接显示结论、
+两组各自的平移 RMS / 最大误差和下一步。数值目标统一为 RMS ≤ 0.10 mm、
+最大误差 ≤ 0.20 mm；样本不足时显示“待验证”，不会把低拟合残差当作验证通过。
+结果是标定板位姿一致性，不代表机械臂绝对定位精度。数值达标后仍需完整独立验证。
 
-### 2. 健壮性 / 安全边界
-- **两个"AUBO 会话"类刻意不合并**：`robot.AuboPoseSession` 只读 TCP/Tool
-  位姿，绝不下发指令，用于手眼标定；`tcp_teach.TcpTeachSession` 会调用
-  `config.setTcpOffset()` 真正修改机械臂参数。原文件里两者名字都叫
-  `AuboSession`，靠内嵌 exec 的隔离命名空间才没有互相覆盖——这是很容易在
-  后续维护中踩坑的地方，现在是两个类型不同、导入路径不同的类，不可能混用。
-- CSV 字段列表、JSON 序列化等原来在多处重复定义的常量（如
-  `_CSV_FIELDS`）现在只定义一次。
-- **诊断与正式验证分离**：8组样本只允许生成
-  `handeye_diagnostic_current.json`；E7要求至少11组、至少20%且不少于3组预先留出，
-  留出集编号不参与拟合，也不按残差挑选。
-- **采集记录可追溯**：五帧采集会记录相机序列号、profile、RGB/Depth时间戳、
-  标定板视野区域，以及每张相机帧前后的TCP读数。缺少这些字段的旧样本仍可诊断，
-  但不能通过E7。
-- **RGB坐标链统一**：正式样本保存 `T_rgb_board`、PnP内点数和像素重投影误差；
-  E7只接受 `calibration_frame=rgb_camera`，并输出 `T_tcp_rgb_camera`。深度图仍可显示
-  和保存用于现场核查，但不参与正式手眼求解。
-- **旧样本隔离**：工作台启动RGB手眼页时，旧 `pointcloud` 样本会移动到
-  `archived_legacy_pointcloud_*`，不会与新RGB样本混合拟合或覆盖当前结论。
-- **文件状态同步**：“归档最后样本”会把JSON和图像移出活动目录并重写CSV，程序重启后
-  不会把已移除样本重新加载。诊断结果和E7候选均采用唯一current文件原子替换，不生成重复副本。
+旋转均值使用矩阵 SVD 投影，避免 ±180° 处旋转向量平均错误。固定性预检检查
+相对均值的平移/旋转 RMS 和最大值；不再使用误差长度的标准差。
 
-### 3. 已验证正确性
-用合成数据做了端到端回归（见下方“如何验证”），确认几何变换、
-`cv2.calibrateHandEye` 五种方法、非线性精修、样本冲突诊断、
-E7预先留出和JSON输出正常：
-- 无噪声合成数据 → 求解出的 `T_tcp_rgb_camera` 与真值误差在浮点精度量级
-  （浮点精度极限），验证了 Kabsch/RANSAC/hand-eye 数学没有在重构中被改动。
-- 加噪声合成数据端到端跑通 `solve_and_save`，JSON 正常写出，冲突诊断和
-  目标达标判断都按预期工作。
-- 30组无噪声合成数据按固定规则拆成24组标定、6组验证；验证集不参与拟合，
-  求解矩阵恢复真值，候选仍保持 `validated=false` 和 `do_not_use_for_motion=true`。
-- 合成RGB ChArUco角点在完全不提供深度图/点云的情况下通过PnP恢复板位姿，
-  验证正式算法没有暗中依赖435Le深度。
+诊断输出仍为 `aubo_tools/data/handeye_diagnostic_current.json`，保留矩阵、
+样本分组和各算法数值供追溯，但不安装为生产手眼文件。
 
-### 4. 现场仍需验证的点
-- 当前RGB内参来自435Le SDK当前profile。正式E7前必须确认分辨率、畸变参数和安装后
-  对焦状态保持一致；如改用离线高精度内参，必须重新采集全部RGB手眼样本。
-- PnP重投影门当前为RMSE `<=0.35 px`、最大误差 `<=1.00 px`。这些是保守软件门，
-  不能替代真实装机后的E7独立验证和最终E9/E10精度试验。
-- `CAMERA_CFG.save_dir` / `SOLVE_CFG.output_json` 默认值仍是写死的 Windows
-  路径 `C:\MM\...`，跟原脚本一致；如果你想换成相对路径或者从环境变量读，
-  告诉我可以再改。
+## 孔洞定位流程
 
-## 如何运行
+当前保留的定位流程为 `run_yolo_eye_in_hand_optimized.py` 中的两阶段流程。初始选孔既可手动点击，也可在固定观察位显式启用静态自动分区实验：
 
-```bash
-# 默认：工作台
-python run_workbench.py
+1. 在初始 RGB-D 画面中由 YOLO 检测孔并手动选择目标孔。
+2. 机器人到约 340 mm 位置，使用孔口外侧深度环带拟合局部平面、中心和法向。
+3. 可选地复用经过现场验证的粗定位缓存；缓存不兼容或验证失败时自动回退现场粗定位。
+4. 机器人到约 260 mm，仅使用 RGB/YOLO 多帧精定位，并锁定在粗定位点云锚点附近。
+5. 将去畸变像素中心与粗平面求交，进行倾斜圆心修正和最终 TCP 目标规划。
 
-# 工作台“孔洞定位”页面还提供“偏移容忍度测试（单孔）”按钮，
-# 可直接设置半径/方向并运行下面的偏移测试，不需要单独打开命令行。
+### 第四策略：340 mm纯点云中心直达
 
-# 只要手眼标定
-python run_handeye.py
-python run_handeye.py --opencv-ui   # OpenCV窗口：h诊断、v E7验证、d归档最后样本
+选择第四策略后，程序把独立点云观察高度默认设为340 mm，并先按“当前选中区域”的局部边界
+识别最外围孔洞。外围孔洞先分组，每组最多3个；外围完成后才处理内部孔洞，内部每组最多5个，
+两阶段都优先形成3～5孔组；余数或共同视野/几何质量不允许时，允许1～2孔，不为了凑数放宽视野和质量门。
+外围组同样执行长宽比和紧凑度门限；近似直线的三孔会拆成更小的组，避免共同点云覆盖不完整。
+边界识别按选中孔中心的局部几何计算，不使用托盘外框或图像边缘；断开的选区和凹形边界不会跨区凑组。
+机械臂到位后先确认停稳，再默认额外等待1秒，随后清理旧帧并采集点云。
+每组默认采集15帧、每孔至少10帧有效数据；点云质量不足的孔直接记录失败，不转入260 mm精定位或历史缓存回退。
+正常模式以点云中心规划最终点，最终XY只记录现有 ChArUco 补偿；勾选“仅采集评估”时只移动到340 mm观察位并保存测量，
+不执行最终 XY/Z或夹爪动作。分组搜索、停稳等待、清理旧帧和采集均有超时，进度会写入 `progress.json`。
 
-# 与手眼界面同时运行：逐点移动到40个候选位姿，拍照仍由人工完成
-python run_handeye_pose_sequence.py             # 只预览，不连接机器人
-python run_handeye_pose_sequence.py --execute   # 实机交互模式，默认P01-P40
-python run_handeye_pose_sequence.py --execute --start-index 18  # 从P18恢复
+命令行等价参数如下：
 
-# ChArUco高度×3x3视野实验（默认只预览，不运动）
-python run_charuco_height_error_experiment.py
-
-# 现场确认路径安全后：自动控制Z，XY由人工移动，每个网格点采20帧
-python run_charuco_height_error_experiment.py --execute-motion
-
-# 单高度3x3网格冒烟测试，每位置10帧
-python run_charuco_height_error_experiment.py --heights-mm 340 --frames-per-position 10 --execute-motion
-
-# 如需恢复旧的纯高度实验
-python run_charuco_height_error_experiment.py --height-only --execute-motion
-
-# 命令行查看机械臂信息
-python run_robot_info.py --ip 192.168.50.200 --port 30004
-
-# 粗定位后精定位的视野偏移容忍度测试（默认只生成计划，不运动）
-python run_coarse_to_fine_offset_test.py --no-execute
-
-# 实机测试：只选择一个孔；不执行最终XY、最终Z和基坐标Y+0.2 mm
-python run_coarse_to_fine_offset_test.py --execute --allow-experimental-handeye
-
-# 实机测试：额外执行正式流程的最终XY、降Z、基坐标Y+0.2 mm，到达每个目标点后等待确认
-python run_coarse_to_fine_offset_test.py --execute --allow-experimental-handeye --include-final-motion
+```powershell
+python run_yolo_eye_in_hand_optimized.py `
+  --coarse-direct-final `
+  --coarse-direct-final-height-mm 340 `
+  --coarse-direct-final-max-group-size 5 `
+  --coarse-direct-final-early-stop-extra-frames 5 `
+  --coarse-direct-final-settle-delay-s 1 `
+  --coarse-direct-final-capture-only `
+  --execute
 ```
 
-`run_coarse_to_fine_offset_test.py` 按默认的 0/5/10/15/20 mm 五个半径，
-每个非零半径按 45° 间隔采 8 个方向，共 33 个位置。每个位置都从精定位中心
-重新出发，固定姿态和RZ，只做相机横向偏移，然后运行当前RGB精定位质量门。测试
-结果写入 `C:\MM\aubo_tools\data\hole_localization_runs\coarse-to-fine-offset-*`，
-包括 `report.json`、`offset_samples.csv` 和极坐标图。只有同一半径的所有方向都通过，
-该半径才会被汇总为支持半径。默认不执行最终插入动作；勾选/指定
-`--include-final-motion` 后，会按正式顺序执行最终XY、降Z、基坐标Y+0.2 mm，
-到达最终目标点后等待人工确认；确认或取消后都会先回升，再返回精定位中心。
-GUI 目标点暂停时提供“确认并继续”和“标记当前点有误差并继续”两个选项；
-标记结果会写入报告并在极坐标图中以紫色显示，不会再次询问该点。
+完成多轮 A/B/C 试拍后，可用独立工具汇总报告；该工具只读 `report.json`，不会改写孔位地图：
 
-视野实验固定使用板中心在RGB相机坐标系中的 `T_rgb_board[2,3]` 作为高度：
-300/320/340/360 mm，步进20 mm。程序只自动修改TCP的Z，不发送XY运动；每个高度由
-操作者依次把板中心移动到3x3目标位置，确认后每个位置采20帧。
-程序会先预热并锁定彩色曝光/增益，逐高度人工确认运动，再按20个非重叠10帧批次采集。
-输出位于 `C:\MM\aubo_tools\data\charuco_height_error\<run_id>`，包括逐帧CSV、批次/高度
-汇总、JSON报告、趋势图、箱线图、通过率图和每批代表图。由于没有外部长度真值，该报告
-只评价RGB-PnP、深度和二者交叉差异的内部一致性与重复性，不声称绝对测量精度。
-
-依赖：`opencv-contrib-python`（需要 `cv2.aruco`）、`numpy`、`Pillow`（可选，
-没装的话中文会自动退化成 ASCII）、`scipy`（可选，没装则跳过非线性精修）、
-`pyaubo_sdk`（当前项目会自动查找 `C:\MM\third_party\aubo_sdk`，
-也兼容项目目录下的 `third_party/aubo_sdk`，或直接安装到当前 Python 环境）、
-`pyorbbecsdk`。
-
-## 如何验证（不需要真实硬件）
-
-```bash
-python -m py_compile aubo_workbench/*.py run_workbench.py run_handeye.py run_robot_info.py
-python -m unittest discover -s tests -v
+```powershell
+python tools/summarize_coarse_direct_experiment.py `
+  --label A=C:\runs\A_340mm_5holes `
+  --label B=C:\runs\B_340mm_3holes `
+  --label C=C:\runs\C_340mm_1hole `
+  --output-dir C:\runs\coarse_experiment_summary
 ```
 
-以及仓库里 `config` / `geometry` / `io_utils` / `drawing` / `charuco_detect` /
-`quality` / `camera` / `samples` / `solve` / `visualization` 这些不依赖
-AUBO/Orbbec 硬件 SDK 的模块，都可以直接 `import` 跑单测——这也是这次重构
-特意让它们不依赖硬件 SDK 的原因之一（原文件里所有函数都挤在一个 import
-了 `pyaubo_sdk` 的文件里，哪怕只想测一下坐标变换，也得先能导入机械臂 SDK）。
+### 单臂静止伞架自动分区实验
+
+当前推荐使用鼠标画工作区域，无需提供伞架中心。在 GUI“检测与地图”点击“鼠标画区 / 修改区域”，启动持续 RGB 视频流。选择区域编号，把机械臂调整到该观察位后点击“确认当前位姿并取图”，程序会锁定最新视频帧并只读保存 TCP 位姿和关节角；随后左键逐点画轮廓，右键撤销一点，点击“闭合并保存本区域”；换编号可画多个区域，最后点击“保存配置并使用”。程序自动保存 `partition_mode=polygons` 配置并启用自动选孔。按钮“打开已有图像（离线）”只用于无相机时的离线画区验证，不能产生本次机械臂位姿记录。旧的中心角度模式仍兼容，但下面的 `origin_px` 要求仅适用于旧模式。
+
+画区模式以孔中心判定归属：边线和顶点算区域内；重叠或公共边固定归编号最小的区域，再过滤活动扇区，不产生待确认状态。所有画区的并集就是工作范围，范围外检测记为 `outside_drawn_regions`。这种规则只能覆盖已检测到的孔，不能证明视觉没有漏检。相机与伞架位置、图像尺寸必须与画区时一致；程序会拒绝分辨率不一致的配置，观察位改变需要重新画区。
+
+画区 JSON 与 `.reference.png` 原图保存在扇区信息目录；各 `Sxx` 归档记录实际多边形及归属规则，不再为手画工作区域记录60°角度范围。确认时的帧图保存在对应 `Sxx/captures`，位姿记录保存在 `auto_sector_selection_pose_records.json`，同时写入主配置的 `sector_pose_records`。从工作台打开的编辑器要求每个已画区域都有对应的确认记录后才能保存；离线按钮仅用于无硬件的逻辑验证。
+
+当前位姿记录用于区域复现、绑定和审计；自动选孔仍按当前输入图像的像素多边形执行，运行某个扇区前要把机械臂置于该扇区对应的观察位。代码目前没有把不同观察位的像素多边形自动变换到统一工件坐标。
+
+自动分支只在初始 RGB-D 画面做候选孔筛选、扇区归属、同帧去重和审计输出；初始画面不生成粗定位地图。普通策略仍单独执行340 mm粗定位和260 mm精定位；选择第四策略时改用上述340 mm纯点云流程。先在 GUI 完成视频流、位姿确认和画区，生成 `data/hole_localization_sector_info/auto_sector_selection.json`，再运行：
+
+```powershell
+python run_yolo_eye_in_hand_optimized.py `
+  --auto-select-holes `
+  --auto-sector-config data/hole_localization_sector_info/auto_sector_selection.json `
+  --no-execute
+```
+
+只想用一张RGB图验证扇区线和选孔结果时，使用 `run_auto_sector_selection.py`；它不连接机器人、不读取深度，会在输出目录写入叠加图和 `auto_sector_selection.json`。自动两阶段每轮也会在运行目录写入同名报告和 `01_home_auto_sector_selection.png`。未配置参考孔位表时，报告中的孔号为临时 `Sxx-Pxxx`，不能当作跨次稳定孔号。扇区边界候选会保留在报告和叠加图中，但必须先经粗定位或补拍确认，不会直接进入机器人执行列表；去重还会检查检测框重叠和尺度，避免相邻孔仅因中心距离较近而被合并。
+
+扇区信息另外归档到 `data/hole_localization_sector_info`（可用环境变量 `AUBO_WORKBENCH_SECTOR_INFO_DIR` 修改）。目录下固定建立 `S01` 到 `S06`，每个扇区保存 `sector_definition.json`、`latest.json` 和按运行/预览编号保存的快照；根目录的 `index.json` 记录最近一次更新和各扇区路径。
+
+GUI 首次打开时会把 `configs/auto_sector_selection_static_template.json` 复制为 `data/hole_localization_sector_info/auto_sector_selection.json`，并自动填入配置路径。推荐直接点击“鼠标画区 / 修改区域”完成视频取帧、位姿记录和多边形绘制；模板中的 `origin_px` 只在旧的 `radial` 角度模式中使用。
+
+如果同时使用六扇区地图建图，自动配置和 `--sector-id` 必须只指向同一个扇区；普通两阶段实验可以选择多个活动扇区。
+
+### 340 mm粗定位建图与实时精定位调用
+
+建图阶段只把本轮340 mm粗定位的孔中心、平面、法向和质量写入独立地图，不执行260 mm精定位，也不执行最终安放：
+
+多孔不会被强制塞进同一个相机视野：340 mm粗定位和260 mm精定位都会按孔位投影范围自动拆组，每组在本组综合位置上方进行稳定连拍；某组失败不会取消其他组。
+
+```powershell
+python run_yolo_eye_in_hand_optimized.py `
+  --batch-coarse-localization `
+  --no-batch-fine-localization `
+  --hole-map-mode build `
+  --execute `
+  --allow-experimental-handeye
+```
+
+不指定 `--hole-map-path` 时，地图会自动保存到 `aubo_tools/data/hole_localization_maps/hole-map-时间/hole_map.json`；普通地图只有全部选定孔通过质量门时才更新 `current.json`，六扇区地图会保留已完成扇区并按版本更新入口。调用时不指定地图路径即可自动调用当前地图；也可以按孔号调用历史版本。调用过程会重新启动相机和YOLO，在当前伞架状态下执行260 mm精定位；需要真实下发最终目标时再加 `--move-final-xy`：
+
+```powershell
+python run_yolo_eye_in_hand_optimized.py `
+  --hole-map-mode execute `
+  --hole-ids 3 1 2 `
+  --execute
+```
+
+地图是当前工件/机器人循环内的粗定位导航结果；工件移动、重新装夹、TCP或标定改变后应重新建图。地图不保存精定位 XY、最终孔心、补偿或TCP目标；这些数据只在每次调用的当前运行报告中产生。
+
+建图版本目录还会保存共享粗定位点云的 `pointcloud_raw.npz`、基坐标系 `pointcloud_base.ply`、孔中心标记 `hole_centers_base.ply` 和 `pointcloud_preview.jpg`。GUI 中的“查看点云”可打开二维投影预览，“打开三维PLY”可交给 Open3D 或 CloudCompare 检查点云、粗定位中心和孔位覆盖情况。
+
+默认运行只生成预览报告；真实运动必须显式启用运动开关并通过手眼质量门。
+
+定位流程连续3次取不到有效相机帧（包含预热丢帧）会终止本轮，并在报告中记录
+`failure_type=camera_stream_unavailable`，不会再按孔失败进入后续分组或补拍。
+在SDK每次取帧3秒超时的情况下，持续无帧通常约9秒后报错；这不包含设备关闭耗时。
+机器人未上电、运动下发失败或到位等待超时也会终止本轮，记录
+`failure_type=robot_motion_failed`。GUI显示具体故障；恢复相机/机器人状态后重新启动任务。
+软件的及时终止不能修复网口相机本身的断流，仍需结合设备连接和SDK日志排查。
+
+## 入口
+
+- `run_workbench.py`：主 GUI。
+- `run_yolo_eye_in_hand_optimized.py`：两阶段孔洞定位核心。
+- `run_auto_sector_selection.py`：静止伞架单帧自动分区/选孔离线预览。
+- `tools/summarize_coarse_direct_experiment.py`：汇总第四策略多轮点云报告，不写回地图。
+- `run_hole_localization_pycharm.py`：IDE 直接运行配置入口。
+- `run_coarse_to_fine_offset_test.py`：单孔偏移诊断入口。
+
+GUI 中的孔洞定位页面提供模型、手眼文件、粗/精定位参数、缓存开关、批量粗定位、结果查看和偏移测试。
+
+## 主要模块
+
+- `aubo_workbench/optics.py`：去畸变、相机光线、平面求交和倾斜圆心修正。
+- `aubo_workbench/fitting.py`：平面/球面拟合。
+- `aubo_workbench/coarse_cache.py`：粗定位缓存建立、兼容性检查和现场验证。
+- `aubo_workbench/hole_map.py`：340 mm粗定位地图的生成、版本指针、读取和结构校验。
+- `aubo_workbench/hole_map_visualization.py`：地图点云归档、PLY和JPG诊断产物。
+- `aubo_workbench/auto_sector_selection.py`：静态图像坐标系中的扇区归属、候选筛选、去重和完整性审计。
+- `aubo_workbench/camera.py`：RGB、RGB-D 和点云帧采集。
+- `aubo_workbench/geometry.py`：坐标变换和位姿计算。
+- `aubo_workbench/motion_control.py`、`robot.py`：机器人运动和只读位姿会话。
+
+## 数据与安全
+
+运行报告位于 `aubo_tools/data/hole_localization_runs`，孔位地图位于 `aubo_tools/data/hole_localization_maps`，粗定位持久化缓存位于 `aubo_tools/data/hole_localization_coarse_cache`。这些目录是运行数据，不应作为源码批量提交。
+
+当前手眼候选和 ChArUco 补偿模型仍需结合独立真值完成生产验收。离线测试不能替代真实相机、机器人和工艺安全验证。
+
+## 测试
+
+在项目目录运行：
+
+```powershell
+python -m pytest tests -q
+```
+
+真实硬件测试前，先使用预览模式核对报告、目标位姿、缓存验证结果和运动安全门。

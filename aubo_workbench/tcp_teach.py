@@ -22,13 +22,19 @@ from typing import Any
 import tkinter as tk
 from tkinter import BOTH, END, LEFT, RIGHT, X, Y, filedialog, messagebox, ttk
 
+from .paths import (
+    DATA_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_USER,
+)
 from .sdk_paths import add_aubo_sdk_to_path
 
 add_aubo_sdk_to_path()
 
 import pyaubo_sdk as aubo  # noqa: E402
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_POINTS_FILE = DATA_DIR / "tcp_teach_points.json"
 
 
@@ -382,10 +388,10 @@ class TcpTeachPanel(ttk.Frame):
         self.poll_after_id: str | None = None
         self.last_poll_error = ""
 
-        self.ip_var = tk.StringVar(value="192.168.50.200")
-        self.port_var = tk.StringVar(value="30004")
-        self.user_var = tk.StringVar(value="AUBO")
-        self.password_var = tk.StringVar(value="123456")
+        self.ip_var = tk.StringVar(value=DEFAULT_ROBOT_IP)
+        self.port_var = tk.StringVar(value=str(DEFAULT_ROBOT_PORT))
+        self.user_var = tk.StringVar(value=DEFAULT_ROBOT_USER)
+        self.password_var = tk.StringVar(value=DEFAULT_ROBOT_PASSWORD)
         self.status_var = tk.StringVar(value="未连接")
         self.robot_var = tk.StringVar(value="-")
         self.mode_var = tk.StringVar(value="-")
@@ -405,8 +411,18 @@ class TcpTeachPanel(ttk.Frame):
         self.start_polling()
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, padding=10)
-        outer.pack(fill=BOTH, expand=True)
+        # 工作台顶部和系统缩放会占用高度，结果区不能被点位表挤出窗口。
+        viewport = ttk.Frame(self)
+        viewport.pack(fill=BOTH, expand=True)
+        canvas = tk.Canvas(viewport, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(viewport, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        outer = ttk.Frame(canvas, padding=10)
+        content_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(content_id, width=event.width))
 
         top = ttk.LabelFrame(outer, text="TCP 示教会话", padding=8)
         top.pack(fill=X)
@@ -444,8 +460,10 @@ class TcpTeachPanel(ttk.Frame):
         ttk.Button(toolbar, text="计算TCP", command=self.compute_tcp).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="写入TCP", command=self.apply_tcp).pack(side=LEFT)
 
+        table = ttk.Frame(left)
+        table.pack(fill=BOTH, expand=True)
         columns = ("name", "time", "tool_xyz", "tool_rpy", "tcp_xyz")
-        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=13)
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", height=5)
         for col, label, width in [
             ("name", "点位", 80), ("time", "采集时间", 150),
             ("tool_xyz", "基坐标法兰 XYZ(mm)", 220),
@@ -454,10 +472,13 @@ class TcpTeachPanel(ttk.Frame):
         ]:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, anchor="w", stretch=True)
-        self.tree.pack(fill=BOTH, expand=True)
+        table_scrollbar = ttk.Scrollbar(table, orient=tk.VERTICAL, command=self.tree.yview)
+        table_scrollbar.pack(side=RIGHT, fill=Y)
+        self.tree.configure(yscrollcommand=table_scrollbar.set)
+        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
 
         result = ttk.LabelFrame(left, text="标定结果")
-        result.pack(fill=X, pady=(8, 0))
+        result.pack(before=table, fill=X, pady=(0, 8))
         self._info_row(result, 0, "TCP偏移(法兰系)", self.result_var)
         self._info_row(result, 1, "公共点基坐标XYZ", self.result_base_xyz_var)
         self._info_row(result, 2, "质量评估", self.quality_var)
@@ -477,7 +498,7 @@ class TcpTeachPanel(ttk.Frame):
         right = ttk.Frame(mid, width=320)
         right.pack(side=RIGHT, fill=Y, padx=(10, 0))
         ttk.Label(right, text="日志").pack(anchor="w")
-        self.log_text = tk.Text(right, height=28, width=42, wrap="word")
+        self.log_text = tk.Text(right, height=12, width=42, wrap="word")
         self.log_text.pack(fill=BOTH, expand=True)
 
     def _info_row(self, parent: ttk.Frame, row: int, name: str, var: tk.StringVar) -> None:
@@ -731,6 +752,7 @@ class TcpTeachPanel(ttk.Frame):
             f"TCP XYZ 计算完成: {fmt_xyz_mm(result['identified_xyz'])} mm；"
             f"完整偏移(m/rad): {fmt(self.result_offset)}"
         )
+        self.log(f"TCP 质量评估: {self.quality_var.get()}")
 
     def apply_tcp(self) -> None:
         if self.result_offset is None:

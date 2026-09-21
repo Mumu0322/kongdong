@@ -7,6 +7,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from .paths import AUBO_SDK_DIR
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
@@ -17,7 +19,7 @@ def find_aubo_sdk_dir() -> Path | None:
     candidates = [
         PROJECT_DIR / "third_party" / "aubo_sdk",
         PROJECT_DIR.parent / "third_party" / "aubo_sdk",
-        PROJECT_DIR.parent.parent / "third_party" / "aubo_sdk",
+        AUBO_SDK_DIR,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -37,6 +39,6 @@ def aubo_sdk_hint() -> str:
     candidates = [
         PROJECT_DIR / "third_party" / "aubo_sdk",
         PROJECT_DIR.parent / "third_party" / "aubo_sdk",
-        PROJECT_DIR.parent.parent / "third_party" / "aubo_sdk",
+        AUBO_SDK_DIR,
     ]
     return "、".join(str(path) for path in candidates)

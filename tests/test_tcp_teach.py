@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import sys
+import tkinter as tk
 
-from aubo_workbench.tcp_teach import TeachPoint, TcpTeachSession, fmt_xyz_mm
+from aubo_workbench.tcp_teach import TeachPoint, TcpTeachPanel, TcpTeachSession, fmt_xyz_mm
 
 
 class _FakeClient:
@@ -51,6 +53,53 @@ class TcpTeachSessionTests(unittest.TestCase):
 
     def test_fmt_xyz_mm_converts_meters_to_millimeters(self) -> None:
         self.assertEqual(fmt_xyz_mm([0.440783, 0.312765, 0.266545]), "[440.783, 312.765, 266.545]")
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows desktop layout regression")
+class TcpTeachLayoutTests(unittest.TestCase):
+    def test_point_table_is_not_covered_by_its_container(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        # Keep the test window almost transparent; alpha=0 prevents hit testing.
+        root.attributes("-alpha", 0.01)
+        root.geometry("1300x700+0+0")
+        panel = TcpTeachPanel(root)
+        panel.pack(fill="both", expand=True)
+        panel.stop_polling()
+        panel.points = [_point(index) for index in range(12)]
+        panel.refresh_points()
+        root.deiconify()
+        root.lift()
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        canvas = next(w for w in descendants(panel) if isinstance(w, tk.Canvas))
+        for scale in (1.333, 2.0):
+            with self.subTest(scale=scale):
+                root.tk.call("tk", "scaling", scale)
+                root.update()
+                canvas.yview_moveto(0)
+                root.update()
+                table_y = panel.tree.winfo_rooty() - canvas.winfo_rooty()
+                content_height = float(canvas.cget("scrollregion").split()[3])
+                canvas.yview_moveto(max(0, table_y - 40) / content_height)
+                panel.tree.yview_moveto(0)
+                root.update()
+                rows = panel.tree.get_children()
+                x, y, width, height = panel.tree.bbox(rows[0])
+                for local_y in (y // 2, y + height // 2):
+                    hit = root.winfo_containing(
+                        panel.tree.winfo_rootx() + x + 10,
+                        panel.tree.winfo_rooty() + local_y,
+                    )
+                    self.assertEqual(hit, panel.tree, "Point header/row is obscured")
+                panel.tree.see(rows[-1])
+                root.update()
+                self.assertTrue(panel.tree.bbox(rows[-1]), "Last point must be scrollable into view")
 
 
 if __name__ == "__main__":

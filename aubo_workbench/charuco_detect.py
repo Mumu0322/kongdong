@@ -293,8 +293,6 @@ def estimate_rgb_board_pose(
     draw_text_panel(overlay, [
         (f"RGB ChArUco角点={charuco_count}，PnP内点={inlier_indices.size}", text_color),
         (f"RGB重投影 RMSE={rmse:.3f}px，最大={max_error:.3f}px", text_color),
-        ("正式链路：RGB 2D角点 + 内参 + PnP；深度不参与手眼求解", (255, 255, 255)),
-        ("c: 采集5帧选1帧 | h: RGB诊断 | v: E7验证 | d: 归档最后样本", (255, 255, 255)),
     ])
     inlier_ids = [used_ids[int(index)] for index in inlier_indices]
     return BoardPoseResult(

@@ -3,7 +3,7 @@
 r"""独立 AUBO 机械臂上下电与运动控制 GUI。
 
 运行建议：
-    C:\Users\j1005\.conda\envs\lip_env310\python.exe C:\MM\aubo_tools\aubo_workbench_project\run_workbench.py
+    python C:\MM_two\aubo_tools\aubo_workbench_project\run_workbench.py
 """
 
 from __future__ import annotations
@@ -20,21 +20,41 @@ import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable
 
+from .paths import (
+    AUBO_SDK_DIR,
+    DATA_DIR,
+    DEFAULT_ROBOT_IP,
+    DEFAULT_ROBOT_PASSWORD,
+    DEFAULT_ROBOT_PORT,
+    DEFAULT_ROBOT_TIMEOUT_MS,
+    DEFAULT_ROBOT_USER,
+)
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
 AUBO_TOOLS_DIR = PROJECT_DIR.parent
-DATA_DIR = AUBO_TOOLS_DIR / "data"
 POINTS_FILE = DATA_DIR / "aubo_motion_points.json"
 HOME_POINT_FILE = DATA_DIR / "aubo_home_point.json"
-DEFAULT_SDK_DIR = Path(r"C:\MM\third_party\aubo_sdk")
+DEFAULT_SDK_DIR = AUBO_SDK_DIR
 
-DEFAULT_IP = "192.168.50.200"
-DEFAULT_PORT = 30004
-DEFAULT_USER = "AUBO"
-DEFAULT_PASSWORD = "123456"
-DEFAULT_TIMEOUT_MS = 3000
+DEFAULT_IP = DEFAULT_ROBOT_IP
+DEFAULT_PORT = DEFAULT_ROBOT_PORT
+DEFAULT_USER = DEFAULT_ROBOT_USER
+DEFAULT_PASSWORD = DEFAULT_ROBOT_PASSWORD
+DEFAULT_TIMEOUT_MS = DEFAULT_ROBOT_TIMEOUT_MS
 MOTION_FRAME_CHOICES = ("基坐标系", "工具/TCP坐标系")
+
+
+@dataclass(frozen=True)
+class MotionSafetyPolicy:
+    """底层运动会话的最小安全门。"""
+
+    require_power_on: bool = True
+    require_steady_for_position_move: bool = True
+    reject_collision: bool = True
+    require_within_safety_limits: bool = True
+    expected_dof: int = 6
 
 
 def add_local_sdk_path() -> Path | None:
@@ -238,6 +258,7 @@ class AuboMotionSession:
         self.manage: Any | None = None
         self.config: Any | None = None
         self.robot_name = ""
+        self.safety_policy = MotionSafetyPolicy()
 
     @property
     def connected(self) -> bool:
@@ -300,6 +321,40 @@ class AuboMotionSession:
         if not self.connected or self.state is None or self.motion is None or self.manage is None:
             raise RuntimeError("尚未连接机械臂。")
 
+    def _require_motion_state(self, *, require_steady: bool) -> None:
+        """检查所有运动命令都必须满足的控制器状态条件。"""
+        self.require_connected()
+        assert self.state is not None
+        policy = self.safety_policy
+
+        if policy.require_power_on and not bool(self.state.isPowerOn()):
+            raise RuntimeError("机械臂未上电，已拒绝运动命令。")
+        if policy.reject_collision and bool(self.state.isCollisionOccurred()):
+            raise RuntimeError("控制器报告发生碰撞，已拒绝继续运动。")
+        if policy.require_within_safety_limits:
+            within_limits = getattr(self.state, "isWithinSafetyLimits", None)
+            if callable(within_limits) and not bool(within_limits()):
+                raise RuntimeError("机械臂当前不在控制器安全范围内，已拒绝运动命令。")
+        if require_steady and policy.require_steady_for_position_move and not bool(self.state.isSteady()):
+            raise RuntimeError("机械臂尚未静止，已拒绝新的位置运动命令。")
+
+    def _validate_vector(self, values: list[float], label: str) -> list[float]:
+        normalized = [float(value) for value in values]
+        if len(normalized) != self.safety_policy.expected_dof:
+            raise ValueError(
+                f"{label} 必须包含 {self.safety_policy.expected_dof} 个数值，收到 {len(normalized)} 个。"
+            )
+        if not all(math.isfinite(value) for value in normalized):
+            raise ValueError(f"{label} 包含 NaN 或无穷值，已拒绝运动命令。")
+        return normalized
+
+    @staticmethod
+    def _validate_positive(value: float, label: str) -> float:
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0.0:
+            raise ValueError(f"{label} 必须是有限正数，收到 {value!r}。")
+        return normalized
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             self.require_connected()
@@ -309,6 +364,10 @@ class AuboMotionSession:
             snap["power_on"] = bool(self.state.isPowerOn())
             snap["steady"] = bool(self.state.isSteady())
             snap["collision"] = bool(self.state.isCollisionOccurred())
+            try:
+                snap["within_safety_limits"] = bool(self.state.isWithinSafetyLimits())
+            except Exception:
+                snap["within_safety_limits"] = None
             snap["robot_mode"] = str(self.state.getRobotModeType())
             snap["safety_mode"] = str(self.state.getSafetyModeType())
             snap["joints_rad"] = [float(v) for v in list(self.state.getJointPositions())]
@@ -320,6 +379,26 @@ class AuboMotionSession:
                 except Exception:
                     snap["queue_size"] = None
             return snap
+
+    def get_controller_home_joints(self) -> list[float]:
+        """读取控制器中保存的原始点关节角（AUBO SDK 弧度）。
+
+        ``getHomePosition`` 是控制器的持久化原始点，和项目自己的
+        ``aubo_home_point.json`` 是两套独立数据。自动运动应优先使用控制器
+        原始点，避免控制器已更新而本地备用文件仍是旧值。
+        """
+        with self.lock:
+            self.require_connected()
+            if self.config is None:
+                raise RuntimeError("机械臂配置接口未初始化，无法读取控制器原始点。")
+            getter = getattr(self.config, "getHomePosition", None)
+            if not callable(getter):
+                raise RuntimeError("当前 AUBO SDK 不支持读取控制器原始点 getHomePosition。")
+            try:
+                values = list(getter())
+            except Exception as exc:
+                raise RuntimeError(f"读取控制器原始点失败：{exc}") from exc
+            return self._validate_vector(values, "控制器保存原始点关节")
 
     def power_on_startup(self) -> list[Any]:
         with self.lock:
@@ -350,39 +429,51 @@ class AuboMotionSession:
 
     def move_joint(self, joints_rad: list[float], speed_rad_s: float, acc_rad_s2: float) -> list[Any]:
         with self.lock:
-            self.require_connected()
+            joints = self._validate_vector(joints_rad, "关节目标")
+            speed = self._validate_positive(speed_rad_s, "关节速度")
+            acc = self._validate_positive(acc_rad_s2, "关节加速度")
+            self._require_motion_state(require_steady=True)
             assert self.motion is not None
             rets: list[Any] = []
             try:
                 rets.append(self.motion.clearPath())
             except Exception as exc:
                 rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveJoint([float(v) for v in joints_rad], float(speed_rad_s), float(acc_rad_s2), 0.0, 0.0))
+            rets.append(self.motion.moveJoint(joints, speed, acc, 0.0, 0.0))
             return rets
 
     def move_line(self, pose_m_rad: list[float], speed_m_s: float, acc_m_s2: float) -> list[Any]:
         with self.lock:
-            self.require_connected()
+            pose = self._validate_vector(pose_m_rad, "直线目标位姿")
+            speed = self._validate_positive(speed_m_s, "直线速度")
+            acc = self._validate_positive(acc_m_s2, "直线加速度")
+            self._require_motion_state(require_steady=True)
             assert self.motion is not None
             rets: list[Any] = []
             try:
                 rets.append(self.motion.clearPath())
             except Exception as exc:
                 rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveLine([float(v) for v in pose_m_rad], float(speed_m_s), float(acc_m_s2), 0.0, 0.0))
+            rets.append(self.motion.moveLine(pose, speed, acc, 0.0, 0.0))
             return rets
 
     def speed_joint(self, speeds_rad_s: list[float], acc_rad_s2: float, duration_s: float) -> Any:
         with self.lock:
-            self.require_connected()
+            speeds = self._validate_vector(speeds_rad_s, "关节速度向量")
+            acc = self._validate_positive(acc_rad_s2, "关节加速度")
+            duration = self._validate_positive(duration_s, "速度控制时长")
+            self._require_motion_state(require_steady=False)
             assert self.motion is not None
-            return self.motion.speedJoint([float(v) for v in speeds_rad_s], float(acc_rad_s2), float(duration_s))
+            return self.motion.speedJoint(speeds, acc, duration)
 
     def speed_line(self, speed_m_rad_s: list[float], acc_m_s2: float, duration_s: float) -> Any:
         with self.lock:
-            self.require_connected()
+            speeds = self._validate_vector(speed_m_rad_s, "直线速度向量")
+            acc = self._validate_positive(acc_m_s2, "直线加速度")
+            duration = self._validate_positive(duration_s, "速度控制时长")
+            self._require_motion_state(require_steady=False)
             assert self.motion is not None
-            return self.motion.speedLine([float(v) for v in speed_m_rad_s], float(acc_m_s2), float(duration_s))
+            return self.motion.speedLine(speeds, acc, duration)
 
     def freedrive(self, enable: bool) -> Any:
         with self.lock:
@@ -453,7 +544,7 @@ class AuboMotionPanel(ttk.Frame):
         self._refresh_points()
         if aubo is None:
             self.log(f"SDK 导入失败：{SDK_IMPORT_ERROR}")
-            self.log("请用 Python 3.10 运行，或确认 C:\\MM\\third_party\\aubo_sdk 存在。")
+            self.log(f"请用 Python 3.10 运行，或确认 AUBO SDK 存在：{DEFAULT_SDK_DIR}")
         else:
             self.log(f"SDK 已加载：{getattr(aubo, '__file__', '-')}")
 
@@ -545,7 +636,7 @@ class AuboMotionPanel(ttk.Frame):
             ("碰撞", self.collision_var),
             ("队列", self.queue_var),
             ("坐标", self.motion_frame_var),
-            ("原始点", self.home_var),
+            ("软件备用原始点", self.home_var),
         ]):
             ttk.Label(box, text=name, width=8).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(box, textvariable=var, width=28).grid(row=row, column=1, sticky="w", pady=2)
@@ -568,8 +659,8 @@ class AuboMotionPanel(ttk.Frame):
         ttk.Button(box, text="上电并启动", command=lambda: self.run_command("上电并启动", self.session.power_on_startup)).pack(fill=X, pady=(0, 6))
         ttk.Button(box, text="断电", command=lambda: self.run_command("断电", self.session.power_off)).pack(fill=X, pady=(0, 6))
         ttk.Button(box, text="停止运动", command=lambda: self.run_command("停止运动", self.session.stop_motion)).pack(fill=X, pady=(0, 6))
-        ttk.Button(box, text="设当前为原始点", command=self.set_current_as_home_point).pack(fill=X, pady=(0, 6))
-        ttk.Button(box, text="复位到原始点", command=self.reset_to_home_point).pack(fill=X, pady=(0, 6))
+        ttk.Button(box, text="保存当前位置为软件备用原始点", command=self.set_current_as_home_point).pack(fill=X, pady=(0, 6))
+        ttk.Button(box, text="复位到控制器原始点", command=self.reset_to_home_point).pack(fill=X, pady=(0, 6))
         ttk.Button(box, text="清空运动队列", command=lambda: self.run_command("清空运动队列", self.session.clear_path)).pack(fill=X, pady=(0, 6))
         ttk.Button(box, text="进入拖拽模式", command=lambda: self.run_command("进入拖拽模式", lambda: self.session.freedrive(True))).pack(fill=X, pady=(0, 6))
         ttk.Button(box, text="退出拖拽模式", command=lambda: self.run_command("退出拖拽模式", self.session.exit_handguide)).pack(fill=X)
@@ -615,8 +706,8 @@ class AuboMotionPanel(ttk.Frame):
         toolbar = ttk.Frame(parent)
         toolbar.pack(fill=X, pady=(0, 8))
         ttk.Button(toolbar, text="采集当前点", command=self.capture_point).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="设当前为原始点", command=self.set_current_as_home_point).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="复位到原始点", command=self.reset_to_home_point).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="保存当前位置为软件备用原始点", command=self.set_current_as_home_point).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="复位到控制器原始点", command=self.reset_to_home_point).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="移动到选中点", command=self.move_to_selected_point).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="删除选中点", command=self.delete_selected_point).pack(side=LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="清空点位", command=self.clear_points).pack(side=LEFT, padx=(0, 6))
@@ -990,20 +1081,45 @@ class AuboMotionPanel(ttk.Frame):
         self.home_point = point
         save_home_point(point)
         self.home_var.set(self.home_label())
-        self.log("已将当前位置设置为原始点")
+        self.log(
+            "已将当前位置设置为软件备用原始点；"
+            f"已保存到 {HOME_POINT_FILE}；关节目标(rad)={point.joints_rad}"
+        )
 
     def reset_to_home_point(self) -> None:
-        if self.home_point is None:
-            messagebox.showwarning("未设置原始点", "请先点击“设当前为原始点”。")
-            return
+        # 原始点可能在 GUI 启动后由另一个页面/进程更新。每次复位前重新
+        # 从磁盘读取，避免继续使用 AuboMotionPanel 初始化时的旧缓存。
+        point = load_home_point()
+        self.home_point = point
+        self.home_var.set(self.home_label())
         try:
             speed = deg_to_rad(read_float(self.ptp_speed_var, "点到点速度", 0.0))
             acc = deg_to_rad(read_float(self.ptp_acc_var, "点到点加速度", 0.0))
         except Exception as exc:
             messagebox.showerror("参数错误", str(exc))
             return
-        point = self.home_point
-        self.run_command("复位到原始点", lambda: self.session.move_joint(point.joints_rad, speed, acc))
+
+        def move_home() -> list[Any]:
+            try:
+                target = self.session.get_controller_home_joints()
+                source = "控制器保存原始点"
+            except Exception as controller_exc:
+                if point is None:
+                    raise RuntimeError(
+                        "无法读取控制器保存原始点，且没有软件备用原始点："
+                        f"{controller_exc}"
+                    ) from controller_exc
+                target = list(point.joints_rad)
+                source = f"软件备用文件 {HOME_POINT_FILE}"
+            self.after(
+                0,
+                lambda: self.log(
+                    f"复位使用{source}；关节目标(rad)={target}"
+                ),
+            )
+            return self.session.move_joint(target, speed, acc)
+
+        self.run_command("回控制器原始点", move_home)
 
     def capture_point(self) -> None:
         snap = self.last_snapshot

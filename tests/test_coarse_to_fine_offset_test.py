@@ -68,7 +68,7 @@ class CoarseToFineOffsetTests(unittest.TestCase):
                     "final_z": {"pose_error": {
                         "translation_error_norm_mm": 0.3, "rotation_error_deg": 0.02,
                     }},
-                    "final_y_plus_0_2": {"pose_error": {
+                    "final_y_plus_0_3": {"pose_error": {
                         "translation_error_norm_mm": 0.1, "rotation_error_deg": 0.03,
                     }},
                 },
@@ -81,7 +81,7 @@ class CoarseToFineOffsetTests(unittest.TestCase):
                     "final_z": {"pose_error": {
                         "translation_error_norm_mm": 0.2, "rotation_error_deg": 0.01,
                     }},
-                    "final_y_plus_0_2": {"pose_error": {
+                    "final_y_plus_0_3": {"pose_error": {
                         "translation_error_norm_mm": 0.1, "rotation_error_deg": 0.02,
                     }},
                 },

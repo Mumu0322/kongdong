@@ -5,9 +5,10 @@
 这是 TCP 示教和手眼标定之外的第三类数据：它只记录当前工具、当前高度、当前
 yaw 下，视觉预测的 ChArUco 角点基坐标与人工实际触碰该角点时 TCP 基坐标的差。
 
-程序只会自动执行“基坐标 Z”运动，把相机调到固定板面距离；每段都需输入 m 确认。
-它不会自动下降到板面，也不会自动移动最终 XY。最终触碰的 Z 必须由人工示教器完成。
-触碰时若发现 XY 未对准，应人工微调 XY 后再下 Z；否则不能得到 XY 真值。
+每组先在高位选择角点，再自动移动到角点上方 260 mm 重新精定位，随后按
+ChArUco XY 模型自动对准最终 XY；最终 Z 始终由操作者使用示教器移动。
+触碰角点后若有 XY 偏差，应使用示教器微调后再记录，
+否则机器人自己的预测位置会被误当成真值，得到无效的零误差模型。
 """
 
 from __future__ import annotations
@@ -36,9 +37,16 @@ from aubo_workbench.charuco_point_experiment import (
     load_handeye_experiment_result,
     nearest_detected_corner,
 )
-from aubo_workbench.config import ROBOT_CFG
+from aubo_workbench.config import ROBOT_CFG, SOLVE_CFG
+from aubo_workbench.io_utils import jsonable
 from aubo_workbench.geometry import average_transforms
 from aubo_workbench.motion_control import AuboMotionSession, sdk_ok
+from aubo_workbench.paths import TCP_XY_MODEL_PATH, TCP_ABSOLUTE_XY_MODEL_DIR
+from aubo_workbench.hole_localization_planning import (
+    CHARUCO_XY_MODEL_BIAS_MM,
+    CHARUCO_XY_MODEL_MATRIX,
+    CHARUCO_XY_MODEL_READY,
+)
 from aubo_workbench.robot import AuboPoseSession
 
 
@@ -46,8 +54,9 @@ from aubo_workbench.robot import AuboPoseSession
 # 用户配置区：在 PyCharm 中直接 Run；通常只修改这里
 # ============================================================================
 
-HANDEYE_PATH = Path(r"C:\MM\aubo_tools\data\e7_candidates\e7_handeye_candidate_current.json")
-OUTPUT_ROOT = Path(r"C:\MM\aubo_tools\data\tcp_absolute_xy_model")
+# 使用手眼标定页每次重新求解后原子更新的最新诊断结果。
+HANDEYE_PATH = Path(SOLVE_CFG.output_json)
+OUTPUT_ROOT = TCP_ABSOLUTE_XY_MODEL_DIR
 
 # 选择 3x3 个分散的 ChArUco 内部角点；每个格点只触碰一次。
 # 当前目标是测量视野位置误差，因此每次必须选择不同角点，不做同点重复。
@@ -55,39 +64,40 @@ GRID_ROWS = 3
 GRID_COLS = 3
 REPEATS_PER_CORNER = 1
 
-# 不再写死相机-板面距离：第一次检测到板时，以当前距离为基准再抬升该值，
-# 并在本次运行内锁定。这样“只允许自动抬升Z”和高度固定不再冲突。
-INITIAL_CAPTURE_HEIGHT_RAISE_MM = 20.0
-HEIGHT_TOLERANCE_MM = 3.0
+# 高位画面只用于选角点；正式视觉坐标统一在 260 mm 精定位层重新计算。
+WORKFLOW_VERSION = "fine_260_auto_xy_manual_z_v1"
+FINE_CAPTURE_HEIGHT_MM = 260.0
+HEIGHT_TOLERANCE_MM = 2.0
 MAX_Z_CORRECTIONS = 3
-MAX_AUTO_Z_DELTA_MM = 200.0
-# 当前原点距离较远：程序绝不回原点；自动高度对准也只允许基坐标 Z 抬升。
-# 若需要下降，脚本会拒绝并要求用示教器人工处理。
-AUTO_RAISE_BASE_Z_ONLY = True
+MAX_AUTO_Z_DELTA_MM = 260.0
+MAX_AUTO_XY_DELTA_MM = 250.0
+# 260 mm 对准和最终 XY 由程序规划；最终 Z 始终由示教器操作。
+ALLOW_CONFIRMED_CAPTURE_Z_DESCENT = True
+AUTO_MOVE_TO_FINE_POSE = True
 MOVE_SPEED_M_S = 0.020
 MOVE_ACC_M_S2 = 0.080
+AUBO_REQUEST_IGNORE_CODE = 13
+REQUEST_IGNORE_POSITION_TOLERANCE_MM = 0.50
+REQUEST_IGNORE_ROTATION_TOLERANCE_DEG = 0.10
 
-# 当前 9 点 ChArUco 模型（charuco-tcp-xy-20260727_174559/report.json）：
-# touch_tcp_xy_mm = MATRIX @ visual_corner_xy_mm + BIAS。
-# 留一角点验证 P95=0.535 mm；仅适用于当前手眼、TCP、工具、固定 yaw、
-# 标定板固定以及约 317~322 mm 的采集高度。
+# current.json 存在且模型完整时使用已复核模型；首次采集时使用单位矩阵，
+# 自动到达视觉预测点后由操作者微调，微调后的 TCP 才作为真实触碰坐标。
 AUTO_MOVE_TO_VISUAL_XY = True
-VISUAL_TO_TCP_MATRIX_2X2 = np.array([
-    [1.0008588303603987, -0.0011632075996384716],
-    [-0.0013284394231714038, 0.999581433830417],
-], dtype=np.float64)
-VISUAL_TO_TCP_BIAS_MM = np.array([0.05229713949213546, 3.1959138367376676], dtype=np.float64)
-VISUAL_TO_TCP_MODEL_SOURCE = Path(
-    r"C:\MM\aubo_tools\data\tcp_absolute_xy_model\charuco-tcp-xy-20260727_174559\report.json"
-)
+VISUAL_TO_TCP_MATRIX_2X2 = np.asarray(CHARUCO_XY_MODEL_MATRIX, dtype=np.float64).copy()
+VISUAL_TO_TCP_BIAS_MM = np.asarray(CHARUCO_XY_MODEL_BIAS_MM, dtype=np.float64).copy()
+VISUAL_TO_TCP_MODEL_READY = bool(CHARUCO_XY_MODEL_READY)
+VISUAL_TO_TCP_MODEL_SOURCE = Path(TCP_XY_MODEL_PATH)
 
 CAPTURE_VALID_FRAMES = 20
 HEIGHT_MEASURE_FRAMES = 8
 MAX_CAPTURE_ATTEMPTS = 80
 
-# 只有 3 个不共线点可以拟合；默认 3x3×3=27 组用于验证，不会把训练误差当精度。
+# 只有 3 个不共线点可以拟合；默认 3x3=9 组并做留一角点验证，不把训练误差当精度。
 MIN_FIELD_SPAN_MM = 120.0
 MAX_LOOCV_P95_MM = 0.50
+MIN_INDEPENDENT_VALIDATION_POINTS = GRID_ROWS * GRID_COLS
+VALIDATION_RMS_LIMIT_MM = 0.20
+VALIDATION_MAX_LIMIT_MM = 0.20
 WAIT_BEFORE_EXIT = True
 WINDOW = "ChArUco TCP absolute XY recorder"
 
@@ -97,25 +107,17 @@ RESUME_LATEST_INCOMPLETE = True
 RESUME_RUN_DIR: Path | None = None
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
+# 实现已统一到 aubo_workbench.io_utils.jsonable。
+_jsonable = jsonable
 
 
 def _save_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(_jsonable(value), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _load_resume_report() -> tuple[Path, dict[str, Any]] | None:
+def _load_resume_report(
+    expected_model_source_report: str | None = None,
+) -> tuple[Path, dict[str, Any]] | None:
     """读取指定或最新未完成档案；只接受本脚本生成的 ChArUco XY 记录。"""
     candidates: list[Path] = []
     if RESUME_RUN_DIR is not None:
@@ -137,8 +139,17 @@ def _load_resume_report() -> tuple[Path, dict[str, Any]] | None:
         saved = payload.get("configuration", {})
         if (int(saved.get("grid_rows", GRID_ROWS)) != GRID_ROWS
                 or int(saved.get("grid_cols", GRID_COLS)) != GRID_COLS
-                or int(saved.get("repeats", REPEATS_PER_CORNER)) != REPEATS_PER_CORNER):
-            # 旧 3 次重复档案可保留，但不能被新的“每点一次”方案误续跑。
+                or int(saved.get("repeats", REPEATS_PER_CORNER)) != REPEATS_PER_CORNER
+                or saved.get("workflow_version") != WORKFLOW_VERSION
+                or not math.isclose(
+                    float(saved.get("fine_capture_height_mm", float("nan"))),
+                    FINE_CAPTURE_HEIGHT_MM,
+                    abs_tol=1e-9,
+                )):
+            # 旧采集高度或旧流程的档案继续保留，但不能混入固定 260 mm 模型。
+            continue
+        if saved.get("installed_model_source_report") != expected_model_source_report:
+            # 切换 current.json 后必须开启新的独立验证，不能续接旧模型的验证点。
             continue
         return path.parent, payload
     return None
@@ -220,6 +231,46 @@ def _submit_move_line(motion: AuboMotionSession, target: np.ndarray) -> list[Any
     return retry
 
 
+def _rotation_error_deg(actual: np.ndarray, target: np.ndarray) -> float:
+    relative = np.asarray(actual)[:3, :3].T @ np.asarray(target)[:3, :3]
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(math.degrees(math.acos(cosine)))
+
+
+def _finish_move_or_raise(
+    label: str,
+    response: list[Any],
+    target: np.ndarray,
+    pose_session: AuboPoseSession,
+) -> np.ndarray:
+    """校验运动结果；返回13时仅在实测已经到位的情况下放行。"""
+    if response and sdk_ok(response[-1]):
+        _, actual = _wait_steady(pose_session)
+        return actual
+    try:
+        code = int(response[-1]) if response else None
+    except (TypeError, ValueError):
+        code = None
+    if code == AUBO_REQUEST_IGNORE_CODE:
+        _, actual = _wait_steady(pose_session)
+        position_error = float(np.linalg.norm(actual[:3, 3] - np.asarray(target)[:3, 3]))
+        rotation_error = _rotation_error_deg(actual, target)
+        if (
+            position_error <= REQUEST_IGNORE_POSITION_TOLERANCE_MM
+            and rotation_error <= REQUEST_IGNORE_ROTATION_TOLERANCE_DEG
+        ):
+            print(
+                f"[MOTION] {label} 返回13(AUBO_REQUEST_IGNORE)，但实测已到位："
+                f"位置误差={position_error:.3f} mm，姿态误差={rotation_error:.3f} deg"
+            )
+            return actual
+        raise RuntimeError(
+            f"{label} moveLine返回13且未到目标：位置误差={position_error:.3f} mm，"
+            f"姿态误差={rotation_error:.3f} deg；响应={response}"
+        )
+    raise RuntimeError(f"{label} moveLine 下发失败：{response}")
+
+
 def _visual_to_tcp_target_xy(visual_xy_mm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """应用 ChArUco 9 点仿射模型，返回目标 TCP XY 和本次位置相关修正量。"""
     visual = np.asarray(visual_xy_mm, dtype=np.float64).reshape(2)
@@ -227,14 +278,21 @@ def _visual_to_tcp_target_xy(visual_xy_mm: np.ndarray) -> tuple[np.ndarray, np.n
     return target, target - visual
 
 
-def _move_base_z_only(label: str, current: np.ndarray, target_z_mm: float,
-                      motion: AuboMotionSession, pose_session: AuboPoseSession) -> np.ndarray:
+def _move_base_z_only(
+    label: str,
+    current: np.ndarray,
+    target_z_mm: float,
+    motion: AuboMotionSession,
+    pose_session: AuboPoseSession,
+    *,
+    require_confirmation: bool = True,
+) -> np.ndarray:
     target = np.asarray(current, dtype=np.float64).copy()
     target[2, 3] = float(target_z_mm)
     delta = float(target[2, 3] - current[2, 3])
     if abs(delta) < 0.02:
         return current
-    if AUTO_RAISE_BASE_Z_ONLY and delta < 0.0:
+    if not ALLOW_CONFIRMED_CAPTURE_Z_DESCENT and delta < 0.0:
         raise RuntimeError(
             f"当前高度需要基坐标 Z 下降 {abs(delta):.1f} mm 才能达到目标；"
             "本脚本只允许自动抬升 Z，请用示教器人工处理。"
@@ -247,38 +305,122 @@ def _move_base_z_only(label: str, current: np.ndarray, target_z_mm: float,
         f"  target  XYZ(mm): {np.round(target[:3, 3], 3).tolist()}\n"
         f"  仅修改基坐标 Z: {delta:+.3f} mm；XY、姿态、yaw 均保持不变"
     )
-    if input("输入 m 确认 Z 运动，其他任意键取消：").strip().lower() != "m":
+    if require_confirmation and input("输入 m 确认 Z 运动，其他任意键取消：").strip().lower() != "m":
         raise RuntimeError("用户取消自动高度调整")
     response = _submit_move_line(motion, target)
     print("[MOTION]", response)
-    if not response or not sdk_ok(response[-1]):
-        raise RuntimeError(f"{label} moveLine 下发失败：{response}")
-    _, actual = _wait_steady(pose_session)
-    return actual
+    return _finish_move_or_raise(label, response, target, pose_session)
 
 
-def _move_to_target_xy(label: str, current: np.ndarray, target_xy_mm: np.ndarray,
-                       motion: AuboMotionSession, pose_session: AuboPoseSession) -> np.ndarray:
+def _move_to_target_xy(
+    label: str,
+    current: np.ndarray,
+    target_xy_mm: np.ndarray,
+    motion: AuboMotionSession,
+    pose_session: AuboPoseSession,
+    *,
+    require_confirmation: bool = True,
+) -> np.ndarray:
     """仅移动 TCP 基坐标 XY，严格保持当前 Z 和全部姿态（含 yaw）。"""
     target = np.asarray(current, dtype=np.float64).copy()
     target[:2, 3] = np.asarray(target_xy_mm, dtype=np.float64).reshape(2)
     delta = target[:3, 3] - current[:3, 3]
     if float(np.linalg.norm(delta[:2])) < 0.02:
         return current
+    xy_distance = float(np.linalg.norm(delta[:2]))
+    if xy_distance > MAX_AUTO_XY_DELTA_MM:
+        raise RuntimeError(
+            f"自动 XY 移动 {xy_distance:.1f} mm 超过安全上限 "
+            f"{MAX_AUTO_XY_DELTA_MM:.0f} mm；请先用示教器移动到目标附近"
+        )
     print(
         f"\n[MOTION] {label}\n"
         f"  current XYZ(mm): {np.round(current[:3, 3], 3).tolist()}\n"
         f"  target  XYZ(mm): {np.round(target[:3, 3], 3).tolist()}\n"
         f"  仅修改基坐标 XY: {np.round(delta[:2], 3).tolist()} mm；Z、姿态、yaw 均保持不变"
     )
-    if input("输入 m 确认自动 XY 运动，其他任意键取消：").strip().lower() != "m":
+    if require_confirmation and input("输入 m 确认自动 XY 运动，其他任意键取消：").strip().lower() != "m":
         raise RuntimeError("用户取消自动 XY 对准")
     response = _submit_move_line(motion, target)
     print("[MOTION]", response)
-    if not response or not sdk_ok(response[-1]):
-        raise RuntimeError(f"{label} moveLine 下发失败：{response}")
-    _, actual = _wait_steady(pose_session)
-    return actual
+    return _finish_move_or_raise(label, response, target, pose_session)
+
+
+def _plan_camera_over_corner(
+    T_base_tcp: np.ndarray,
+    T_tcp_camera: np.ndarray,
+    corner_base_mm: np.ndarray,
+    camera_height_mm: float,
+) -> np.ndarray:
+    """保持 TCP 姿态，使所选角点落在相机光轴前方指定距离处。"""
+    current = np.asarray(T_base_tcp, dtype=np.float64)
+    T_base_camera = current @ np.asarray(T_tcp_camera, dtype=np.float64)
+    corner = np.asarray(corner_base_mm, dtype=np.float64).reshape(3)
+    camera_origin_target = corner - T_base_camera[:3, 2] * float(camera_height_mm)
+    target = current.copy()
+    target[:3, 3] += camera_origin_target - T_base_camera[:3, 3]
+    return target
+
+
+def _move_to_fine_capture_pose(
+    label: str,
+    current: np.ndarray,
+    target: np.ndarray,
+    motion: AuboMotionSession,
+    pose_session: AuboPoseSession,
+) -> np.ndarray:
+    """先在高位横移到角点上方，再只改基坐标 Z 进入 260 mm 层。"""
+    after_xy = _move_to_target_xy(
+        f"{label}：高位对准角点上方 XY",
+        current,
+        np.asarray(target, dtype=np.float64)[:2, 3],
+        motion,
+        pose_session,
+        require_confirmation=False,
+    )
+    return _move_base_z_only(
+        f"{label}：下降到 {FINE_CAPTURE_HEIGHT_MM:.0f} mm 精定位层",
+        after_xy,
+        float(np.asarray(target, dtype=np.float64)[2, 3]),
+        motion,
+        pose_session,
+        require_confirmation=False,
+    )
+
+
+def _return_to_high_view(
+    label: str,
+    current: np.ndarray,
+    fine_capture_pose: np.ndarray,
+    high_view_pose: np.ndarray,
+    motion: AuboMotionSession,
+    pose_session: AuboPoseSession,
+) -> np.ndarray:
+    """最终点记录后分两段垂直抬升，再在高位返回原观察 XY。"""
+    fine_lift = _move_base_z_only(
+        f"{label}：离开板面并返回260 mm层",
+        current,
+        float(np.asarray(fine_capture_pose)[2, 3]),
+        motion,
+        pose_session,
+        require_confirmation=False,
+    )
+    high_lift = _move_base_z_only(
+        f"{label}：从260 mm层返回高位 Z",
+        fine_lift,
+        float(np.asarray(high_view_pose)[2, 3]),
+        motion,
+        pose_session,
+        require_confirmation=False,
+    )
+    return _move_to_target_xy(
+        f"{label}：高位返回观察 XY",
+        high_lift,
+        np.asarray(high_view_pose)[:2, 3],
+        motion,
+        pose_session,
+        require_confirmation=False,
+    )
 
 
 def _annotate_corners(image: np.ndarray, result: Any, selected_id: int | None) -> None:
@@ -458,6 +600,96 @@ def _statistics(values: np.ndarray) -> dict[str, float]:
     }
 
 
+def _load_current_model_context() -> dict[str, Any] | None:
+    """读取已安装模型及其原始训练记录，供独立验证和增量优化使用。"""
+    path = Path(VISUAL_TO_TCP_MODEL_SOURCE)
+    if not VISUAL_TO_TCP_MODEL_READY or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        source_text = payload.get("source_report")
+        source_path = Path(source_text).expanduser().resolve() if source_text else None
+        source_report = (
+            json.loads(source_path.read_text(encoding="utf-8"))
+            if source_path is not None and source_path.is_file() else {}
+        )
+        source_records = source_report.get("records", [])
+        if not isinstance(source_records, list):
+            source_records = []
+        return {
+            "current_path": path,
+            "source_report_path": source_path,
+            "source_records": source_records,
+            "training_corner_ids": sorted({int(item["corner_id"]) for item in source_records}),
+            "installed_at": payload.get("installed_at"),
+        }
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"当前 ChArUco XY 模型上下文读取失败：{exc}") from exc
+
+
+def evaluate_installed_model(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """统计新触碰真值相对当前已安装模型预测值的独立 XY 误差。"""
+    if not records:
+        return {"status": "insufficient_data", "sample_count": 0}
+    visual = np.asarray([item["visual_corner_base_mm"][:2] for item in records], dtype=np.float64)
+    touch = np.asarray(
+        [[item["touch_tcp_pose_m_rad"][0] * 1000.0,
+          item["touch_tcp_pose_m_rad"][1] * 1000.0] for item in records],
+        dtype=np.float64,
+    )
+    predicted = _predict(visual, VISUAL_TO_TCP_MATRIX_2X2, VISUAL_TO_TCP_BIAS_MM)
+    residual = touch - predicted
+    norms = np.linalg.norm(residual, axis=1)
+    error = _statistics(norms)
+    enough = len(records) >= MIN_INDEPENDENT_VALIDATION_POINTS
+    passed = bool(
+        enough
+        and error["rms_mm"] <= VALIDATION_RMS_LIMIT_MM
+        and error["max_mm"] <= VALIDATION_MAX_LIMIT_MM
+    )
+    status = "passed" if passed else ("needs_optimization" if enough else "collecting")
+    return {
+        "status": status,
+        "sample_count": int(len(records)),
+        "minimum_sample_count": MIN_INDEPENDENT_VALIDATION_POINTS,
+        "definition": "touch_tcp_xy_mm - installed_model(visual_corner_xy_mm)",
+        "residual_xy_mean_mm": np.mean(residual, axis=0),
+        "residual_xy_median_mm": np.median(residual, axis=0),
+        "error": error,
+        "acceptance": {
+            "rms_limit_mm": VALIDATION_RMS_LIMIT_MM,
+            "max_limit_mm": VALIDATION_MAX_LIMIT_MM,
+            "passed": passed,
+        },
+        "per_sample": [
+            {
+                "label": item["label"],
+                "corner_id": int(item["corner_id"]),
+                "residual_xy_mm": residual[index],
+                "error_norm_mm": float(norms[index]),
+            }
+            for index, item in enumerate(records)
+        ],
+    }
+
+
+def build_optimized_candidate(
+    training_records: list[dict[str, Any]],
+    validation_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """合并旧训练点与新独立点拟合候选；候选必须再用下一轮新点验证。"""
+    combined = [*training_records, *validation_records]
+    candidate = build_xy_model(combined)
+    return {
+        "status": candidate.get("status", "insufficient_data"),
+        "training_sample_count": int(len(training_records)),
+        "new_sample_count": int(len(validation_records)),
+        "combined_sample_count": int(len(combined)),
+        "requires_fresh_independent_validation": True,
+        "model": candidate,
+    }
+
+
 def build_xy_model(records: list[dict[str, Any]]) -> dict[str, Any]:
     """按角点分组拟合，留出一个角点交叉验证；绝不把训练误差称为精度。"""
     groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -500,12 +732,41 @@ def build_xy_model(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _update_validation_and_candidate(
+    report: dict[str, Any],
+    records: list[dict[str, Any]],
+    model_context: dict[str, Any] | None,
+    run_dir: Path,
+) -> None:
+    """更新当前模型独立误差，并输出包含新点的优化候选。"""
+    if model_context is None:
+        return
+    validation = evaluate_installed_model(records)
+    candidate = build_optimized_candidate(model_context["source_records"], records)
+    report["installed_model_validation"] = validation
+    report["optimized_candidate"] = candidate
+    if candidate.get("model", {}).get("status") == "ready":
+        _save_json(run_dir / "optimized_candidate.json", {
+            "schema_version": 1,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "source_current_model": str(model_context["current_path"]),
+            "source_training_report": (
+                str(model_context["source_report_path"])
+                if model_context.get("source_report_path") is not None else None
+            ),
+            "validation_run_report": str(run_dir / "report.json"),
+            "model": candidate["model"],
+            "requires_fresh_independent_validation": True,
+        })
+
+
 def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
     fields = [
         "label", "row", "col", "repeat", "corner_id", "board_x_mm", "board_y_mm",
         "visual_x_mm", "visual_y_mm", "visual_z_mm", "touch_x_mm", "touch_y_mm", "touch_z_mm",
         "residual_x_mm", "residual_y_mm", "capture_height_mm", "pnp_rmse_p95_px",
         "pnp_max_p95_px", "corner_pnp_scatter_p95_mm",
+        "corrected_residual_x_mm", "corrected_residual_y_mm", "corrected_error_mm",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -522,6 +783,9 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
                 "pnp_rmse_p95_px": item["pnp_quality"]["reprojection_rmse_p95_px"],
                 "pnp_max_p95_px": item["pnp_quality"]["reprojection_max_p95_px"],
                 "corner_pnp_scatter_p95_mm": item["pnp_quality"]["board_translation_scatter_p95_mm"],
+                "corrected_residual_x_mm": item.get("post_correction_residual_xy_mm", [None, None])[0],
+                "corrected_residual_y_mm": item.get("post_correction_residual_xy_mm", [None, None])[1],
+                "corrected_error_mm": item.get("post_correction_error_mm"),
             })
 
 
@@ -532,7 +796,16 @@ def _label(row: int, col: int, repeat: int) -> str:
 def main() -> int:
     if min(GRID_ROWS, GRID_COLS, REPEATS_PER_CORNER) < 1:
         raise ValueError("网格和重复次数必须为正")
-    resumed = _load_resume_report()
+    model_context = _load_current_model_context()
+    training_corner_ids = set(
+        model_context["training_corner_ids"] if model_context is not None else []
+    )
+    source_report_text = (
+        str(model_context["source_report_path"])
+        if model_context is not None and model_context.get("source_report_path") is not None
+        else None
+    )
+    resumed = _load_resume_report(source_report_text)
     if resumed is None:
         run_dir = OUTPUT_ROOT / f"charuco-tcp-xy-{datetime.now():%Y%m%d_%H%M%S}"
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -541,13 +814,25 @@ def main() -> int:
             "status": "collecting", "created_at": datetime.now().isoformat(timespec="seconds"),
             "run_dir": str(run_dir), "mode": "charuco_tcp_absolute_xy_model",
             "limitations": [
-                "只适用于当前手眼、当前TCP、当前工具、固定yaw和当前配置的相机高度",
-                "最终触碰Z由人工完成；若不把工具尖端实际对到角点，不能得到XY真值",
+                "只适用于当前手眼、当前TCP、当前工具、固定yaw和260mm精定位高度",
+                "程序只自动对准最终XY；最终Z由操作者示教，微调后的TCP才是XY真值",
                 "标定板一旦移动，本次绝对XY模型即失效",
             ],
             "configuration": {"grid_rows": GRID_ROWS, "grid_cols": GRID_COLS, "repeats": REPEATS_PER_CORNER,
-                              "initial_capture_height_raise_mm": INITIAL_CAPTURE_HEIGHT_RAISE_MM,
+                              "workflow_version": WORKFLOW_VERSION,
+                              "fine_capture_height_mm": FINE_CAPTURE_HEIGHT_MM,
+                              "auto_move_to_fine_pose": AUTO_MOVE_TO_FINE_POSE,
+                              "auto_move_to_final_xy": AUTO_MOVE_TO_VISUAL_XY,
+                              "final_z_policy": "manual_teach_pendant",
+                              "motion_confirmation_policy": "one_m_per_point_then_auto_return",
+                              "run_purpose": (
+                                  "independent_validation_and_candidate_optimization"
+                                  if model_context is not None else "initial_model_collection"
+                              ),
+                              "visual_to_tcp_model_ready": VISUAL_TO_TCP_MODEL_READY,
                               "visual_to_tcp_model_source": str(VISUAL_TO_TCP_MODEL_SOURCE),
+                              "installed_model_source_report": source_report_text,
+                              "excluded_training_corner_ids": sorted(training_corner_ids),
                               "visual_to_tcp_matrix_2x2": VISUAL_TO_TCP_MATRIX_2X2,
                               "visual_to_tcp_bias_mm": VISUAL_TO_TCP_BIAS_MM},
             "records": records,
@@ -558,13 +843,29 @@ def main() -> int:
         saved = report.get("configuration", {})
         if (int(saved.get("grid_rows", GRID_ROWS)) != GRID_ROWS
                 or int(saved.get("grid_cols", GRID_COLS)) != GRID_COLS
-                or int(saved.get("repeats", REPEATS_PER_CORNER)) != REPEATS_PER_CORNER):
+                or int(saved.get("repeats", REPEATS_PER_CORNER)) != REPEATS_PER_CORNER
+                or saved.get("workflow_version") != WORKFLOW_VERSION):
             raise RuntimeError("读档网格配置与当前代码配置不一致；请恢复原配置或关闭自动读档新建实验")
+        if saved.get("installed_model_source_report") != source_report_text:
+            raise RuntimeError("读档使用的 current.json 与当前已安装模型不同；请关闭自动读档新建实验")
         report["status"] = "collecting"
         report["resumed_at"] = datetime.now().isoformat(timespec="seconds")
         print(f"[RESUME] 已读档：{run_dir} | 已保存 {len(records)} 组，将从下一未完成组继续。")
     report.setdefault("configuration", {}).update({
+        "workflow_version": WORKFLOW_VERSION,
+        "fine_capture_height_mm": FINE_CAPTURE_HEIGHT_MM,
+        "auto_move_to_fine_pose": AUTO_MOVE_TO_FINE_POSE,
+        "auto_move_to_final_xy": AUTO_MOVE_TO_VISUAL_XY,
+        "final_z_policy": "manual_teach_pendant",
+        "motion_confirmation_policy": "one_m_per_point_then_auto_return",
+        "run_purpose": (
+            "independent_validation_and_candidate_optimization"
+            if model_context is not None else "initial_model_collection"
+        ),
+        "visual_to_tcp_model_ready": VISUAL_TO_TCP_MODEL_READY,
         "visual_to_tcp_model_source": str(VISUAL_TO_TCP_MODEL_SOURCE),
+        "installed_model_source_report": source_report_text,
+        "excluded_training_corner_ids": sorted(training_corner_ids),
         "visual_to_tcp_matrix_2x2": VISUAL_TO_TCP_MATRIX_2X2,
         "visual_to_tcp_bias_mm": VISUAL_TO_TCP_BIAS_MM,
     })
@@ -585,10 +886,21 @@ def main() -> int:
         motion = AuboMotionSession()
         motion.connect(ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user, ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms)
         total = GRID_ROWS * GRID_COLS * REPEATS_PER_CORNER
-        print("\n[流程] 每组：人工到可见位置 -> 程序仅抬升基坐标Z至本次锁定高度 -> 选 ChArUco 角点 -> 人工触碰角点并记录TCP。")
-        print("[要求] 3x3格选择分散的9个内部角点；每格只记录一次且必须选择新角点。最终Z由人工下降。")
-        locked_value = report.get("configuration", {}).get("locked_capture_height_mm")
-        locked_capture_height_mm: float | None = float(locked_value) if locked_value is not None else None
+        print(
+            "\n[流程] 每组：高位选角点 -> 自动对准并下降到260 mm -> "
+            "260 mm重新精定位 -> 自动对准最终XY -> 人工示教Z并检查/微调后记录。"
+        )
+        print("[要求] 3x3格选择分散的9个内部角点；每格只记录一次且必须选择新角点。")
+        print(
+            f"[MODEL] current.json={'已加载' if VISUAL_TO_TCP_MODEL_READY else '不存在/无效，使用零补偿'}："
+            f"{VISUAL_TO_TCP_MODEL_SOURCE}"
+        )
+        if model_context is not None:
+            print(
+                "[VALIDATION] 本轮为独立验证；不能选择当前模型的9个训练角点："
+                f"{sorted(training_corner_ids)}"
+            )
+            print("[OPTIMIZE] 每个新点都会更新纠偏后误差，并生成合并拟合候选。")
         for row in range(GRID_ROWS):
             for col in range(GRID_COLS):
                 for repeat in range(REPEATS_PER_CORNER):
@@ -598,128 +910,200 @@ def main() -> int:
                         continue
                     print(f"\n{'=' * 72}\n[{label}] {len(records) + 1}/{total}")
                     _preview_board_until_confirm(pipeline, board, dictionary, label)
-                    # 最多三次：PnP测得相机-板面距离，程序只修改基坐标 Z。
-                    for correction in range(MAX_Z_CORRECTIONS + 1):
-                        _, current_tcp = _current_tcp(pose_session)
-                        height_observation = _capture_board_burst(pipeline, board, dictionary, HEIGHT_MEASURE_FRAMES)
-                        raw_height, _ = _board_height_and_z_target(current_tcp, handeye.T_tcp_rgb_camera,
-                                                                     height_observation["T_rgb_board"], 0.0)
-                        if locked_capture_height_mm is None:
-                            locked_capture_height_mm = raw_height + INITIAL_CAPTURE_HEIGHT_RAISE_MM
-                            report["configuration"]["locked_capture_height_mm"] = locked_capture_height_mm
-                            _save_json(run_dir / "report.json", report)
-                            print(
-                                f"[HEIGHT] 首次检测={raw_height:.2f} mm，锁定采集高度="
-                                f"{locked_capture_height_mm:.2f} mm（仅抬升 {INITIAL_CAPTURE_HEIGHT_RAISE_MM:.1f} mm）"
-                            )
-                        height, target_z = _board_height_and_z_target(
-                            current_tcp, handeye.T_tcp_rgb_camera, height_observation["T_rgb_board"],
-                            locked_capture_height_mm,
-                        )
-                        print(f"[HEIGHT] 当前={height:.2f} mm，锁定目标={locked_capture_height_mm:.2f} mm")
-                        if abs(height - locked_capture_height_mm) <= HEIGHT_TOLERANCE_MM:
-                            break
-                        # 现场限制为“只能自动抬升Z”。若人工把相机放得比锁定高度更高，
-                        # 不自动下降、不退出；保留真实高度并在该样本报告中显式标记。
-                        if AUTO_RAISE_BASE_Z_ONLY and target_z < current_tcp[2, 3]:
-                            deviation = float(height - locked_capture_height_mm)
-                            print(
-                                f"[HEIGHT-WARN] 当前比锁定高度高 {deviation:.2f} mm；"
-                                "只抬升策略不允许自动下降，本组按当前高度继续并写入报告。"
-                            )
-                            report.setdefault("height_warnings", []).append({
-                                "label": label, "current_height_mm": height,
-                                "locked_height_mm": locked_capture_height_mm,
-                                "deviation_mm": deviation,
-                                "policy": "accepted_without_auto_descent",
-                            })
-                            _save_json(run_dir / "report.json", report)
-                            break
-                        if correction >= MAX_Z_CORRECTIONS:
-                            raise RuntimeError("自动高度修正次数已用尽，仍未达到目标高度")
-                        _move_base_z_only(f"ChArUco 高度修正 {correction + 1}/{MAX_Z_CORRECTIONS}", current_tcp, target_z,
-                                          motion, pose_session)
-
                     expected_id = cell_corner_ids.get((row, col))
                     if expected_id is None:
-                        selected_id = _select_corner(pipeline, board, dictionary, label)
+                        while True:
+                            selected_id = _select_corner(pipeline, board, dictionary, label)
+                            if selected_id in training_corner_ids:
+                                print(
+                                    f"[VALIDATION] 角点 ID={selected_id} 已用于当前模型训练，"
+                                    "不能作为独立验证点；请改选其它角点。"
+                                )
+                                continue
+                            break
                     else:
                         # 仅为兼容旧档案保留；新配置每格只有一次，不会进入这里。
                         selected_id = expected_id
                         print(f"[SELECT] {label} 自动锁定本格角点 ID={selected_id}")
+                    if selected_id in training_corner_ids:
+                        raise RuntimeError(f"验证档案包含训练角点 ID={selected_id}，拒绝混用")
                     if expected_id is None and selected_id in cell_corner_ids.values():
                         raise RuntimeError(f"角点 ID={selected_id} 已属于其它网格位置；请为每格选择不同角点")
                     cell_corner_ids[(row, col)] = selected_id
+
+                    if selected_id >= len(board_corners):
+                        raise RuntimeError(f"无效 ChArUco 角点 ID={selected_id}")
+                    corner_board = np.asarray(board_corners[selected_id], dtype=np.float64)
+                    high_snapshot, high_view_tcp = _current_tcp(pose_session)
+                    coarse_observation = _capture_board_burst(
+                        pipeline, board, dictionary, HEIGHT_MEASURE_FRAMES,
+                    )
+                    coarse_corner = _corner_base_point(
+                        high_view_tcp,
+                        handeye.T_tcp_rgb_camera,
+                        coarse_observation["T_rgb_board"],
+                        corner_board,
+                    )
+                    fine_plan = _plan_camera_over_corner(
+                        high_view_tcp,
+                        handeye.T_tcp_rgb_camera,
+                        coarse_corner,
+                        FINE_CAPTURE_HEIGHT_MM,
+                    )
+                    print(
+                        f"[PLAN] 角点 ID={selected_id} 粗算基坐标="
+                        f"{np.round(coarse_corner, 3).tolist()} mm；进入 "
+                        f"{FINE_CAPTURE_HEIGHT_MM:.0f} mm 精定位层"
+                    )
+                    if input(
+                        "输入 m 确认本组自动运动（高位XY→260mm→高度闭环→最终XY），"
+                        "其他任意键取消："
+                    ).strip().lower() != "m":
+                        raise RuntimeError("用户取消本组自动运动")
+                    if AUTO_MOVE_TO_FINE_POSE:
+                        fine_arrival_tcp = _move_to_fine_capture_pose(
+                            label, high_view_tcp, fine_plan, motion, pose_session,
+                        )
+                    else:
+                        fine_arrival_tcp = high_view_tcp.copy()
+
+                    height = float("nan")
+                    # 到达后用新的 PnP 高度闭环，只修正基坐标 Z。
+                    for correction in range(MAX_Z_CORRECTIONS + 1):
+                        _, current_tcp = _current_tcp(pose_session)
+                        height_observation = _capture_board_burst(
+                            pipeline, board, dictionary, HEIGHT_MEASURE_FRAMES,
+                        )
+                        height, target_z = _board_height_and_z_target(
+                            current_tcp,
+                            handeye.T_tcp_rgb_camera,
+                            height_observation["T_rgb_board"],
+                            FINE_CAPTURE_HEIGHT_MM,
+                        )
+                        print(
+                            f"[HEIGHT] 当前={height:.2f} mm，"
+                            f"精定位目标={FINE_CAPTURE_HEIGHT_MM:.2f} mm"
+                        )
+                        if abs(height - FINE_CAPTURE_HEIGHT_MM) <= HEIGHT_TOLERANCE_MM:
+                            break
+                        if correction >= MAX_Z_CORRECTIONS:
+                            raise RuntimeError("自动高度修正次数已用尽，仍未达到260 mm精定位高度")
+                        _move_base_z_only(
+                            f"260 mm高度闭环 {correction + 1}/{MAX_Z_CORRECTIONS}",
+                            current_tcp,
+                            target_z,
+                            motion,
+                            pose_session,
+                            require_confirmation=False,
+                        )
 
                     before_snapshot, capture_tcp = _current_tcp(pose_session)
                     observation = _capture_board_burst(pipeline, board, dictionary, CAPTURE_VALID_FRAMES)
                     after_snapshot, after_tcp = _current_tcp(pose_session)
                     if np.linalg.norm(after_tcp[:3, 3] - capture_tcp[:3, 3]) > 0.20:
                         raise RuntimeError("ChArUco采集期间 TCP 位置变化超过0.20mm")
-                    if selected_id >= len(board_corners):
-                        raise RuntimeError(f"无效 ChArUco 角点 ID={selected_id}")
-                    corner_board = np.asarray(board_corners[selected_id], dtype=np.float64)
                     visual_corner = _corner_base_point(capture_tcp, handeye.T_tcp_rgb_camera,
                                                         observation["T_rgb_board"], corner_board)
                     overlay = observation["last_result"].rgb_overlay.copy()
                     _annotate_corners(overlay, observation["last_result"], selected_id)
                     cv2.imwrite(str(run_dir / f"{label}_capture.png"), overlay)
-                    print(f"[视觉] corner={selected_id} | predicted XY={np.round(visual_corner[:2], 3).tolist()} mm")
+                    print(
+                        f"[精定位] corner={selected_id} | height={height:.2f} mm | "
+                        f"predicted XYZ={np.round(visual_corner, 3).tolist()} mm"
+                    )
                     planned_tcp = capture_tcp.copy()
                     model_target_xy, model_correction_xy = _visual_to_tcp_target_xy(visual_corner[:2])
                     planned_tcp[:2, 3] = model_target_xy
+                    planned_tcp[2, 3] = float(visual_corner[2])
                     print(
                         f"[MODEL] ChArUco仿射修正={np.round(model_correction_xy, 3).tolist()} mm | "
                         f"target XY={np.round(model_target_xy, 3).tolist()} mm"
                     )
                     if AUTO_MOVE_TO_VISUAL_XY:
                         aligned_tcp = _move_to_target_xy(
-                            f"自动移动至 ChArUco 角点 ID={selected_id} 的目标 XY", capture_tcp,
+                            f"260 mm精定位后自动对准 ChArUco 角点 ID={selected_id} 的最终 XY",
+                            capture_tcp,
                             planned_tcp[:2, 3], motion, pose_session,
+                            require_confirmation=False,
                         )
                     else:
                         aligned_tcp = capture_tcp.copy()
-                    if input("请人工将工具尖端真正触到该 ChArUco 角点；最终Z手动下降，必要时微调XY；稳定后按 Enter（q结束）：").strip().lower() == "q":
+                    if input(
+                        "最终XY已对准，Z未自动移动。请用示教器下降Z并真正触碰角点；"
+                        "必要时微调XY，稳定后按 Enter 记录并自动返回高位（q结束）："
+                    ).strip().lower() == "q":
                         raise KeyboardInterrupt
                     touch_snapshot, touch_tcp = _current_tcp(pose_session)
                     residual_xy = touch_tcp[:2, 3] - visual_corner[:2]
+                    post_correction_residual_xy = touch_tcp[:2, 3] - model_target_xy
                     record = {
                         "label": label, "row": row, "col": col, "repeat": repeat, "corner_id": selected_id,
                         "recorded_at": datetime.now().isoformat(timespec="seconds"), "corner_board_mm": corner_board,
                         "visual_corner_base_mm": visual_corner, "capture_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(capture_tcp),
+                        "high_view_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(high_view_tcp),
+                        "fine_planned_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(fine_plan),
+                        "fine_arrival_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(fine_arrival_tcp),
                         "planned_target_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(planned_tcp),
                         "aligned_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(aligned_tcp),
                         "visual_to_tcp_model_source": str(VISUAL_TO_TCP_MODEL_SOURCE),
                         "visual_to_tcp_xy_correction_mm": model_correction_xy,
+                        "installed_model_predicted_xy_mm": model_target_xy,
+                        "post_correction_residual_xy_mm": post_correction_residual_xy,
+                        "post_correction_error_mm": float(np.linalg.norm(post_correction_residual_xy)),
                         "touch_tcp_pose_m_rad": _transform_to_sdk_pose_m_rad(touch_tcp),
-                        "capture_height_mm": height, "locked_capture_height_mm": locked_capture_height_mm,
-                        "capture_height_deviation_mm": float(height - locked_capture_height_mm),
+                        "capture_height_mm": height, "locked_capture_height_mm": FINE_CAPTURE_HEIGHT_MM,
+                        "capture_height_deviation_mm": float(height - FINE_CAPTURE_HEIGHT_MM),
                         "touch_minus_visual_xy_mm": residual_xy,
                         "pnp_quality": {key: observation[key] for key in (
                             "valid_frames", "attempts", "charuco_count_median", "reprojection_rmse_p95_px",
                             "reprojection_max_p95_px", "board_translation_scatter_p95_mm",
                         )},
+                        "high_view_robot_snapshot": high_snapshot,
                         "capture_robot_snapshot_before": before_snapshot, "capture_robot_snapshot_after": after_snapshot,
                         "touch_robot_snapshot": touch_snapshot,
                     }
                     records.append(record)
                     completed_labels.add(label)
                     report["model"] = build_xy_model(records)
+                    _update_validation_and_candidate(report, records, model_context, run_dir)
                     _write_csv(run_dir / "charuco_tcp_xy_samples.csv", records)
                     _save_json(run_dir / "report.json", report)
                     loo = (report["model"].get("leave_one_corner_out_error") or {}).get("p95_mm", float("nan"))
                     print(f"[触碰差] TCP - visual = {np.round(residual_xy, 3).tolist()} mm | LOOCV P95={loo:.3f} mm")
-                    print("[NEXT] 请人工仅抬升 Z，使标定板重新清晰可见；随后在相机窗口点击左键进入下一组。")
+                    if model_context is not None:
+                        validation_error = report["installed_model_validation"]["error"]
+                        print(
+                            f"[纠偏后误差] 本点={np.linalg.norm(post_correction_residual_xy):.3f} mm | "
+                            f"累计RMS={validation_error['rms_mm']:.3f} mm | "
+                            f"P95={validation_error['p95_mm']:.3f} mm | "
+                            f"最大={validation_error['max_mm']:.3f} mm"
+                        )
+                    _return_to_high_view(
+                        label, touch_tcp, capture_tcp, high_view_tcp, motion, pose_session,
+                    )
+                    print("[NEXT] 已返回本组高位观察姿态；在相机窗口选择下一角点。")
         report["status"] = "completed"
         report["model"] = build_xy_model(records)
+        _update_validation_and_candidate(report, records, model_context, run_dir)
         _write_csv(run_dir / "charuco_tcp_xy_samples.csv", records)
         _save_json(run_dir / "report.json", report)
         print("\n[完成]", run_dir)
         print(json.dumps(_jsonable(report["model"]), ensure_ascii=False, indent=2))
+        if model_context is not None:
+            print("\n[独立验证]", json.dumps(
+                _jsonable(report["installed_model_validation"]), ensure_ascii=False, indent=2,
+            ))
+            validation_status = report["installed_model_validation"]["status"]
+            if validation_status == "passed":
+                print("[结论] 当前模型独立验证通过：RMS和最大误差均不超过0.20 mm。")
+            else:
+                print("[结论] 当前模型未达到0.20 mm独立验证门限，使用优化候选前还需新一轮验证。")
+            print(f"[优化候选] {run_dir / 'optimized_candidate.json'}")
         return 0
     except KeyboardInterrupt:
         report["status"] = "stopped_by_user"
         report["model"] = build_xy_model(records)
+        _update_validation_and_candidate(report, records, model_context, run_dir)
         _write_csv(run_dir / "charuco_tcp_xy_samples.csv", records)
         _save_json(run_dir / "report.json", report)
         print(f"\n[停止] 已保存 {len(records)} 组记录：{run_dir}")
@@ -728,6 +1112,7 @@ def main() -> int:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["model"] = build_xy_model(records)
+        _update_validation_and_candidate(report, records, model_context, run_dir)
         _write_csv(run_dir / "charuco_tcp_xy_samples.csv", records)
         _save_json(run_dir / "report.json", report)
         print(f"\n[FAILED] {type(exc).__name__}: {exc}")
