@@ -12,10 +12,63 @@ import numpy as np
 
 from aubo_workbench import sequential_hole_execution as execution
 from aubo_workbench.geometry import transform_to_sdk_pose_m_rad
-from aubo_workbench.hole_localization_planning import plan_final_tcp_base_z
+from aubo_workbench.hole_localization_planning import (
+    plan_final_tcp_base_z, plan_final_tcp_xy,
+)
 
 
 class PlannedFinalPointPersistenceTests(unittest.TestCase):
+    def test_precaptured_final_target_uses_its_own_orientation(self) -> None:
+        current = np.eye(4)
+        current[:3, 3] = [0.0, 0.0, 100.0]
+        current_before = current.copy()
+        fine_capture = np.eye(4)
+        angle = np.deg2rad(15.0)
+        fine_capture[:3, :3] = [
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(angle), -np.sin(angle)],
+            [0.0, np.sin(angle), np.cos(angle)],
+        ]
+        fine_capture[:3, 3] = [10.0, 20.0, 260.0]
+        point = np.array([50.0, 60.0, 40.0])
+        with patch.object(execution, "np", np, create=True), patch.object(
+            execution, "plan_final_tcp_xy", plan_final_tcp_xy, create=True,
+        ), patch.object(
+            execution, "plan_final_tcp_base_z", plan_final_tcp_base_z, create=True,
+        ):
+            reference, xy_target, final = execution._plan_per_hole_final_target(
+                current, fine_capture, point, None,
+                use_charuco_model=False, precaptured=True,
+            )
+        np.testing.assert_allclose(reference[:3, :3], fine_capture[:3, :3])
+        np.testing.assert_allclose(xy_target[:3, :3], fine_capture[:3, :3])
+        np.testing.assert_allclose(final[:3, :3], fine_capture[:3, :3])
+        np.testing.assert_allclose(final[:3, 3], point)
+        np.testing.assert_allclose(current, current_before)
+
+    def test_precaptured_pose_forces_safe_path_even_above_final(self) -> None:
+        current = np.eye(4)
+        current[2, 3] = 100.0
+        final = current.copy()
+        final[2, 3] = 40.0
+        final[0, 3] = 50.0
+        timing = SimpleNamespace(measure=lambda *a, **k: nullcontext())
+        with patch.object(execution, "np", np, create=True), patch.object(
+            execution, "_move_to_batch_final_tcp_direct", return_value=final,
+            create=True,
+        ) as safe, patch.object(
+            execution, "_confirm_and_move_line", side_effect=AssertionError("unsafe XY first"),
+            create=True,
+        ):
+            reached, after_xy, policy = execution._execute_per_hole_final_motion(
+                7, 7, current, final, final, "model", object(),
+                object(), object(), timing, force_safe_path=True,
+            )
+        safe.assert_called_once()
+        self.assertIsNone(after_xy)
+        self.assertEqual(policy, "safe_z_lift_xy_guarded_z_descent")
+        np.testing.assert_allclose(reached, final)
+
     def test_current_below_final_uses_safe_z_xy_z_route(self) -> None:
         current = np.eye(4)
         current[:3, 3] = [0.0, 0.0, 10.0]

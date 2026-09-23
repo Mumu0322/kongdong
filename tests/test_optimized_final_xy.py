@@ -41,7 +41,7 @@ class FinalXyPlanningTests(unittest.TestCase):
         self.assertTrue(args.move_final_xy)
         self.assertTrue(args.two_stage_hole_localization)
         self.assertFalse(args.execute)
-        self.assertTrue(args.allow_experimental_handeye)
+        self.assertFalse(args.allow_experimental_handeye)
 
     def test_coarse_normal_gate_matches_measured_depth_repeatability(self):
         self.assertEqual(TwoStageConfig().normal_tolerance_deg, 2.0)

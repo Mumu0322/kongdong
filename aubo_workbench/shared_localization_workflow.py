@@ -941,7 +941,7 @@ def _flush_rgb_queue_until_fresh(
     maximum = minimum + max(0, int(maximum_extra_frames))
     required = max(1, int(required_fresh_intervals))
     threshold_ns = max(0, int(float(fresh_host_interval_ms) * 1_000_000.0))
-    if minimum == 0:
+    if maximum == 0:
         return {
             "discarded_frame_count": 0,
             "fresh_frame_confirmed": False,
@@ -988,14 +988,20 @@ def _flush_rgb_queue_until_fresh(
             "color_frame_index": getattr(bundle, "color_frame_index", None),
             "fresh_interval_streak": fresh_streak,
         })
-        if discarded < minimum:
+        # minimum=0 means adaptive mode: do not force a fixed warm-up batch,
+        # but still consume frames until the timestamp stream is fresh.
+        if discarded < max(1, minimum):
             continue
         if not metadata_available:
             return {
                 "discarded_frame_count": discarded,
                 "attempt_count": attempts,
                 "fresh_frame_confirmed": False,
-                "reason": "minimum_reached_without_frame_metadata",
+                "reason": (
+                    "minimum_reached_without_frame_metadata"
+                    if minimum > 0 else
+                    "adaptive_single_frame_without_frame_metadata"
+                ),
                 "fresh_host_interval_ms": float(fresh_host_interval_ms),
                 "required_fresh_intervals": required,
                 "records": records,
@@ -1020,6 +1026,81 @@ def _flush_rgb_queue_until_fresh(
         "required_fresh_intervals": required,
         "records": records,
     }
+
+
+def _paired_fine_center_diagnostic(
+    hole: dict[str, Any],
+    detection_center: np.ndarray,
+    ellipse: dict[str, Any] | None,
+    intrinsics: Any,
+    current_tcp: np.ndarray,
+    handeye: Any,
+) -> dict[str, Any]:
+    """Record same-frame alternative centers without changing localization decisions."""
+    result: dict[str, Any] = {
+        "paired_center_diagnostic_status": "unavailable",
+        "yolo_center_px_distorted": np.asarray(
+            detection_center, dtype=np.float64,
+        ).reshape(2).tolist(),
+    }
+    try:
+        yolo_center = np.asarray(
+            undistort_pixels(
+                intrinsics,
+                np.asarray(detection_center, dtype=np.float64).reshape(1, 2),
+                pixel_output=True,
+            )[0], dtype=np.float64,
+        ).reshape(2)
+        result["yolo_center_px"] = yolo_center.tolist()
+        if ellipse is None or ellipse.get("center_px") is None:
+            result["paired_center_diagnostic_status"] = "geometric_center_missing"
+            return result
+        geometric_center = np.asarray(
+            ellipse["center_px"], dtype=np.float64,
+        ).reshape(2)
+        result["paired_center_delta_px"] = (
+            yolo_center - geometric_center
+        ).tolist()
+        plane_point = hole.get("coarse_plane_point_base_mm")
+        if plane_point is None:
+            plane_point = hole.get("initial_center_base_mm")
+        normal = hole.get("coarse_normal_toward_camera_base")
+        if normal is None:
+            normal = hole.get("initial_plane_normal_base")
+        if plane_point is None or normal is None:
+            result["paired_center_diagnostic_status"] = "plane_geometry_missing"
+            return result
+        plane_point = np.asarray(plane_point, dtype=np.float64).reshape(3)
+        normal = _unit(
+            np.asarray(normal, dtype=np.float64).reshape(3),
+            "paired fine center diagnostic normal",
+        )
+        points = {}
+        for source, center in (
+            ("yolo", yolo_center),
+            ("geometric", geometric_center),
+        ):
+            point = np.asarray(
+                pixel_to_base_plane(
+                    center, intrinsics, current_tcp,
+                    handeye.T_tcp_rgb_camera, plane_point, normal,
+                    center_is_undistorted=True,
+                ), dtype=np.float64,
+            ).reshape(3)
+            if not np.isfinite(point).all():
+                raise ValueError(f"{source} point is not finite")
+            points[source] = point
+            result[f"{source}_point_base_mm"] = point.tolist()
+        result["paired_center_delta_xy_mm"] = (
+            points["yolo"][:2] - points["geometric"][:2]
+        ).tolist()
+        result["paired_center_diagnostic_status"] = "complete"
+    except Exception as exc:
+        result["paired_center_diagnostic_status"] = "error"
+        result["paired_center_diagnostic_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+    return result
 
 
 def _batch_fine_localization_at_260mm(
@@ -1092,21 +1173,22 @@ def _batch_fine_localization_at_260mm(
         fine_settle_discard_frames=int(cfg.batch_fine_settle_discard_frames),
     )
     settle_discard_frames = max(0, int(batch_cfg.fine_settle_discard_frames))
-    if settle_discard_frames > 0:
-        with timing.measure(
-            "batch_fine/discard_settle_frames",
-            target_frames=settle_discard_frames,
+    # 相机管线持续运行时，即使配置的最少丢帧数为0，也要先确认队列已
+    # 追上实时流；helper会按时间戳自适应读取，避免固定丢弃10帧。
+    with timing.measure(
+        "batch_fine/discard_settle_frames",
+        target_frames=settle_discard_frames,
+    ):
+        with visual_measure(
+            timing,
+            "batch_fine/frame_acquisition_settle",
+            "frame_acquisition",
+            target_frames=int(settle_discard_frames),
         ):
-            with visual_measure(
-                timing,
-                "batch_fine/frame_acquisition_settle",
-                "frame_acquisition",
-                target_frames=int(settle_discard_frames),
-            ):
-                settle_flush = _flush_rgb_queue_until_fresh(
-                    pipeline, settle_discard_frames,
-                )
-            discarded_frame_count = int(settle_flush["discarded_frame_count"])
+            settle_flush = _flush_rgb_queue_until_fresh(
+                pipeline, settle_discard_frames,
+            )
+        discarded_frame_count = int(settle_flush["discarded_frame_count"])
 
     max_frames = max(1, int(batch_cfg.fine_frames))
     # 首拍仍以原有正式帧数为主；只有某些孔未通过质量门时，才利用
@@ -1265,6 +1347,10 @@ def _batch_fine_localization_at_260mm(
                 ):
                     ellipse = fit_hole_ellipse(bundle.color_bgr, detection, bundle.intrinsics)
                 strict_ok = _ellipse_ok(ellipse, cfg)
+                paired_diagnostic = _paired_fine_center_diagnostic(
+                    hole, detection_center, ellipse, bundle.intrinsics,
+                    current_tcp, handeye,
+                )
                 if not strict_ok:
                     rejected_center = (
                         np.asarray(ellipse["center_px"], dtype=np.float64).reshape(2)
@@ -1285,6 +1371,7 @@ def _batch_fine_localization_at_260mm(
                         "hole_id": hole_id, "valid": False,
                         "distance_px": float(assigned["distance_px"]),
                         "reason": "ellipse_quality",
+                        **paired_diagnostic,
                     })
                     continue
 
@@ -1317,6 +1404,7 @@ def _batch_fine_localization_at_260mm(
                         "distance_px": float(assigned["distance_px"]),
                         "geometric_anchor_distance_px": geometric_anchor_distance,
                         "reason": reason,
+                        **paired_diagnostic,
                     })
                     continue
                 observations_by_hole[hole_id].append(Observation(
@@ -1336,6 +1424,7 @@ def _batch_fine_localization_at_260mm(
                     "geometric_center_px": center.tolist(),
                     "geometric_center_px_distorted": center_distorted.tolist(),
                     "ellipse_residual_px": float(ellipse["residual_px"]),
+                    **paired_diagnostic,
                 })
 
             for hole_id in hole_ids:

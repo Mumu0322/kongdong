@@ -83,6 +83,13 @@ def _reference_holes(reference_report: dict[str, Any]) -> list[dict[str, Any]]:
     for hole in raw:
         if not isinstance(hole, dict) or str(hole.get("status")) != "completed":
             continue
+        if bool(hole.get("pointcloud_center_fallback")) or str(
+            hole.get("fine_quality_status", "")
+        ).lower() == "pointcloud_center_fallback":
+            # The fallback is sufficient to keep the hole visible in a coarse
+            # map, but it is not an RGB-confirmed center for fitting a map
+            # seed-correction model.
+            continue
         if hole.get("hole_center_base_mm") is None:
             continue
         _finite_xy(hole["hole_center_base_mm"], "逐孔参考孔心")

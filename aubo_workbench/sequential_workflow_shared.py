@@ -2033,6 +2033,126 @@ def run_shared_cache_validation_stage(ctx: Any) -> None:
     ctx.shared_cache_failed_ids = shared_cache_failed_ids
     ctx.invalidated_cache_ids = invalidated_cache_ids
 
+def _capture_failed_holes_before_next_group(
+    ctx: Any,
+    group_index: int,
+    fallback_holes: list[int],
+    planning_holes_by_id: dict[int, dict[str, Any]],
+    current_tcp: Any,
+    group_report: dict[str, Any],
+) -> Any:
+    """Capture single-hole fallbacks now; defer final points and motion to hole order."""
+    originals = {int(hole["hole_id"]): hole for hole in ctx.initial_holes}
+    records: list[dict[str, Any]] = []
+    group_report["immediate_per_hole_fallbacks"] = records
+    for hole_id in fallback_holes:
+        planning_hole = planning_holes_by_id.get(hole_id)
+        hole = originals.get(hole_id)
+        if planning_hole is None or hole is None:
+            records.append({"hole_id": hole_id, "status": "missing_coarse_geometry"})
+            continue
+        try:
+            target, _ = _plan_hole_tcp_pose_fixed_rz(
+                np.asarray(planning_hole["coarse_center_base_mm"], dtype=np.float64),
+                np.asarray(planning_hole["coarse_normal_toward_camera_base"], dtype=np.float64),
+                current_tcp,
+                ctx.handeye.T_tcp_rgb_camera,
+                fixed_rz_rad=ctx.fixed_rz_rad,
+                camera_height_mm=ctx.cfg.fine_height_mm,
+            )
+        except (ValueError, RuntimeError) as exc:
+            # No motion was issued. The original per-hole path remains available.
+            records.append({
+                "hole_id": hole_id,
+                "status": "planning_failed_deferred_to_per_hole_stage",
+                "error": f"{type(exc).__name__}:{exc}",
+            })
+            continue
+        with ctx.timing.measure(
+            f"hole_{hole_id:02d}/in_group_move_to_fine_pose",
+            hole_id=hole_id, group_index=group_index,
+        ):
+            current_tcp = _move_to_fine_pose(
+                str(hole_id), current_tcp, target,
+                ctx.args, ctx.motion_session, ctx.pose_session,
+                target_height_mm=ctx.cfg.fine_height_mm,
+                target_stage="本组失败孔单孔精定位",
+                safe_margin_mm=ctx.cfg.per_hole_fine_safe_z_margin_mm,
+                descent_guard_mm=(
+                    SHARED_OBSERVATION_MIN_DESCENT_MM
+                    if ctx.all_selected_two_capture_mode else 0.0
+                ),
+            )
+        plane_base = np.asarray(
+            planning_hole["coarse_plane_point_base_mm"], dtype=np.float64,
+        ).reshape(3)
+        for correction_index in range(ctx.cfg.max_z_corrections):
+            _, measured_tcp = _require_safe_snapshot(ctx.pose_session)
+            height = camera_height_to_plane_mm(
+                measured_tcp, ctx.handeye.T_tcp_rgb_camera, plane_base,
+            )
+            current_tcp = measured_tcp
+            if abs(height - ctx.cfg.fine_height_mm) <= ctx.cfg.height_tolerance_mm:
+                break
+            z_target, _ = base_z_target_for_camera_height(
+                measured_tcp, ctx.handeye.T_tcp_rgb_camera,
+                plane_base, ctx.cfg.fine_height_mm,
+            )
+            with ctx.timing.measure(
+                f"hole_{hole_id:02d}/in_group_fine_height_correction_{correction_index + 1}",
+                hole_id=hole_id, group_index=group_index,
+            ):
+                current_tcp = _confirm_and_move_line(
+                    f"孔{hole_id}组内补拍纯Z高度修正",
+                    measured_tcp, z_target, ctx.args,
+                    ctx.motion_session, ctx.pose_session,
+                    "只修正基坐标Z；XY和姿态不变",
+                    require_confirmation=False, motion_profile="approach",
+                )
+        _, current_tcp = _require_safe_snapshot(ctx.pose_session)
+        height = camera_height_to_plane_mm(
+            current_tcp, ctx.handeye.T_tcp_rgb_camera, plane_base,
+        )
+        if abs(height - ctx.cfg.fine_height_mm) > ctx.cfg.height_tolerance_mm:
+            raise RuntimeError(
+                f"孔{hole_id}组内补拍未达到精拍高度：{height:.2f} mm"
+            )
+        capture_tcp = np.asarray(current_tcp, dtype=np.float64).copy()
+        camera = camera_transform(capture_tcp, ctx.handeye.T_tcp_rgb_camera)
+        expected_anchor = _project_base_point_to_pixel(
+            np.asarray(planning_hole["coarse_center_base_mm"], dtype=np.float64),
+            camera, ctx.initial_intrinsics,
+        )
+        pipeline, _, _ = ctx.ensure_rgbd_pipeline()
+        recovery = _capture_fine_with_recovery(
+            pipeline, ctx.model, ctx.args.confidence,
+            hole["initial_detection"], ctx.cfg, ctx.run_dir,
+            hole, hole_id,
+            int(hole.get("initial_selection_order") or hole_id),
+            expected_anchor, ctx.timing, ctx.rows,
+        )
+        ctx.in_group_fine_recoveries[hole_id] = {
+            "capture_tcp": capture_tcp,
+            "expected_anchor_px": expected_anchor,
+            "height_mm": height,
+            "recovery": recovery,
+            "group_index": group_index,
+        }
+        records.append({
+            "hole_id": hole_id,
+            "status": "captured" if recovery["success"] else "quality_failed",
+            "fine_quality_status": recovery.get("status"),
+            "error": recovery.get("error"),
+            "capture_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(capture_tcp),
+        })
+        print(
+            f"[BATCH_FINE] 第{group_index}组孔{hole_id}已立即完成逐孔补拍；"
+            f"quality={records[-1]['status']}",
+            flush=True,
+        )
+    return current_tcp
+
+
 def run_shared_fine_stage(ctx: Any) -> None:
     args = ctx.args
     handeye = ctx.handeye
@@ -2098,13 +2218,14 @@ def run_shared_fine_stage(ctx: Any) -> None:
         "initial_pointcloud_reused_holes": initial_pointcloud_reused_holes,
         "coarse_geometry_policy": "fresh_shared_340mm_capture_required",
         "failure_policy": (
-            "bounded_in_group_pose_adjustment_then_per_hole_fine_fallback"
+            "bounded_in_group_pose_adjustment_then_immediate_per_hole_capture"
             if cfg.batch_fine_per_hole_fallback else
             "bounded_in_group_pose_adjustment_then_defer"
         ),
         "joint_failure_policy": (
-            "move_to_per_hole_fine_capture_with_charuco_when_joint_gate_fails"
+            "capture_failed_hole_before_next_group_with_charuco_final_later"
         ),
+        "per_hole_fallback_timing": "after_own_group_before_next_group",
         "combined_position_policy": "projected_bbox_center_from_all_coarse_holes",
         "motion_policy": "shared_vertical_lift_min10_safe_horizontal_descent_guard10_then_pure_descent10_then_steady_capture",
         "final_pose_policy": (
@@ -3134,6 +3255,18 @@ def run_shared_fine_stage(ctx: Any) -> None:
                         flush=True,
                     )
                 batch_fine_plan["groups"].append(group_report)
+                if (
+                    cfg.batch_fine_per_hole_fallback
+                    and group_report.get("fallback_holes")
+                    and not group_report.get("error")
+                ):
+                    # Stay in this group's vicinity. The later per-hole stage
+                    # consumes these RGB results but retains its original final
+                    # motion and operator-confirmation order.
+                    current_tcp = _capture_failed_holes_before_next_group(
+                        ctx, group_index, group_report["fallback_holes"],
+                        fine_planning_holes_by_id, current_tcp, group_report,
+                    )
 
             batch_fine_plan["fallback_holes"] = sorted({
                 *missing_fine_geometry,

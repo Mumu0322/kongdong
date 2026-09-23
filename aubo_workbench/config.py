@@ -26,8 +26,6 @@ from .paths import (
     DEFAULT_ROBOT_TIMEOUT_MS,
     DEFAULT_ROBOT_USER,
     DATA_DIR,
-    HANDEYE_CANDIDATE_DIR,
-    HANDEYE_VALIDATION_PATH,
 )
 
 
@@ -110,16 +108,15 @@ class RobotConfig:
 
 @dataclass
 class RobotCameraIntegrationConfig:
-    """自动入孔所需权威证据文件位置；不使用可手工翻转的解锁布尔值。"""
+    """现场相机身份绑定配置。"""
 
     # 新副本不预设旧设备序列号；现场核对后通过环境变量绑定实际相机。
     production_camera_serial: str = os.environ.get("AUBO_WORKBENCH_CAMERA_SERIAL", "").strip()
-    handeye_validation_evidence_path: str = str(HANDEYE_VALIDATION_PATH)
 
 
 @dataclass
 class SolveConfig:
-    # 8组只允许做诊断求解；正式E7由 E7HandEyeConfig 单独控制。
+    # 至少 8 组才进行诊断求解；诊断结果不自动放行运动。
     min_samples_for_solve: int = 8
     output_json: str = str(DATA_DIR / "handeye_diagnostic_current.json")
     also_write_compatible_key_t_tooltcp_cam: bool = False
@@ -127,43 +124,6 @@ class SolveConfig:
     nonlinear_rotation_weight_mm: float = 80.0
     nonlinear_max_nfev: int = 300
     load_existing_samples_on_start: bool = True
-
-
-@dataclass
-class E7HandEyeConfig:
-    """正式RGB-PnP E7交叉验证；与8组诊断及旧点云样本严格分开。"""
-
-    # 超过 10 组即可进入正式流程：11 组中至少 8 组用于拟合、3 组独立留出验证。
-    minimum_total_poses: int = 11
-    minimum_validation_fraction: float = 0.20
-    minimum_validation_poses: int = 3
-    maximum_validation_center_scatter_rms_mm: float = 0.10
-    maximum_validation_center_scatter_max_mm: float = 0.20
-    require_tcp_pose_source: bool = True
-    allow_manual_pose: bool = False
-    candidate_dir: str = str(HANDEYE_CANDIDATE_DIR)
-
-    # 视野覆盖必须能由原始样本自动计算，不能由人工布尔值直接声称通过。
-    center_region_half_width_ratio: float = 0.22
-    center_region_half_height_ratio: float = 0.22
-    minimum_distinct_edge_regions: int = 2
-
-    # 这些门只用于判定单次采集期间机器人是否真正静止。
-    maximum_pose_bracket_xyz_mm: float = 0.05
-    maximum_pose_bracket_abc_deg: float = 0.01
-
-    # 板固定程度数值验证门槛
-    maximum_board_position_scatter_rms_mm: float = 0.5
-    maximum_board_position_scatter_max_mm: float = 1.0
-    maximum_board_orientation_scatter_rms_deg: float = 0.3
-    maximum_board_orientation_scatter_max_deg: float = 0.6
-    maximum_time_gap_hours: float = 2.0
-
-    # 每个采集会话锁定的TCP/相机元数据一致性门槛。
-    require_tcp_offset_metadata: bool = True
-    maximum_tcp_offset_xyz_delta_mm: float = 0.02
-    maximum_tcp_offset_rpy_delta_deg: float = 0.02
-    require_camera_serial_metadata: bool = True
 
 
 @dataclass
@@ -181,13 +141,15 @@ class AutoCaptureConfig:
     burst_pose_stability_xyz_mm: float = 0.05
     burst_pose_stability_abc_deg: float = 0.01
     reject_unstable_burst_pose: bool = True
+    tcp_offset_tolerance_xyz_mm: float = 0.02
+    tcp_offset_tolerance_rpy_deg: float = 0.02
 
     # 选择同一 TCP 姿态簇时使用的近邻阈值。
     burst_pose_cluster_xyz_mm: float = 0.05
     burst_pose_cluster_abc_deg: float = 0.01
     burst_min_pose_cluster_frames: int = 3
 
-    # True：只有满足毫米级单帧诊断门槛才保存；这不是正式E7手眼验收。
+    # True：只有满足单帧诊断门槛才保存；诊断不自动放行运动。
     require_quality_ok_for_burst: bool = True
 
     # 综合评分与图像质量门槛。
@@ -198,7 +160,7 @@ class AutoCaptureConfig:
     max_corner_max_error_mm: float = 2.0
     max_plane_rmse_mm: float = 0.70
 
-    # RGB手眼正式采样门；点云毫米指标只保留给旧点云诊断。
+    # RGB 手眼采样门；点云毫米指标只保留给旧点云诊断。
     min_rgb_pnp_inliers: int = 78
     max_rgb_reprojection_rmse_px: float = 0.35
     max_rgb_reprojection_error_px: float = 1.00
@@ -222,7 +184,6 @@ CAMERA_CFG = CameraConfig()
 ROBOT_CFG = RobotConfig()
 ROBOT_CAMERA_INTEGRATION_CFG = RobotCameraIntegrationConfig()
 SOLVE_CFG = SolveConfig()
-E7_HAND_EYE_CFG = E7HandEyeConfig()
 AUTO_CAPTURE_CFG = AutoCaptureConfig()
 
 # argparse 参数名 -> RobotConfig 字段名。工作台顶栏的连接参数通过命令行传给

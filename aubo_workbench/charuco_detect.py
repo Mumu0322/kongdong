@@ -614,7 +614,7 @@ def estimate_pointcloud_board_pose(color_bgr: np.ndarray, depth_mm: np.ndarray, 
         (f"ChArUco 标记={marker_count}，角点={charuco_count}，有效3D={valid_3d_count}", text_color),
         (f"点云-标定板拟合 RMSE={rmse:.3f} mm，最大误差={max_err:.3f} mm", text_color),
         (f"板面点数={board_mask_point_count}，内点={plane_inlier_count}，平面RMSE={plane_rmse:.3f} mm", text_color),
-        ("c: 采集5帧选1帧 | h: 诊断 | v: E7验证 | a: 剔除并诊断 | d: 归档最后样本 | m: 手动位姿 | q/ESC: 退出", (255, 255, 255)),
+        ("c: 采集5帧选1帧 | h: 诊断 | a: 剔除并诊断 | d: 归档最后样本 | m: 手动位姿 | q/ESC: 退出", (255, 255, 255)),
     ]
     draw_text_panel(overlay, lines)
 

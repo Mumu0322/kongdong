@@ -20,13 +20,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .config import BOARD_CFG, E7_HAND_EYE_CFG, ROBOT_CAMERA_INTEGRATION_CFG
+from .config import AUTO_CAPTURE_CFG, BOARD_CFG
 from .geometry import average_transforms, make_transform, rotation_error_deg, rotx, roty, rotz
 from .io_utils import atomic_write_json, matrix_to_list, timestamp_str
-from .paths import CHARUCO_POINT_EXPERIMENTS_DIR
+from .paths import CHARUCO_POINT_EXPERIMENTS_DIR, HANDEYE_DIAGNOSTIC_PATH
 
 
-DEFAULT_CANDIDATE_PATH = Path(E7_HAND_EYE_CFG.candidate_dir) / "e7_handeye_candidate_current.json"
 DEFAULT_OUTPUT_DIR = CHARUCO_POINT_EXPERIMENTS_DIR
 WINDOW_NAME = "ChArUco selected point hand-eye experiment (read only)"
 DEFAULT_FIXED_BASE_RZ_RAD = 1.735
@@ -57,10 +56,7 @@ def _rigid_transform(values: Any, name: str) -> np.ndarray:
 
 
 def choose_default_handeye_path() -> Path:
-    authoritative = Path(ROBOT_CAMERA_INTEGRATION_CFG.handeye_validation_evidence_path)
-    if authoritative.exists():
-        return authoritative
-    return DEFAULT_CANDIDATE_PATH
+    return HANDEYE_DIAGNOSTIC_PATH
 
 
 def load_handeye_experiment_result(path: str | Path) -> HandEyeExperimentResult:
@@ -82,15 +78,8 @@ def load_handeye_experiment_result(path: str | Path) -> HandEyeExperimentResult:
     if frame not in {"", "rgb_camera"}:
         raise ValueError(f"当前实验只支持 RGB-PnP 手眼结果，文件 calibration_frame={frame!r}")
 
-    validated = bool(payload.get("validated", False))
-    motion_allowed = (
-        validated
-        and not bool(payload.get("do_not_use_for_motion", True))
-        and bool(payload.get("production_eligible", False))
-    )
-    warning = ""
-    if not motion_allowed:
-        warning = "该手眼结果未通过生产验证，仅允许只读误差实验，禁止用于机械臂运动。"
+    motion_allowed = False
+    warning = "手眼结果仅用于诊断；实验运动必须显式启用并核对现场条件。"
     return HandEyeExperimentResult(
         path=source.resolve(), payload=payload, T_tcp_rgb_camera=matrix,
         validated_for_motion=motion_allowed, experimental_only=not motion_allowed,
@@ -246,8 +235,8 @@ def _pose_bracket(before: dict[str, Any] | None, after: dict[str, Any] | None) -
     bv = np.asarray(b[:6], dtype=np.float64)
     xyz_delta = np.abs(bv[:3] - av[:3])
     abc_delta = np.abs((bv[3:6] - av[3:6] + 180.0) % 360.0 - 180.0)
-    xyz_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_xyz_mm)
-    abc_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_abc_deg)
+    xyz_limit = float(AUTO_CAPTURE_CFG.burst_pose_stability_xyz_mm)
+    abc_limit = float(AUTO_CAPTURE_CFG.burst_pose_stability_abc_deg)
     return {
         "ok": bool(np.max(xyz_delta) <= xyz_limit and np.max(abc_delta) <= abc_limit),
         "xyz_delta_mm": xyz_delta.astype(float).tolist(),
@@ -644,7 +633,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--handeye", type=Path, default=choose_default_handeye_path(),
-        help="手眼 JSON；优先使用已安装 E7，若不存在则默认当前 E7 candidate（只做实验）。",
+        help="手眼 JSON；默认使用当前诊断结果，仅用于只读误差实验。",
     )
     parser.add_argument("--corner-id", type=int, default=None, help="初始 ChArUco 角点 ID；也可在窗口中点击选择。")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="JSON/CSV/图片输出目录。")

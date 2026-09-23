@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""RGB手眼标定界面：采集、求解、独立验证。"""
+"""RGB 手眼界面：采集、诊断求解和样本维护。"""
 
 from __future__ import annotations
 
@@ -19,8 +19,7 @@ import numpy as np
 from .capture import capture_burst_samples_gui
 from .camera import get_rgb_frame_bundle, init_rgb_handeye_pipeline, print_device_info
 from .charuco_detect import create_charuco_board, estimate_rgb_board_pose
-from .config import CAMERA_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOLVE_CFG
-from .e7_handeye import run_e7_cross_validation
+from .config import CAMERA_CFG, ROBOT_CFG, SOLVE_CFG
 from .gui_common import GuiLogWriter
 from .io_utils import make_dir
 from .quality import evaluate_image_quality
@@ -37,25 +36,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
-def _format_e7_candidate_summary(result: dict[str, Any]) -> str:
-    """格式化当前扁平E7候选结构；避免GUI继续依赖已经移除的旧嵌套字段。"""
-    validation_rms = float(result["validation_center_scatter_rms_mm"])
-    raw_validation_max = result.get("validation_center_scatter_max_mm")
-    validation_max = (
-        f"{float(raw_validation_max):.3f} mm"
-        if raw_validation_max is not None else "未知"
-    )
-    validation_pass = bool(result.get("validation_numeric_pass", False))
-    return (
-        f"结论：独立验证{'数值达标，待复核' if validation_pass else '未达标'}\n"
-        f"验证平移 RMS {validation_rms:.3f} mm，最大 {validation_max}\n"
-        f"目标：RMS ≤ {E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm:.2f} mm，"
-        f"最大 ≤ {E7_HAND_EYE_CFG.maximum_validation_center_scatter_max_mm:.2f} mm"
-    )
-
-
 def load_active_rgb_samples() -> list[CalibSample]:
-    """当前正式链路只加载RGB样本；旧点云样本移动到可追溯归档目录。"""
+    """只加载 RGB 样本；旧点云样本移动到可追溯归档目录。"""
     loaded = load_existing_samples() if SOLVE_CFG.load_existing_samples_on_start else []
     rgb_samples = [
         sample for sample in loaded
@@ -66,7 +48,7 @@ def load_active_rgb_samples() -> list[CalibSample]:
         if str(sample.calibration_frame or "").strip().lower() != "rgb_camera"
     ]
     if not rgb_samples:
-        print("[E7] 当前没有活动RGB样本；保留已有固定验证分组，避免自动重选留出集。")
+        print("[HANDEYE] 当前没有活动 RGB 样本。")
     if legacy_samples:
         archive_dir = archive_samples(
             legacy_samples,
@@ -166,12 +148,6 @@ class HandEyeGuiPanel(ttk.Frame):
         self.capture_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.solve_btn = ttk.Button(toolbar, text="求解标定", command=lambda: self.enqueue_command("solve"))
         self.solve_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.e7_btn = ttk.Button(
-            toolbar,
-            text="独立验证",
-            command=self.request_e7_validation,
-        )
-        self.e7_btn.pack(side=tk.LEFT, padx=(0, 12))
         self.maintenance_btn = ttk.Menubutton(toolbar, text="样本维护")
         maintenance_menu = tk.Menu(self.maintenance_btn, tearoff=False)
         maintenance_menu.add_command(label="归档最后样本", command=lambda: self.enqueue_command("delete_last"))
@@ -362,16 +338,6 @@ class HandEyeGuiPanel(ttk.Frame):
             return
         self.command_queue.put((command, payload))
 
-    def request_e7_validation(self) -> None:
-        confirmed = messagebox.askyesno(
-            "E7固定标定板确认",
-            "请确认：本批全部样本采集期间，ChArUco标定板在机器人基座坐标系中始终固定，"
-            "未移动、未松动、未重新装夹。\n\n确认后只生成待独立复核的E7候选文件，不会解锁运动。",
-            parent=self,
-        )
-        if confirmed:
-            self.enqueue_command("validate_e7", {"fixed_board_confirmed": True})
-
     def _worker_status(self, **kwargs: str) -> None:
         self.status_queue.put({k: str(v) for k, v in kwargs.items()})
 
@@ -425,15 +391,6 @@ class HandEyeGuiPanel(ttk.Frame):
                         self._worker_status(output=SOLVE_CFG.output_json, result=format_handeye_summary(result))
                     else:
                         self._worker_status(result="样本不足，无法求解")
-                elif command == "validate_e7":
-                    result = run_e7_cross_validation(
-                        samples,
-                        fixed_board_confirmed=bool((payload or {}).get("fixed_board_confirmed", False)),
-                    )
-                    print(_format_e7_candidate_summary(result))
-                    self._worker_status(
-                        output=str(result.get("candidate_path", "")), result=_format_e7_candidate_summary(result),
-                    )
                 elif command == "delete_last":
                     if samples:
                         removed = samples[-1]
@@ -601,7 +558,7 @@ class HandEyeGuiPanel(ttk.Frame):
         state = tk.NORMAL if running else tk.DISABLED
         for button in (
             self.connect_btn, self.disconnect_btn, self.capture_btn,
-            self.solve_btn, self.e7_btn, self.maintenance_btn,
+            self.solve_btn, self.maintenance_btn,
         ):
             button.configure(state=state)
 

@@ -11,9 +11,10 @@ from typing import Any, Callable
 import numpy as np
 
 from .charuco_detect import BoardPoseResult, estimate_rgb_board_pose
-from .config import AUTO_CAPTURE_CFG, E7_HAND_EYE_CFG, SOLVE_CFG
+from .config import AUTO_CAPTURE_CFG, SOLVE_CFG
 from .drawing import draw_unicode_text
 from .geometry import circular_angle_abs_diff_deg, angle_span_deg as circular_angle_span_deg, rotation_error_deg
+from .handeye_consistency import camera_profile_signature, camera_serial, tcp_offset_consistency
 from .quality import evaluate_image_quality
 from .robot import get_capture_pose_transform
 from .samples import CalibSample, save_sample
@@ -21,7 +22,7 @@ from .io_utils import timestamp_str
 
 
 def board_view_metadata(pose_result: BoardPoseResult, image_shape: tuple[int, ...]) -> dict[str, Any]:
-    """从实际角点自动计算标定板中心和视野区域，供E7覆盖检查。"""
+    """从实际角点计算标定板中心和视野区域，供诊断报告使用。"""
     height, width = int(image_shape[0]), int(image_shape[1])
     raw_points = pose_result.image_points
     points = (
@@ -35,8 +36,8 @@ def board_view_metadata(pose_result: BoardPoseResult, image_shape: tuple[int, ..
     dx = (float(center[0]) - 0.5 * width) / max(0.5 * width, 1.0)
     dy = (float(center[1]) - 0.5 * height) / max(0.5 * height, 1.0)
     if (
-        abs(dx) <= float(E7_HAND_EYE_CFG.center_region_half_width_ratio)
-        and abs(dy) <= float(E7_HAND_EYE_CFG.center_region_half_height_ratio)
+        abs(dx) <= 0.22
+        and abs(dy) <= 0.22
     ):
         region = "center"
     elif abs(dx) >= abs(dy):
@@ -53,8 +54,6 @@ def board_view_metadata(pose_result: BoardPoseResult, image_shape: tuple[int, ..
 def _session_consistency_errors(samples: list[CalibSample], candidate: CalibSample) -> list[str]:
     """阻止把不同TCP、相机或位姿源混进同一手眼数据集。"""
     try:
-        from .e7_handeye import _camera_profile_signature, _camera_serial, _tcp_offset_consistency
-
         all_samples = [*samples, candidate]
         errors: list[str] = []
         pose_sources = {
@@ -64,15 +63,15 @@ def _session_consistency_errors(samples: list[CalibSample], candidate: CalibSamp
         if len(pose_sources) != 1:
             errors.append(f"位姿源不一致: {sorted(pose_sources)}")
 
-        camera_serials = [_camera_serial(sample) for sample in all_samples]
+        camera_serials = [camera_serial(sample) for sample in all_samples]
         if not camera_serials or not all(camera_serials) or len(set(camera_serials)) != 1:
             errors.append(f"相机序列号不一致或缺失: {sorted(set(camera_serials))}")
 
-        profile_signatures = {_camera_profile_signature(sample) for sample in all_samples}
+        profile_signatures = {camera_profile_signature(sample) for sample in all_samples}
         if len(profile_signatures) != 1:
             errors.append("相机分辨率、内参、设备信息或RGB采集模式发生变化")
 
-        tcp_report = _tcp_offset_consistency(all_samples, E7_HAND_EYE_CFG)
+        tcp_report = tcp_offset_consistency(all_samples)
         if not tcp_report["actual_metadata_complete"]:
             errors.append("存在样本缺少实际TCP偏移记录")
         elif not tcp_report["actual_offset_consistent"]:
@@ -102,8 +101,8 @@ def pose_bracket_report(
         [circular_angle_abs_diff_deg(before[i], after[i]) for i in range(3, 6)],
         dtype=np.float64,
     )
-    xyz_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_xyz_mm)
-    abc_limit = float(E7_HAND_EYE_CFG.maximum_pose_bracket_abc_deg)
+    xyz_limit = float(AUTO_CAPTURE_CFG.burst_pose_stability_xyz_mm)
+    abc_limit = float(AUTO_CAPTURE_CFG.burst_pose_stability_abc_deg)
     ok = float(np.max(xyz_delta)) <= xyz_limit and float(np.max(abc_delta)) <= abc_limit
     active_tcp = any(
         (snapshot or {}).get("pose_source_selection") == "controller_active_tcp"
@@ -120,9 +119,9 @@ def pose_bracket_report(
             ]
             offset_stable = bool(
                 np.max(np.abs(offsets[0][:3, 3] - offsets[1][:3, 3]))
-                <= E7_HAND_EYE_CFG.maximum_tcp_offset_xyz_delta_mm
+                <= AUTO_CAPTURE_CFG.tcp_offset_tolerance_xyz_mm
                 and rotation_error_deg(offsets[0][:3, :3], offsets[1][:3, :3])
-                <= E7_HAND_EYE_CFG.maximum_tcp_offset_rpy_delta_deg
+                <= AUTO_CAPTURE_CFG.tcp_offset_tolerance_rpy_deg
             )
         except (KeyError, TypeError, ValueError, RuntimeError):
             offset_stable = False
@@ -336,10 +335,7 @@ def save_burst_single_frame_sample(
     )
     next_index += 1
     if len(samples) >= SOLVE_CFG.min_samples_for_solve:
-        print(
-            f"[INFO] 样本数已满足求解条件；"
-            f"E7正式验证仍需至少{E7_HAND_EYE_CFG.minimum_total_poses}组及完整证据。"
-        )
+        print("[INFO] 样本数已满足诊断求解条件；结果不会自动放行运动。")
     return sample, next_index
 
 

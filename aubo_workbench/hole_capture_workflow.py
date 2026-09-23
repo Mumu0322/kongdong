@@ -519,9 +519,11 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
                           initial_anchor_px: np.ndarray | None = None,
                           tracking_tolerance_px: float | None = None,
                           lock_anchor: bool = False,
-                          stop_when_stable: bool = True,
-                          include_points: bool = False,
-                          timing: Any | None = None,
+                           stop_when_stable: bool = True,
+                           include_points: bool = False,
+                            timing: Any | None = None,
+                            T_base_camera: np.ndarray | None = None,
+                            same_capture_fine: dict[str, Any] | None = None,
                           ) -> tuple[list[Observation], np.ndarray]:
     observations: list[Observation] = []
     latest_image: np.ndarray | None = None
@@ -536,17 +538,36 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
     ):
         for _ in range(cfg.coarse_settle_frames):
             get_aligned_frame_bundle(pipeline, align, chain)
-    for attempt in range(cfg.coarse_frames * cfg.coarse_max_attempt_multiplier):
+    max_attempts = cfg.coarse_frames * cfg.coarse_max_attempt_multiplier
+    if same_capture_fine is not None:
+        same_capture_fine["observations"] = []
+        same_capture_fine["intrinsics"] = None
+        same_capture_fine["latest_ellipse"] = None
+        max_attempts = max(max_attempts, cfg.fine_frames * 3)
+    for attempt in range(max_attempts):
         valid_count = len([item for item in observations if item.error is None and item.plane is not None])
-        if valid_count >= cfg.coarse_frames or (
-            stop_when_stable and (
-                valid_count >= cfg.min_coarse_valid
-                and _coarse_burst_stable(
-                    {1: observations}, cfg.min_coarse_valid,
-                    cfg.max_coarse_center_scatter_p95_px,
+        coarse_ready = valid_count >= cfg.coarse_frames or (
+            stop_when_stable and valid_count >= cfg.min_coarse_valid
+            and _coarse_burst_stable(
+                {1: observations}, cfg.min_coarse_valid,
+                cfg.max_coarse_center_scatter_p95_px,
+            )
+        )
+        fine_ready = True
+        if same_capture_fine is not None:
+            fine_observations = same_capture_fine["observations"]
+            fine_valid = sum(
+                item.error is None and item.ellipse is not None
+                for item in fine_observations
+            )
+            fine_ready = fine_valid >= cfg.fine_frames or (
+                fine_valid >= cfg.fine_stable_min_frames
+                and _fine_burst_stable(
+                    {1: fine_observations}, cfg.fine_stable_min_frames,
+                    cfg.fine_stable_center_scatter_p95_px,
                 )
             )
-        ):
+        if coarse_ready and fine_ready:
             break
         with visual_measure(
             timing,
@@ -557,6 +578,8 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
             bundle = get_aligned_frame_bundle(pipeline, align, chain)
         if bundle is None or bundle.intrinsics is None:
             continue
+        if same_capture_fine is not None:
+            same_capture_fine["intrinsics"] = bundle.intrinsics
         latest_image = bundle.color_bgr
         if anchor is None:
             anchor = np.array([bundle.color_bgr.shape[1] / 2.0, bundle.color_bgr.shape[0] / 2.0])
@@ -576,6 +599,11 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
             observations.append(Observation(
                 name, attempt, search_anchor, timestamp_ns=bundle.host_timestamp_ns, error="yolo_missing",
             ))
+            if same_capture_fine is not None:
+                same_capture_fine["observations"].append(Observation(
+                    f"{name}_fine_340", attempt, search_anchor,
+                    timestamp_ns=bundle.host_timestamp_ns, error="yolo_missing",
+                ))
             continue
         detection_center = np.asarray(detection["center"], dtype=np.float64)
         tracking_distance = float(np.linalg.norm(detection_center - search_anchor))
@@ -584,7 +612,57 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
                 name, attempt, search_anchor, timestamp_ns=bundle.host_timestamp_ns,
                 error="tracking_distance", tracking_distance_px=tracking_distance,
             ))
+            if same_capture_fine is not None:
+                same_capture_fine["observations"].append(Observation(
+                    f"{name}_fine_340", attempt, search_anchor,
+                    timestamp_ns=bundle.host_timestamp_ns, error="tracking_distance",
+                    tracking_distance_px=tracking_distance,
+                ))
             continue
+        if same_capture_fine is not None:
+            fine_name = f"{name}_fine_340"
+            try:
+                with visual_measure(
+                    timing, f"{fine_name}/ellipse_fitting", "ellipse_fitting",
+                    attempt=int(attempt),
+                ):
+                    ellipse = fit_hole_ellipse(
+                        bundle.color_bgr, detection, bundle.intrinsics,
+                    )
+                same_capture_fine["latest_ellipse"] = ellipse
+                if not _ellipse_ok(ellipse, cfg):
+                    fine_observation = Observation(
+                        fine_name, attempt, detection_center, ellipse,
+                        timestamp_ns=bundle.host_timestamp_ns,
+                        error="ellipse_quality", center_source="rejected",
+                    )
+                else:
+                    with visual_measure(
+                        timing, f"{fine_name}/coordinate_transform", "coordinate_transform",
+                        attempt=int(attempt),
+                    ):
+                        fine_center = undistort_pixels(
+                            bundle.intrinsics, detection_center.reshape(1, 2),
+                            pixel_output=True,
+                        )[0]
+                    fine_observation = Observation(
+                        fine_name, attempt, fine_center, ellipse,
+                        timestamp_ns=bundle.host_timestamp_ns, center_source="yolo",
+                    )
+            except Exception as exc:
+                fine_observation = Observation(
+                    fine_name, attempt, detection_center,
+                    timestamp_ns=bundle.host_timestamp_ns,
+                    error=f"ellipse_error:{type(exc).__name__}:{exc}",
+                )
+            same_capture_fine["observations"].append(fine_observation)
+            if coarse_ready:
+                # Coarse geometry is already sufficient at this fixed TCP.
+                # Continue RGB quality sampling without rebuilding the point cloud.
+                if not lock_anchor:
+                    anchor = detection_center
+                latest_detection = detection
+                continue
         # 粗定位只使用YOLO框中心和点云环带，测量孔中心及局部法向。
         # 椭圆拟合只用于旧诊断叠加图，不参与粗定位结果，因此不在这里计算。
         center = detection_center
@@ -624,7 +702,8 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
         with artifact_measure(timing, "per_hole_coarse/write_surface_diagnostic",
                               artifact_kind="surface_diagnostic", paths=[str(diagnostic_path)]):
             save_surface_diagnostic(diagnostic_path, diagnostic.plane,
-                                    frame_index=diagnostic.frame_index)
+                                    frame_index=diagnostic.frame_index,
+                                    T_base_camera=T_base_camera)
     output_path = run_dir / f"{name}_overlay.png"
     with artifact_measure(
         timing,
@@ -634,7 +713,12 @@ def _capture_coarse_burst(pipeline: Any, align: Any, chain: Any, model: Any, con
         capture_name=name,
     ):
         if not cv2.imwrite(
-            str(output_path), _overlay(latest_image, latest_detection, None, name),
+            str(output_path), _overlay(
+                latest_image, latest_detection,
+                same_capture_fine.get("latest_ellipse")
+                if same_capture_fine is not None else None,
+                name,
+            ),
         ):
             raise RuntimeError(f"粗定位叠加图写入失败：{output_path}")
     return observations, latest_image
@@ -668,15 +752,45 @@ def _capture_fine_burst(
         cfg.fine_yolo_fallback_max_ellipse_residual_px
         if fallback_max_residual_px is None else float(fallback_max_residual_px)
     )
+    # 相机管线持续运行。配置为0时不再固定丢弃一批“预热帧”，而是
+    # 读取到时间戳表明已经追上实时流的帧；显式正数仍可作为最少下限。
+    minimum_discard_frames = max(0, int(settle_discard_frames))
     with visual_measure(
         timing,
         f"{name}/frame_acquisition_settle",
         "frame_acquisition",
-        target_frames=max(0, int(settle_discard_frames)),
+        target_frames=minimum_discard_frames,
     ):
-        for _ in range(max(0, int(settle_discard_frames))):
-            # 只取RGB帧而不运行YOLO；这些帧用于跨越机器人到位后的相机/末端稳定期。
-            get_rgb_frame_bundle(pipeline)
+        discarded = 0
+        attempts = 0
+        previous_host_timestamp_ns = None
+        fresh_streak = 0
+        metadata_available = False
+        maximum_discard_frames = minimum_discard_frames + 20
+        while discarded < maximum_discard_frames and attempts < maximum_discard_frames + 5:
+            attempts += 1
+            bundle = get_rgb_frame_bundle(pipeline)
+            if bundle is None:
+                continue
+            discarded += 1
+            has_frame_metadata = bool(
+                hasattr(bundle, "color_frame_index")
+                or hasattr(bundle, "color_timestamp_us")
+            )
+            metadata_available = metadata_available or has_frame_metadata
+            host_timestamp_ns = getattr(bundle, "host_timestamp_ns", None)
+            if host_timestamp_ns is not None:
+                host_timestamp_ns = int(host_timestamp_ns)
+                if previous_host_timestamp_ns is not None and has_frame_metadata:
+                    if host_timestamp_ns - previous_host_timestamp_ns >= 10_000_000:
+                        fresh_streak += 1
+                    else:
+                        fresh_streak = 0
+                previous_host_timestamp_ns = host_timestamp_ns
+            if discarded < max(1, minimum_discard_frames):
+                continue
+            if not metadata_available or fresh_streak >= 2:
+                break
     for attempt in range(cfg.fine_frames * 3):
         valid_count = len([item for item in observations if item.error is None and item.ellipse is not None])
         if (

@@ -12,7 +12,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .config import AUTO_CAPTURE_CFG, BOARD_CFG, CAMERA_CFG, E7_HAND_EYE_CFG, ROBOT_CFG, SOLVE_CFG
+from .config import AUTO_CAPTURE_CFG, BOARD_CFG, CAMERA_CFG, ROBOT_CFG, SOLVE_CFG
 from .geometry import (
     angle_span_deg,
     average_transforms,
@@ -26,6 +26,7 @@ from .geometry import (
     vec6_to_transform,
 )
 from .io_utils import atomic_write_json, matrix_to_list
+from .handeye_consistency import tcp_offset_consistency
 from .samples import CalibSample
 
 
@@ -398,53 +399,11 @@ def pose_coverage_report(samples: list[CalibSample]) -> dict[str, Any]:
     }
 
 
-def solve_and_save(
-    samples: list[CalibSample],
-    *,
-    validation_samples: list[CalibSample] | None = None,
-    fixed_validation_split: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
+def solve_and_save(samples: list[CalibSample]) -> dict[str, Any] | None:
     fit_samples = list(samples)
-    held_out_samples = list(validation_samples or [])
-    active_samples = sorted(
-        [*fit_samples, *held_out_samples], key=lambda item: int(item.index),
-    )
-
-    # 先检查整批样本的位姿源，再尝试复用固定 E7 留出集。否则当工作区残留
-    # 旧 split 文件、当前诊断样本只有 8 组时，错误会被“至少需要 11 组”遮住，
-    # 现场会看不到真正的 tcp/tool 混用原因。
-    if active_samples:
-        active_pose_sources = sorted({
-            str((sample.robot_snapshot or {}).get("pose_source") or "").strip().lower()
-            for sample in active_samples
-        })
-        if len(active_pose_sources) != 1 or not active_pose_sources[0]:
-            raise RuntimeError(
-                f"样本位姿源必须唯一且显式，当前={active_pose_sources}"
-            )
-
-    if fixed_validation_split is None and held_out_samples == []:
-        from .e7_handeye import fixed_validation_split_path, get_or_create_fixed_e7_split
-
-        split_path = fixed_validation_split_path(active_samples)
-        if len(active_samples) < SOLVE_CFG.min_samples_for_solve:
-            if split_path.is_file():
-                get_or_create_fixed_e7_split(active_samples, E7_HAND_EYE_CFG, persist=True)
-            print(
-                f"[WARN] 样本不足，至少需要 {SOLVE_CFG.min_samples_for_solve} 个，"
-                f"当前 {len(active_samples)} 个"
-            )
-            return None
-        if len(active_samples) >= int(E7_HAND_EYE_CFG.minimum_total_poses) or split_path.is_file():
-            fit_samples, held_out_samples, fixed_validation_split = get_or_create_fixed_e7_split(
-                active_samples, E7_HAND_EYE_CFG, persist=True,
-            )
-            active_samples = sorted(
-                [*fit_samples, *held_out_samples], key=lambda item: int(item.index),
-            )
     if len(fit_samples) < SOLVE_CFG.min_samples_for_solve:
         print(
-            f"[WARN] 固定验证集占用后标定样本不足，至少需要 {SOLVE_CFG.min_samples_for_solve} 个，"
+            f"[WARN] 诊断求解至少需要 {SOLVE_CFG.min_samples_for_solve} 个样本，"
             f"当前 {len(fit_samples)} 个"
         )
         return None
@@ -469,45 +428,9 @@ def solve_and_save(
     estimate = solve_handeye_estimate(fit_samples, quiet=True)
     T_final = estimate["T_final"]
     quality = {k: v for k, v in estimate["quality"].items() if k != "T_base_board_mean"}
-    validation_quality = None
-    if held_out_samples:
-        from .e7_handeye import validation_stats_against_reference
-
-        validation_quality = validation_stats_against_reference(
-            held_out_samples, T_final, estimate["quality"]["T_base_board_mean"],
-        )
-        validation_quality = {
-            key: value for key, value in validation_quality.items()
-            if key not in {"T_base_board_reference", "transforms"}
-        }
-    rms_limit = float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_rms_mm)
-    max_limit = float(E7_HAND_EYE_CFG.maximum_validation_center_scatter_max_mm)
-    measured = [quality] + ([validation_quality] if validation_quality is not None else [])
-    numeric_pass = all(
-        np.isfinite(q["translation_rmse_mm"]) and np.isfinite(q["translation_max_mm"])
-        and q["translation_rmse_mm"] <= rms_limit and q["translation_max_mm"] <= max_limit
-        for q in measured
-    )
-    enough_validation = (
-        len(active_samples) >= E7_HAND_EYE_CFG.minimum_total_poses
-        and len(held_out_samples) >= E7_HAND_EYE_CFG.minimum_validation_poses
-        and len(held_out_samples) / len(active_samples) >= E7_HAND_EYE_CFG.minimum_validation_fraction
-    )
-    if not numeric_pass:
-        conclusion = "未达标"
-        next_action = "检查图像与机器人位姿对应、相机安装和标定板尺寸，补采重复姿态核对。"
-    elif not enough_validation:
-        conclusion = "待验证"
-        next_action = "独立验证样本不足，继续采集不同姿态。"
-    else:
-        conclusion = "数值达标，待完整验证"
-        next_action = "执行独立验证，核对采集条件与姿态覆盖。"
-
     session_consistency = None
     if is_rgb:
-        from .e7_handeye import _tcp_offset_consistency
-
-        session_consistency = _tcp_offset_consistency(active_samples, E7_HAND_EYE_CFG)
+        session_consistency = tcp_offset_consistency(fit_samples)
     output = {
         "record_type": "handeye_rgb_diagnostic_result" if is_rgb else "handeye_pointcloud_legacy_diagnostic_result",
         "record_policy": "diagnostic_current_replace_on_refresh",
@@ -515,9 +438,8 @@ def solve_and_save(
         "do_not_use_for_motion": True,
         "production_eligible": False,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "conclusion": conclusion,
-        "next_action": next_action,
-        "precision_target": {"translation_rmse_mm_max": rms_limit, "translation_max_mm_max": max_limit},
+        "conclusion": "诊断结果（不自动放行运动）",
+        "next_action": "核对采集会话、相机和 TCP 一致性；实验运动须显式启用实验手眼选项。",
         "method": method_name,
         "calibration_frame": calibration_frame,
         "rgb_coordinate_convention": "opencv_optical_x_right_y_down_z_forward" if is_rgb else None,
@@ -527,19 +449,15 @@ def solve_and_save(
             "runtime_formula": "P_base = T_base_pose_source @ T_pose_source_sensor @ P_sensor",
         },
         "pose_source": pose_source,
-        "raw_sample_count": len(active_samples),
+        "raw_sample_count": len(fit_samples),
         "sample_count": len(fit_samples),
         "used_sample_indices": [int(s.index) for s in fit_samples],
         "calibration_sample_indices": [int(s.index) for s in fit_samples],
-        "validation_sample_indices": [int(s.index) for s in held_out_samples],
-        "validation_poses_excluded_from_fit": bool(held_out_samples),
-        "fixed_validation_split": fixed_validation_split,
         "best_opencv_method": estimate["best_method"],
         "T_pose_source_sensor": matrix_to_list(T_final),
         "T_pose_source_sensor_pose6_rzryrx_mm_deg": list(transform_to_pose6_rzryrx(T_final)),
         "T_pose_source_sensor_initial_opencv": matrix_to_list(estimate["T_init"]),
         "quality": quality,
-        "validation_quality": validation_quality,
         "pose_coverage": pose_coverage_report(fit_samples),
         "T_base_board_mean": matrix_to_list(estimate["quality"]["T_base_board_mean"]),
         "nonlinear_refine": estimate["nonlinear_refine"],
@@ -568,25 +486,12 @@ def solve_and_save(
 
 
 def format_handeye_summary(result: dict[str, Any]) -> str:
-    """界面和日志共用同一份结论，拟合误差与独立验证误差分开显示。"""
+    """界面和日志共用诊断结论与拟合误差。"""
     quality = result["quality"]
-    target = result["precision_target"]
     lines = [
         f"结论：{result['conclusion']}",
         f"拟合 {result['sample_count']} 组：平移 RMS {quality['translation_rmse_mm']:.3f} mm，"
         f"最大 {quality['translation_max_mm']:.3f} mm",
-    ]
-    validation = result.get("validation_quality")
-    if validation is None:
-        lines.append("独立验证：样本不足")
-    else:
-        lines.append(
-            f"验证 {len(result['validation_sample_indices'])} 组：平移 RMS "
-            f"{validation['translation_rmse_mm']:.3f} mm，最大 {validation['translation_max_mm']:.3f} mm"
-        )
-    lines.extend([
-        f"目标：RMS ≤ {target['translation_rmse_mm_max']:.2f} mm，"
-        f"最大 ≤ {target['translation_max_mm_max']:.2f} mm",
         result["next_action"],
-    ])
+    ]
     return "\n".join(lines)

@@ -8,7 +8,7 @@
 
 ## 手眼标定
 
-工作台手眼页保留采集、求解、独立验证和手动归档样本。旧 `--opencv-ui` 界面、
+工作台手眼页保留采集、诊断求解和手动归档样本。旧 `--opencv-ui` 界面、
 自动按残差删点、贪心试删子集和空深度看板已移除。历史采集文件与归档保留。
 
 位姿自动读取控制器当前生效的 TCP（`getTcpPose`，相对机器人基坐标系），
@@ -18,16 +18,13 @@ SDK 未提供示教器工具坐标名称的读取接口；请用显示的数值�
 读取失败时拒绝采集，不回退到手动位姿或法兰。采集中切换 TCP 会被拒绝；
 更换 TCP 后需要使用新的采集会话。
 
-“求解标定”使用固定拟合集计算矩阵，留出组不参与拟合。结果区直接显示结论、
-两组各自的平移 RMS / 最大误差和下一步。数值目标统一为 RMS ≤ 0.10 mm、
-最大误差 ≤ 0.20 mm；样本不足时显示“待验证”，不会把低拟合残差当作验证通过。
-结果是标定板位姿一致性，不代表机械臂绝对定位精度。数值达标后仍需完整独立验证。
+“求解标定”使用当前活动 RGB 样本计算矩阵，结果区显示拟合平移 RMS 和最大误差。
+这些数值只用于诊断标定板位姿一致性，不代表机械臂绝对定位精度，也不自动允许机器人运动。
+实验运动必须另外显式开启 `--execute --allow-experimental-handeye`，并核对当前相机、TCP 与工作区。
 
-旋转均值使用矩阵 SVD 投影，避免 ±180° 处旋转向量平均错误。固定性预检检查
-相对均值的平移/旋转 RMS 和最大值；不再使用误差长度的标准差。
+旋转均值使用矩阵 SVD 投影，避免 ±180° 处旋转向量平均错误。
 
-诊断输出仍为 `aubo_tools/data/handeye_diagnostic_current.json`，保留矩阵、
-样本分组和各算法数值供追溯，但不安装为生产手眼文件。
+诊断输出仍为 `aubo_tools/data/handeye_diagnostic_current.json`，保留矩阵和各算法数值供追溯。
 
 ## 孔洞定位流程
 
@@ -61,7 +58,8 @@ python run_yolo_eye_in_hand_optimized.py `
   --coarse-direct-final-early-stop-extra-frames 5 `
   --coarse-direct-final-settle-delay-s 1 `
   --coarse-direct-final-capture-only `
-  --execute
+  --execute `
+  --allow-experimental-handeye
 ```
 
 完成多轮 A/B/C 试拍后，可用独立工具汇总报告；该工具只读 `report.json`，不会改写孔位地图：
@@ -103,15 +101,14 @@ GUI 首次打开时会把 `configs/auto_sector_selection_static_template.json` �
 
 ### 340 mm粗定位建图与实时精定位调用
 
-建图阶段只把本轮340 mm粗定位的孔中心、平面、法向和质量写入独立地图，不执行260 mm精定位，也不执行最终安放：
+建图有三种定位方式：`coarse_only` 只保存本轮340 mm粗定位；`per_hole` 逐孔340 mm粗定位后再到260 mm采集RGB精定位参考；`same_capture_340` 在每孔340 mm的同批RGB-D帧内同时完成点云粗定位和严格RGB精定位，不下降到260 mm。第三种方式若RGB精定位质量门失败，但340 mm点云中心、平面拟合、帧间散布、环带覆盖以及相机中心/法向质量都通过原有粗定位门，则地图使用点云中心作为该孔参考，并记录回退原因；粗定位也不合格时仍暂缓入图。此回退只用于建图参考，调用地图时仍重新现场精定位，地图中不保存可执行的最终TCP目标。
 
-多孔不会被强制塞进同一个相机视野：340 mm粗定位和260 mm精定位都会按孔位投影范围自动拆组，每组在本组综合位置上方进行稳定连拍；某组失败不会取消其他组。
+共享采集模式会按孔位投影范围拆组，不会强制把多孔塞进同一个相机视野；逐孔模式逐个采集，单孔质量失败不会取消其他孔。
 
 ```powershell
 python run_yolo_eye_in_hand_optimized.py `
-  --batch-coarse-localization `
-  --no-batch-fine-localization `
   --hole-map-mode build `
+  --map-build-localization-mode same_capture_340 `
   --execute `
   --allow-experimental-handeye
 ```
@@ -122,14 +119,16 @@ python run_yolo_eye_in_hand_optimized.py `
 python run_yolo_eye_in_hand_optimized.py `
   --hole-map-mode execute `
   --hole-ids 3 1 2 `
-  --execute
+  --execute `
+  --allow-experimental-handeye
 ```
 
-地图是当前工件/机器人循环内的粗定位导航结果；工件移动、重新装夹、TCP或标定改变后应重新建图。地图不保存精定位 XY、最终孔心、补偿或TCP目标；这些数据只在每次调用的当前运行报告中产生。
+地图是当前工件/机器人循环内的粗定位导航结果；工件移动、重新装夹、TCP或标定改变后应重新建图。逐孔建图会保存精定位参考与质量，地图不保存最终运动目标；调用时的最终孔心由当前运行重新计算。
 
-建图版本目录还会保存共享粗定位点云的 `pointcloud_raw.npz`、基坐标系 `pointcloud_base.ply`、孔中心标记 `hole_centers_base.ply` 和 `pointcloud_preview.jpg`。GUI 中的“查看点云”可打开二维投影预览，“打开三维PLY”可交给 Open3D 或 CloudCompare 检查点云、粗定位中心和孔位覆盖情况。
+建图版本目录还会保存粗定位点云的 `pointcloud_raw.npz`、基坐标系 `pointcloud_base.ply`、孔中心标记 `hole_centers_base.ply` 和 `pointcloud_preview.jpg`。GUI 中的“查看点云”可打开二维投影预览，“打开三维PLY”可交给 Open3D 或 CloudCompare 检查点云、粗定位中心和孔位覆盖情况。
 
-默认运行只生成预览报告；真实运动必须显式启用运动开关并通过手眼质量门。
+默认运行只生成预览报告；实验运动必须显式启用 `--execute` 和
+`--allow-experimental-handeye`。上述命令仅用于已核对运动路径和现场条件的实验，不能据此认定手眼达到生产精度。
 
 定位流程连续3次取不到有效相机帧（包含预热丢帧）会终止本轮，并在报告中记录
 `failure_type=camera_stream_unavailable`，不会再按孔失败进入后续分组或补拍。

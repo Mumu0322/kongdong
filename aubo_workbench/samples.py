@@ -505,34 +505,3 @@ def archive_samples(
     rewrite_sample_csv(remaining_samples)
     return archive_dir
 
-
-def build_raw_data_manifest(samples: list[CalibSample]) -> dict[str, Any]:
-    """计算活动样本文件清单及组合SHA256，供E7候选证据追溯。"""
-    entries: list[dict[str, Any]] = []
-    missing: list[str] = []
-    data_root = active_sample_data_root(samples)
-    for sample in sorted(samples, key=lambda item: item.index):
-        fields = ["sample_json_path", "rgb_path", "overlay_path"]
-        if sample.calibration_frame != "rgb_camera":
-            fields.append("depth_vis_path")
-        for field_name in fields:
-            path = resolve_sample_data_path(sample, field_name, data_root)
-            if path is None:
-                missing.append(f"sample={sample.index}:{field_name}:empty")
-                continue
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            entries.append({
-                "sample_index": int(sample.index),
-                "kind": field_name,
-                "path": str(path.resolve()),
-                "size_bytes": int(path.stat().st_size),
-                "sha256": digest,
-            })
-    canonical = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return {
-        "algorithm": "sha256",
-        "raw_data_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        "files": entries,
-        "missing_files": missing,
-        "complete": bool(entries) and not missing,
-    }

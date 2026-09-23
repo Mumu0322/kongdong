@@ -658,12 +658,8 @@ def run_offset_test(args: Any) -> int:
     if cfg.fine_height_mm >= cfg.coarse_height_mm:
         raise ValueError("精定位高度必须小于粗定位高度")
     handeye = load_handeye_experiment_result(args.handeye)
-    if not args.allow_experimental_handeye and not handeye.validated_for_motion:
-        # 当前测试会移动机器人；即使是诊断，也不让调用者无意间使用未验证手眼。
-        raise RuntimeError(
-            "偏移测试需要显式添加 --allow-experimental-handeye，"
-            "或使用已通过生产运动验证的手眼结果"
-        )
+    if not args.allow_experimental_handeye:
+        raise RuntimeError("偏移测试使用诊断手眼结果时必须显式添加 --allow-experimental-handeye")
     model = loc.load_yolo(args.model)
     loc._apply_robot_connection_overrides(args)
     if not bool(getattr(args, "start_confirmed", False)):
@@ -721,11 +717,7 @@ def run_offset_test(args: Any) -> int:
         pose_session.connect()
         _, current_tcp = loc._require_safe_snapshot(pose_session)
         report["robot_initial_tcp_pose_m_rad"] = loc.transform_to_sdk_pose_m_rad(current_tcp)
-        if not handeye.validated_for_motion:
-            print(
-                "[EXPERIMENTAL] 当前偏移测试使用未通过生产验证的手眼结果，"
-                "只用于实验诊断，不代表生产可用。"
-            )
+        print("[EXPERIMENTAL] 当前偏移测试使用诊断手眼结果。")
         motion_session = AuboMotionSession()
         motion_session.connect(
             ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,

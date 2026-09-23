@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -406,14 +407,19 @@ class BatchGroupingTests(unittest.TestCase):
             for index in range(6)
         ]
 
-        groups, _, metadata = group_holes_spatially_with_metadata(
-            holes,
-            max_group_size=5,
-            max_aspect_ratio=2.0,
-            adjacency_distance_factor=1.8,
-            preferred_min_group_size=3,
-            search_timeout_s=1.0e-9,
-        )
+        clock = count()
+        with patch(
+            "aubo_workbench.batch_grouping.time",
+            SimpleNamespace(monotonic=lambda: float(next(clock))),
+        ):
+            groups, _, metadata = group_holes_spatially_with_metadata(
+                holes,
+                max_group_size=5,
+                max_aspect_ratio=2.0,
+                adjacency_distance_factor=1.8,
+                preferred_min_group_size=3,
+                search_timeout_s=0.5,
+            )
 
         self.assertTrue(metadata["search_timed_out"])
         self.assertTrue(metadata["fallback_used"])

@@ -3,7 +3,7 @@
 """机械臂运动前置检查与到位等待。
 
 这里集中放置"动之前必须确认什么"和"怎么判断到位"的逻辑。原来
-``run_charuco_height_error_experiment.py`` 和 ``run_handeye_pose_sequence.py``
+``run_charuco_height_error_experiment.py``
 各自维护了一份语义相同但措辞和实现细节不同的副本；安全检查出现分叉时，
 两个脚本会对同一个控制器状态给出不同判断，因此统一到这里。
 
@@ -34,12 +34,25 @@ def angular_delta_rad(target: float, current: float) -> float:
     return (float(target) - float(current) + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _rpy_matrix(rpy_rad: list[float]) -> tuple[tuple[float, float, float], ...]:
+    """按 AUBO 的 Rz @ Ry @ Rx 约定把欧拉角转换为旋转矩阵。"""
+    rx, ry, rz = (float(value) for value in rpy_rad)
+    sx, cx = math.sin(rx), math.cos(rx)
+    sy, cy = math.sin(ry), math.cos(ry)
+    sz, cz = math.sin(rz), math.cos(rz)
+    return (
+        (cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx),
+        (sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx),
+        (-sy, cy * sx, cy * cx),
+    )
+
+
 def pose_error(
     target_m_rad: list[float], current_m_rad: list[float],
 ) -> tuple[float, float]:
     """返回 (位置误差_mm, 姿态误差_rad)。
 
-    位置取 XYZ 欧氏距离并换算到毫米；姿态取三个轴角差（已折算到 ±pi）的范数。
+    位置取 XYZ 欧氏距离并换算到毫米；姿态取两个旋转矩阵的最小相对转角。
     """
     xyz_mm = math.sqrt(
         sum(
@@ -47,12 +60,13 @@ def pose_error(
             for index in range(3)
         )
     ) * 1000.0
-    rotation_rad = math.sqrt(
-        sum(
-            angular_delta_rad(target_m_rad[index], current_m_rad[index]) ** 2
-            for index in range(3, 6)
-        )
+    target_rotation = _rpy_matrix(target_m_rad[3:6])
+    current_rotation = _rpy_matrix(current_m_rad[3:6])
+    trace = sum(
+        target_rotation[row][column] * current_rotation[row][column]
+        for row in range(3) for column in range(3)
     )
+    rotation_rad = math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0)))
     return xyz_mm, rotation_rad
 
 
@@ -87,8 +101,8 @@ def wait_for_target(
     """轮询等待到位，返回到位时的状态和实际误差。
 
     运动期间一旦读到碰撞标志，立即请求停止并抛 RuntimeError；即使停止指令
-    本身失败，也保证异常向上抛出，不会静默继续。超时抛 TimeoutError 并带上
-    最后一次实测误差，便于判断是公差太紧还是根本没动到位。
+    本身失败，也保证异常向上抛出，不会静默继续。超时先请求停止运动，再抛
+    TimeoutError 并带上最后一次实测误差。
     """
     deadline = time.monotonic() + float(timeout_s)
     last: dict[str, Any] | None = None
@@ -114,10 +128,16 @@ def wait_for_target(
         time.sleep(float(poll_interval_s))
 
     if last is None:
-        raise TimeoutError("等待到位超时，且未读到机器人状态")
-    current = [float(value) for value in last["tcp_pose_m_rad"][:6]]
-    xyz_error_mm, rotation_error_rad = pose_error(target_m_rad, current)
-    raise TimeoutError(
-        f"等待到位超时：位置误差={xyz_error_mm:.3f} mm，"
-        f"姿态误差={rotation_error_rad:.6f} rad"
-    )
+        message = "等待到位超时，且未读到机器人状态"
+    else:
+        current = [float(value) for value in last["tcp_pose_m_rad"][:6]]
+        xyz_error_mm, rotation_error_rad = pose_error(target_m_rad, current)
+        message = (
+            f"等待到位超时：位置误差={xyz_error_mm:.3f} mm，"
+            f"姿态误差={rotation_error_rad:.6f} rad"
+        )
+    try:
+        session.stop_motion()
+    except Exception as exc:
+        raise TimeoutError(f"{message}；停止运动请求失败：{exc}") from exc
+    raise TimeoutError(f"{message}；已请求停止运动")

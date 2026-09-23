@@ -127,7 +127,7 @@ YOLO_CONFIDENCE = 0.35
 
 # 运动配置。默认关闭。
 EXECUTE_MOTION = False
-ALLOW_EXPERIMENTAL_HANDEYE = True
+ALLOW_EXPERIMENTAL_HANDEYE = False
 MOVE_FINAL_XY = True
 
 # 只有准备真实运动时才改为 True。
@@ -167,10 +167,10 @@ def build_arguments() -> list[str]:
         "--acc-m-s2", str(ACC_M_S2),
         "--two-stage-hole-localization" if TWO_STAGE_MODE else "--single-stage",
         "--execute" if EXECUTE_MOTION else "--no-execute",
-        "--allow-experimental-handeye"
-        if ALLOW_EXPERIMENTAL_HANDEYE else "--require-validated-handeye",
         "--move-final-xy" if MOVE_FINAL_XY else "--no-move-final-xy",
     ]
+    if ALLOW_EXPERIMENTAL_HANDEYE:
+        args.append("--allow-experimental-handeye")
 
     if TCP_XY_OFFSET_MM is not None:
         args.extend([

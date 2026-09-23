@@ -19,7 +19,7 @@ from .paths import (
     CHARUCO_HEIGHT_ERROR_DIR,
     CHARUCO_POINT_EXPERIMENTS_DIR,
     DATA_DIR,
-    HANDEYE_CANDIDATE_DIR,
+    HANDEYE_DIAGNOSTIC_PATH,
     HOLE_LOCALIZATION_COARSE_CACHE_DIR,
     HOLE_LOCALIZATION_RUNS_DIR,
     TCP_ABSOLUTE_XY_MODEL_DIR,
@@ -29,7 +29,6 @@ from .paths import (
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 LENS_GUI_SCRIPT = PROJECT_DIR / "LiaoKuang" / "料框镜片检测前端.py"
 CACHE_GUI_SCRIPT = PROJECT_DIR / "tools" / "visualize_coarse_cache.py"
-HANDEYE_POSE_SCRIPT = PROJECT_DIR / "run_handeye_pose_sequence.py"
 CHARUCO_EXPERIMENT_SCRIPT = PROJECT_DIR / "run_charuco_height_error_experiment.py"
 
 
@@ -142,12 +141,7 @@ class VisualToolsPanel(ttk.Frame):
         experiments = ttk.LabelFrame(self, text="标定实验（默认不执行机器人运动）", padding=10)
         experiments.pack(fill=tk.X, pady=(10, 0))
         self._tool_row(
-            experiments, 0, "手眼 40 点序列预检",
-            "校验当前点位计划与进度；实机运动必须在控制台显式追加 --execute。",
-            "handeye_pose", self._handeye_preview_command, HANDEYE_POSE_SCRIPT, console=True,
-        )
-        self._tool_row(
-            experiments, 1, "ChArUco 高度 / 视野实验",
+            experiments, 0, "ChArUco 高度 / 视野实验",
             "启动相机测量流程；默认仅测量和预览 Z 修正，不发送 moveLine。",
             "charuco", self._charuco_preview_command, CHARUCO_EXPERIMENT_SCRIPT, console=True,
         )
@@ -155,7 +149,7 @@ class VisualToolsPanel(ttk.Frame):
         folders = ttk.LabelFrame(self, text="常用数据", padding=10)
         folders.pack(fill=tk.X, pady=(10, 0))
         for column, (label, path) in enumerate((
-            ("手眼候选", HANDEYE_CANDIDATE_DIR),
+            ("手眼诊断", HANDEYE_DIAGNOSTIC_PATH),
             ("ChArUco 实验", CHARUCO_HEIGHT_ERROR_DIR),
             ("粗定位缓存", HOLE_LOCALIZATION_COARSE_CACHE_DIR),
             ("全部运行数据", DATA_DIR),
@@ -195,15 +189,6 @@ class VisualToolsPanel(ttk.Frame):
             "--robot-ip", str(cfg["ip"]), "--robot-port", str(cfg["port"]),
             "--robot-user", str(cfg["user"]), "--robot-password", str(cfg["password"]),
             "--robot-timeout-ms", str(cfg["timeout_ms"]),
-        ]
-
-    def _handeye_preview_command(self) -> list[str]:
-        cfg = self.get_connection()
-        return [
-            sys.executable, str(HANDEYE_POSE_SCRIPT),
-            "--ip", str(cfg["ip"]), "--port", str(cfg["port"]),
-            "--user", str(cfg["user"]), "--password", str(cfg["password"]),
-            "--timeout-ms", str(cfg["timeout_ms"]),
         ]
 
     def _charuco_preview_command(self) -> list[str]:

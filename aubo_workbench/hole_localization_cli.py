@@ -37,9 +37,7 @@ def build_parser(
                    help="仅预览：不连接运动控制或下发机器人运动")
     p.add_argument("--allow-experimental-handeye", dest="allow_experimental_handeye", action="store_true",
                    default=DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE,
-                   help="显式允许当前实验手眼结果；默认只接受已验证手眼")
-    p.add_argument("--require-validated-handeye", dest="allow_experimental_handeye", action="store_false",
-                   help="只允许已获生产授权的手眼结果")
+                   help="显式允许诊断手眼结果参与实验运动；默认拒绝")
     p.add_argument("--speed-m-s", type=float, default=0.08,
                    help="精确靠近/闭环修正的 moveLine 速度(m/s)，默认0.08")
     p.add_argument("--acc-m-s2", type=float, default=0.25,
@@ -503,8 +501,8 @@ def build_parser(
         help="260mm共同精定位稳定验收所需严格几何圆心帧数，默认5",
     )
     p.add_argument(
-        "--batch-fine-settle-discard-frames", type=int, default=10,
-        help="260mm批量精定位正式采集前最少丢弃的停稳RGB帧数；随后自动确认已追上实时帧，默认10",
+        "--batch-fine-settle-discard-frames", type=int, default=0,
+        help="260mm批量精定位自适应清理旧RGB帧；0表示不固定丢帧，仅确认实时帧，默认0",
     )
     p.add_argument(
         "--batch-fine-inplace-recovery-frames", type=int, default=4,
@@ -588,12 +586,14 @@ def build_parser(
     )
     p.add_argument(
         "--map-build-localization-mode",
-        choices=("coarse_only", "per_hole"),
+        choices=("coarse_only", "per_hole", "same_capture_340"),
         default="coarse_only",
         help=(
             "建图定位方式：coarse_only只保存340 mm粗定位；"
             "per_hole逐孔执行340 mm粗定位和260 mm精定位，并保存每孔精定位参考；"
-            "两种方式都不把最终TCP动作写入地图"
+            "same_capture_340逐孔在340 mm同批RGB-D帧完成粗定位和严格精定位，"
+            "精定位失败时若340 mm点云中心仍通过粗定位质量门则回退并收录该中心，否则暂缓；"
+            "所有方式都不把最终TCP动作写入地图"
         ),
     )
     p.add_argument(
@@ -664,8 +664,8 @@ def build_parser(
         help="按当前批量精定位目标XY的最近邻顺序处理孔；默认保持初始选择顺序",
     )
     p.add_argument("--fine-frames", type=int, default=20, help="两阶段精定位最大有效RGB帧数")
-    p.add_argument("--fine-settle-discard-frames", type=int, default=10,
-                   help="每次精定位采集前丢弃的机器人/相机预热RGB帧数，默认10")
+    p.add_argument("--fine-settle-discard-frames", type=int, default=0,
+                   help="每次精定位自适应清理旧RGB帧；0表示不固定丢帧，仅确认实时帧，默认0")
     p.add_argument("--fine-retries", type=int, default=2,
                    help="单孔精定位质量门失败后的自动重拍次数，默认2")
     p.add_argument(

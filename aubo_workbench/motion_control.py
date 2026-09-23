@@ -192,11 +192,23 @@ class SavedPoint:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SavedPoint":
+        if not isinstance(data, dict):
+            raise ValueError("保存点位必须是对象")
+
+        def pose_values(primary: str, legacy: str) -> list[float]:
+            raw = data.get(primary, data.get(legacy))
+            if not isinstance(raw, (list, tuple)) or len(raw) != 6:
+                raise ValueError(f"保存点位的 {primary} 必须包含 6 个数值")
+            values = [float(value) for value in raw]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError(f"保存点位的 {primary} 包含 NaN 或无穷值")
+            return values
+
         return cls(
             name=str(data.get("name", "未命名点")),
             created_at=str(data.get("created_at", "")),
-            joints_rad=[float(v) for v in data.get("joints_rad", data.get("joints", [0.0] * 6))],
-            tcp_pose_m_rad=[float(v) for v in data.get("tcp_pose_m_rad", data.get("tcp", [0.0] * 6))],
+            joints_rad=pose_values("joints_rad", "joints"),
+            tcp_pose_m_rad=pose_values("tcp_pose_m_rad", "tcp"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,7 +225,9 @@ def load_points() -> list[SavedPoint]:
         return []
     try:
         payload = json.loads(POINTS_FILE.read_text(encoding="utf-8"))
-        items = payload.get("points", payload if isinstance(payload, list) else [])
+        items = payload.get("points", []) if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return []
         return [SavedPoint.from_dict(item) for item in items]
     except Exception:
         return []
@@ -427,6 +441,16 @@ class AuboMotionSession:
             assert self.motion is not None
             return self.motion.stopMove(False, True)
 
+    def _clear_path_before_move(self, move_name: str) -> Any:
+        assert self.motion is not None
+        try:
+            result = self.motion.clearPath()
+        except Exception as exc:
+            raise RuntimeError(f"clearPath 异常，已拒绝 {move_name}：{exc}") from exc
+        if not sdk_ok(result):
+            raise RuntimeError(f"clearPath 失败，已拒绝 {move_name}：{ret_text(result)}")
+        return result
+
     def move_joint(self, joints_rad: list[float], speed_rad_s: float, acc_rad_s2: float) -> list[Any]:
         with self.lock:
             joints = self._validate_vector(joints_rad, "关节目标")
@@ -434,13 +458,8 @@ class AuboMotionSession:
             acc = self._validate_positive(acc_rad_s2, "关节加速度")
             self._require_motion_state(require_steady=True)
             assert self.motion is not None
-            rets: list[Any] = []
-            try:
-                rets.append(self.motion.clearPath())
-            except Exception as exc:
-                rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveJoint(joints, speed, acc, 0.0, 0.0))
-            return rets
+            clear_result = self._clear_path_before_move("moveJoint")
+            return [clear_result, self.motion.moveJoint(joints, speed, acc, 0.0, 0.0)]
 
     def move_line(self, pose_m_rad: list[float], speed_m_s: float, acc_m_s2: float) -> list[Any]:
         with self.lock:
@@ -449,13 +468,8 @@ class AuboMotionSession:
             acc = self._validate_positive(acc_m_s2, "直线加速度")
             self._require_motion_state(require_steady=True)
             assert self.motion is not None
-            rets: list[Any] = []
-            try:
-                rets.append(self.motion.clearPath())
-            except Exception as exc:
-                rets.append(f"clearPath 异常：{exc}")
-            rets.append(self.motion.moveLine(pose, speed, acc, 0.0, 0.0))
-            return rets
+            clear_result = self._clear_path_before_move("moveLine")
+            return [clear_result, self.motion.moveLine(pose, speed, acc, 0.0, 0.0)]
 
     def speed_joint(self, speeds_rad_s: list[float], acc_rad_s2: float, duration_s: float) -> Any:
         with self.lock:
@@ -998,19 +1012,23 @@ class AuboMotionPanel(ttk.Frame):
         self.log(f"开始{mode}分步点动")
 
         def loop() -> None:
-            last_bad: str | None = None
             while event.is_set():
                 try:
                     rets = step_func()
-                    bad = [ret for ret in rets if not isinstance(ret, str) and not sdk_ok(ret)]
+                    bad = [ret for ret in rets if not sdk_ok(ret)]
                     if bad:
-                        text = ", ".join(ret_text(ret) for ret in bad)
-                        if text != last_bad:
-                            last_bad = text
-                            self.after(0, lambda t=text: self.log(f"{mode}分步点动返回异常：{t}"))
+                        raise RuntimeError(", ".join(ret_text(ret) for ret in bad))
                     self.wait_after_step()
                 except Exception as exc:
+                    event.clear()
+                    with self.jog_lock:
+                        if self.jog_event is event:
+                            self.jog_event = None
                     self.after(0, lambda e=exc: self.log(f"{mode}分步点动失败：{e}"))
+                    try:
+                        self.session.stop_motion()
+                    except Exception as stop_exc:
+                        self.after(0, lambda e=stop_exc: self.log(f"停止运动请求失败：{e}"))
                     break
                 time.sleep(0.03)
 

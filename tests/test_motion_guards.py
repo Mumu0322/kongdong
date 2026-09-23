@@ -72,6 +72,13 @@ class PoseErrorTests(unittest.TestCase):
         _, rotation_rad = pose_error(target, current)
         self.assertAlmostEqual(rotation_rad, 0.02, places=9)
 
+    def test_equivalent_euler_angles_have_zero_rotation_error(self) -> None:
+        # Rz(pi) @ Ry(pi) @ Rx(pi) 与单位矩阵相同。
+        target = [0.0] * 6
+        equivalent = [0.0, 0.0, 0.0, math.pi, math.pi, math.pi]
+        _, rotation_rad = pose_error(target, equivalent)
+        self.assertAlmostEqual(rotation_rad, 0.0, places=9)
+
 
 class ValidateRobotReadyTests(unittest.TestCase):
     def test_accepts_ready_snapshot(self) -> None:
@@ -182,6 +189,7 @@ class WaitForTargetTests(unittest.TestCase):
                 rotation_tolerance_rad=0.01,
                 poll_interval_s=0.01,
             )
+        self.assertEqual(session.stop_calls, 1)
 
     def test_timeout_without_any_snapshot(self) -> None:
         session = FakeSession([_ready_snapshot()])
@@ -194,6 +202,24 @@ class WaitForTargetTests(unittest.TestCase):
                 rotation_tolerance_rad=0.01,
                 poll_interval_s=0.01,
             )
+        self.assertEqual(session.stop_calls, 1)
+
+    def test_timeout_reports_failed_stop_request(self) -> None:
+        class FailingStopSession(FakeSession):
+            def stop_motion(self) -> str:
+                self.stop_calls += 1
+                raise OSError("控制器无响应")
+
+        session = FailingStopSession([_ready_snapshot()])
+        with self.assertRaisesRegex(TimeoutError, "停止运动请求失败"):
+            wait_for_target(
+                session,
+                target_m_rad=[0.0] * 6,
+                timeout_s=0.0,
+                position_tolerance_mm=0.5,
+                rotation_tolerance_rad=0.01,
+            )
+        self.assertEqual(session.stop_calls, 1)
 
 
 if __name__ == "__main__":

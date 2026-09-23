@@ -259,6 +259,49 @@ class RotaryValidationStabilityTests(unittest.TestCase):
             )
         self.assertTrue(np.allclose(actual, target))
 
+    def test_reached_timeout_reports_accepted_command_without_tcp_motion(self) -> None:
+        class StationaryPoseSession:
+            def read_pose_snapshot(self):
+                return {
+                    "power_on": True, "steady": True, "collision": False,
+                    "robot_mode": "RobotModeType.Running",
+                    "safety_mode": "SafetyModeType.Normal",
+                    "pose_values_sdk_m_rad": [0.0] * 6,
+                }
+
+            def pose_sdk_to_transform_mm(self, _pose):
+                return np.eye(4, dtype=np.float64)
+
+        target = np.eye(4, dtype=np.float64)
+        target[0, 3] = 340.0
+        with patch.object(module, "ROBOT_STEADY_POLL_INTERVAL_S", 0.001):
+            with self.assertRaisesRegex(
+                module.MotionExecutionError, "下发后TCP未见明显运动",
+            ) as caught:
+                module._wait_robot_reached(
+                    StationaryPoseSession(), target, timeout_s=0.02,
+                    command_start_pose=np.eye(4),
+                )
+        self.assertIn("RobotModeType.Running", str(caught.exception))
+        self.assertIn("SafetyModeType.Normal", str(caught.exception))
+
+    def test_move_line_timeout_keeps_sdk_response_in_error(self) -> None:
+        args = SimpleNamespace(speed_m_s=0.08, acc_m_s2=0.25)
+        motion = SimpleNamespace(move_line=lambda *_args: [0, 0])
+        target = np.eye(4, dtype=np.float64)
+        target[0, 3] = 340.0
+        with patch.object(module, "_wait_motion_session_steady"), \
+                patch.object(module, "_require_safe_snapshot", return_value=({}, np.eye(4))), \
+                patch.object(
+                    module, "_wait_robot_reached",
+                    side_effect=module.MotionExecutionError("timeout"),
+                ):
+            with self.assertRaisesRegex(module.MotionExecutionError, r"\[0, 0\]"):
+                module._confirm_and_move_line(
+                    "first coarse", np.eye(4), target, args, motion, object(),
+                    require_confirmation=False,
+                )
+
     def test_home_motion_uses_joint_target_when_saved_tcp_is_stale(self) -> None:
         class FakePoseSession:
             def __init__(self) -> None:

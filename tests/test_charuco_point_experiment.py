@@ -63,22 +63,26 @@ class CharucoPointExperimentTests(unittest.TestCase):
         self.assertAlmostEqual(stats["absolute_error_of_mean_mm"], 1.0)
         self.assertAlmostEqual(stats["absolute_error_rms_mm"], np.sqrt(2.0))
 
-    def test_unvalidated_candidate_is_explicitly_experimental(self):
+    def test_legacy_validation_flags_cannot_authorize_motion(self):
         payload = {
-            "validated": False,
-            "do_not_use_for_motion": True,
-            "production_eligible": False,
             "pose_source": "tcp",
             "calibration_frame": "rgb_camera",
             "T_tcp_rgb_camera": np.eye(4).tolist(),
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "candidate.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            loaded = load_handeye_experiment_result(path)
-        self.assertTrue(loaded.experimental_only)
-        self.assertFalse(loaded.validated_for_motion)
-        self.assertIn("禁止用于机械臂运动", loaded.warning)
+            for legacy_validated in (False, True):
+                with self.subTest(legacy_validated=legacy_validated):
+                    payload.update({
+                        "validated": legacy_validated,
+                        "do_not_use_for_motion": not legacy_validated,
+                        "production_eligible": legacy_validated,
+                    })
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    loaded = load_handeye_experiment_result(path)
+                    self.assertTrue(loaded.experimental_only)
+                    self.assertFalse(loaded.validated_for_motion)
+                    self.assertIn("实验运动必须显式启用", loaded.warning)
 
 
 if __name__ == "__main__":

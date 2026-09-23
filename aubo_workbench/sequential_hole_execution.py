@@ -35,6 +35,7 @@ _RUNTIME_DEPENDENCIES = {
     '_cache_measurements_from_observations',
     '_capture_coarse_burst',
     '_capture_fine_with_recovery',
+    '_fuse_fine',
     '_compose_batch_fine_joint_xy_with_tilt',
     '_confirm_and_move_line',
     '_confirm_next_hole_if_needed',
@@ -149,11 +150,13 @@ def _execute_per_hole_final_motion(
     motion_session: Any,
     pose_session: Any,
     timing: Any,
+    *,
+    force_safe_path: bool = False,
 ) -> tuple[np.ndarray, np.ndarray | None, str]:
-    """Choose the final route from measured base Z, preserving safe XY clearance."""
+    """Choose the final route from measured base Z and pose-change clearance."""
     actual = np.asarray(current_tcp, dtype=np.float64).reshape(4, 4).copy()
     final = np.asarray(final_target, dtype=np.float64).reshape(4, 4).copy()
-    if float(actual[2, 3]) < float(final[2, 3]):
+    if force_safe_path or float(actual[2, 3]) < float(final[2, 3]):
         with timing.measure(
             f"hole_{hole_id:02d}/final_motion_safe_z_xy_z",
             hole_id=hole_id,
@@ -194,14 +197,37 @@ def _execute_per_hole_final_motion(
     return reached, after_xy, "xy_then_z"
 
 
+def _plan_per_hole_final_target(
+    current_tcp: np.ndarray,
+    fine_capture_tcp: np.ndarray,
+    target_point_base: np.ndarray,
+    fixed_offset: tuple[float, float] | None,
+    *,
+    use_charuco_model: bool,
+    precaptured: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep this hole's capture orientation even when final motion occurs later."""
+    reference = np.asarray(
+        fine_capture_tcp if precaptured else current_tcp, dtype=np.float64,
+    ).reshape(4, 4).copy()
+    xy_target, _ = plan_final_tcp_xy(
+        reference, target_point_base, fixed_offset,
+        use_charuco_model=use_charuco_model,
+    )
+    final_target = plan_final_tcp_base_z(xy_target, target_point_base)
+    return reference, xy_target, final_target
+
+
 def _per_hole_fine_route(args: Any, batch_fine_available: bool) -> str:
-    """区分共享精定位、逐孔兜底、粗定位直达和只建粗定位地图四条路径。"""
+    """选择逐孔定位路线，确保同拍建图不进入260 mm运动分支。"""
     if bool(getattr(args, "coarse_direct_final", False)):
         return "coarse_direct_final"
     if bool(batch_fine_available):
         return "batch_fine_result"
     if bool(getattr(args, "map_build_coarse_only", False)):
         return "coarse_map_only"
+    if bool(getattr(args, "map_build_same_capture_340", False)):
+        return "same_capture_340"
     return "per_hole_fallback"
 
 
@@ -695,6 +721,129 @@ def _run_coarse_direct_final(
     return np.asarray(current_tcp, dtype=np.float64), result
 
 
+def _same_capture_pointcloud_fallback_validation(
+    hole: dict[str, Any],
+    cfg: Any,
+    *,
+    map_build_enabled: bool,
+    motion_disabled: bool,
+    same_capture_available: bool,
+) -> dict[str, Any]:
+    """Fail closed unless the accepted 340 mm point-cloud center is map-safe."""
+    captures = hole.get("coarse_captures") or []
+    accepted_capture = next((
+        item for item in reversed(captures)
+        if isinstance(item, dict)
+        and str(item.get("status", "")).startswith("accepted")
+    ), None)
+
+    def finite_float(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    coarse_center = hole.get("coarse_center_base_mm")
+    try:
+        center = np.asarray(coarse_center, dtype=np.float64).reshape(3)
+        center_is_finite = bool(np.isfinite(center).all())
+    except (TypeError, ValueError):
+        center = None
+        center_is_finite = False
+
+    metrics = {
+        "center_offset_px": finite_float(
+            accepted_capture.get("center_offset_px") if accepted_capture else None
+        ),
+        "normal_error_deg": finite_float(
+            accepted_capture.get("normal_error_deg") if accepted_capture else None
+        ),
+        "valid_frames": finite_float(hole.get("coarse_valid_frames")),
+        "plane_rmse_mm": finite_float(hole.get("coarse_plane_rmse_mm")),
+        "center_scatter_p95_px": finite_float(
+            hole.get("coarse_center_scatter_p95_px")
+        ),
+        "ring_coverage_min_ratio": finite_float(
+            hole.get("coarse_ring_coverage_min_ratio")
+        ),
+        "ring_max_gap_deg": finite_float(hole.get("coarse_ring_max_gap_deg")),
+        "camera_height_mm": finite_float(
+            hole.get("fine_height_estimate_mm")
+            if hole.get("fine_height_estimate_mm") is not None
+            else hole.get("estimated_height_mm")
+        ),
+    }
+    thresholds = {
+        "center_offset_max_px": float(cfg.center_tolerance_px),
+        "normal_error_max_deg": float(cfg.normal_tolerance_deg),
+        "valid_frames_min": int(cfg.min_coarse_valid),
+        "plane_rmse_max_mm": float(cfg.max_plane_rmse_mm),
+        "center_scatter_p95_max_px": float(cfg.max_coarse_center_scatter_p95_px),
+        "ring_coverage_min_ratio": float(cfg.coarse_min_ring_coverage_ratio),
+        "ring_max_gap_max_deg": float(cfg.coarse_max_ring_gap_deg),
+        "camera_height_target_mm": float(cfg.coarse_height_mm),
+        "camera_height_tolerance_mm": float(cfg.height_tolerance_mm),
+    }
+    checks = {
+        "same_capture_340_map_build": bool(map_build_enabled),
+        "final_motion_disabled": bool(motion_disabled),
+        "same_capture_rgbd_present": bool(same_capture_available),
+        "accepted_coarse_capture_present": accepted_capture is not None,
+        "finite_pointcloud_center": center_is_finite,
+        "camera_centered": (
+            metrics["center_offset_px"] is not None
+            and metrics["center_offset_px"] <= thresholds["center_offset_max_px"]
+        ),
+        "normal_aligned": (
+            metrics["normal_error_deg"] is not None
+            and metrics["normal_error_deg"] <= thresholds["normal_error_max_deg"]
+        ),
+        "enough_valid_frames": (
+            metrics["valid_frames"] is not None
+            and metrics["valid_frames"] >= thresholds["valid_frames_min"]
+        ),
+        "plane_fit_passed": (
+            metrics["plane_rmse_mm"] is not None
+            and metrics["plane_rmse_mm"] <= thresholds["plane_rmse_max_mm"]
+        ),
+        "center_scatter_passed": (
+            metrics["center_scatter_p95_px"] is not None
+            and metrics["center_scatter_p95_px"]
+            <= thresholds["center_scatter_p95_max_px"]
+        ),
+        "ring_coverage_passed": (
+            metrics["ring_coverage_min_ratio"] is not None
+            and metrics["ring_coverage_min_ratio"]
+            >= thresholds["ring_coverage_min_ratio"]
+        ),
+        "ring_gap_passed": (
+            metrics["ring_max_gap_deg"] is not None
+            and metrics["ring_max_gap_deg"] <= thresholds["ring_max_gap_max_deg"]
+        ),
+        "capture_height_is_340mm": (
+            metrics["camera_height_mm"] is not None
+            and abs(
+                metrics["camera_height_mm"] - thresholds["camera_height_target_mm"]
+            ) <= thresholds["camera_height_tolerance_mm"]
+        ),
+    }
+    failures = [name for name, passed in checks.items() if not passed]
+    return {
+        "eligible": not failures,
+        "checks": checks,
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "failed_checks": failures,
+        "accepted_capture_index": (
+            accepted_capture.get("capture_index") if accepted_capture else None
+        ),
+        "pointcloud_center_base_mm": (
+            center.copy() if center_is_finite else None
+        ),
+    }
+
+
 def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
     """Execute one hole while preserving outer-loop failure recovery semantics."""
     args = ctx.args
@@ -790,6 +939,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             and batch_fine_results[hole_id].get("success", False)
         )
         batch_fine_result = batch_fine_results.get(hole_id, {})
+        precaptured_fine = getattr(ctx, "in_group_fine_recoveries", {}).get(hole_id)
 
         failed_coarse = batch_coarse_results.get(hole_id, {})
         if failed_coarse.get("coarse_quality_retry") and not batch_coarse_available:
@@ -1051,7 +1201,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             cache_reused = False
 
             rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
-            if per_hole_fine_route == "per_hole_fallback":
+            if per_hole_fine_route == "per_hole_fallback" and precaptured_fine is None:
                 # 没有成功的共同260mm批量结果时，保留原有逐孔精定位兜底。
                 batch_fine_target, batch_fine_geometry = _plan_hole_tcp_pose_fixed_rz(
                     np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
@@ -1120,7 +1270,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "summary": {"validation": validation.to_dict()},
             }]
             rgbd_pipeline, align, chain = ensure_rgbd_pipeline()
-            if per_hole_fine_route == "per_hole_fallback":
+            if per_hole_fine_route == "per_hole_fallback" and precaptured_fine is None:
                 fine_target, fine_geometry = _plan_hole_tcp_pose_fixed_rz(
                     np.asarray(hole["coarse_center_base_mm"], dtype=np.float64),
                     np.asarray(hole["coarse_normal_toward_camera_base"], dtype=np.float64),
@@ -1179,7 +1329,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             # 内部沿用“粗几何已就绪”布尔量；报告通过独立字段与缓存区分。
             cache_reused = True
             coarse_captures = list(hole.get("coarse_captures", []))
-            if per_hole_fine_route == "per_hole_fallback":
+            if per_hole_fine_route == "per_hole_fallback" and precaptured_fine is None:
                 # 初始点云复用只提供每孔粗几何；共享精拍失败时仍必须真实
                 # 移到该孔自己的260 mm位姿，再走单孔RGB质量门。
                 fine_target, fine_geometry = _plan_hole_tcp_pose_fixed_rz(
@@ -1411,6 +1561,9 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 })
         coarse_correction_count = 0
         coarse_failure: dict[str, Any] | None = None
+        accepted_same_capture_fine: dict[str, Any] | None = None
+        accepted_same_capture_tcp: np.ndarray | None = None
+        accepted_same_capture_anchor: np.ndarray | None = None
         for capture_index in range(1, 5) if not coarse_capture_ready else []:
             settle_discarded_frames = 0
             settle_delay_s = 0.0
@@ -1441,6 +1594,9 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 tracking_point_base, T_base_camera, initial_intrinsics,
             )
             capture_name = f"hole_{hole_id:02d}_coarse_{capture_index}"
+            same_capture_fine = (
+                {} if bool(getattr(args, "map_build_same_capture_340", False)) else None
+            )
             with timing.measure(
                 f"hole_{hole_id:02d}/coarse_capture_{capture_index}",
                 hole_id=hole_id,
@@ -1458,8 +1614,16 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     lock_anchor=False,
                     include_points=True,
                     timing=timing,
+                    T_base_camera=(
+                        T_base_camera
+                        if bool(getattr(args, "map_build_per_hole_reference", False))
+                        else None
+                    ),
+                    same_capture_fine=same_capture_fine,
                 )
             rows.extend(_observation_rows(coarse_observations))
+            if same_capture_fine is not None:
+                rows.extend(_observation_rows(same_capture_fine["observations"]))
             _record_hole_tracking_event(
                 hole, capture_name, expected_anchor_px, coarse_observations,
                 initial_intrinsics, "distorted_pixel_yolo_center",
@@ -1574,6 +1738,10 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "summary": summary,
             })
             hole["coarse_captures"] = list(coarse_captures)
+            if same_capture_fine is not None:
+                accepted_same_capture_fine = same_capture_fine
+                accepted_same_capture_tcp = capture_tcp.copy()
+                accepted_same_capture_anchor = expected_anchor_px.copy()
             if center_offset <= cfg.center_tolerance_px and normal_error <= cfg.normal_tolerance_deg:
                 break
             if (
@@ -1913,6 +2081,63 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 fine_observations, fine_intrinsics,
                 "undistorted_pixel_yolo_center",
             )
+        elif precaptured_fine is not None:
+            # The fallback RGB burst was already captured next to its shared
+            # group. Use its measured TCP for geometry; do not revisit the
+            # hole before the normal final-motion phase.
+            fine_capture_tcp = np.asarray(
+                precaptured_fine["capture_tcp"], dtype=np.float64,
+            ).copy()
+            estimated_height = float(precaptured_fine["height_mm"])
+            hole["fine_height_estimate_mm"] = estimated_height
+            expected_fine_anchor_px = np.asarray(
+                precaptured_fine["expected_anchor_px"], dtype=np.float64,
+            ).copy()
+            fine_recovery = precaptured_fine["recovery"]
+        elif bool(getattr(args, "map_build_same_capture_340", False)):
+            # The accepted coarse capture already contains the RGB frames used
+            # for strict fine localization. Keep their TCP and intrinsics paired.
+            capture = accepted_same_capture_fine or {}
+            fine_observations = list(capture.get("observations") or [])
+            fine_intrinsics = capture.get("intrinsics")
+            fine_capture_tcp = np.asarray(
+                accepted_same_capture_tcp if accepted_same_capture_tcp is not None
+                else current_tcp, dtype=np.float64,
+            ).copy()
+            estimated_height = camera_height_to_plane_mm(
+                fine_capture_tcp, handeye.T_tcp_rgb_camera, coarse_plane_base,
+            )
+            hole["fine_height_estimate_mm"] = estimated_height
+            error = None
+            fine = None
+            if fine_intrinsics is None:
+                error = "340 mm同拍精定位没有有效RGB内参"
+            else:
+                try:
+                    with timing.measure(
+                        f"hole_{hole_id:02d}/same_capture_340_fine_fusion",
+                        hole_id=hole_id,
+                        processing_order=order,
+                    ):
+                        fine = _fuse_fine(fine_observations, cfg)
+                    fine["fine_quality_status"] = "strict"
+                    fine["fine_recovery_attempts"] = []
+                except RuntimeError as exc:
+                    error = str(exc)
+            fine_recovery = {
+                "success": fine is not None,
+                "observations": fine_observations,
+                "intrinsics": fine_intrinsics,
+                "fine": fine,
+                "attempts": [],
+                "error": error,
+            }
+            if accepted_same_capture_anchor is not None and fine_intrinsics is not None:
+                _record_hole_tracking_event(
+                    hole, "same_capture_340_fine", accepted_same_capture_anchor,
+                    fine_observations, fine_intrinsics,
+                    "undistorted_pixel_yolo_center",
+                )
         else:
             estimated_height = None
             for height_index in range(cfg.max_z_corrections):
@@ -1994,7 +2219,14 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 ),
                 "batch_fine_source": (
                     str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
-                    if batch_fine_available else "per_hole_fine_fallback"
+                    if batch_fine_available else
+                    "same_capture_340_fine"
+                    if bool(getattr(args, "map_build_same_capture_340", False)) else
+                    "per_hole_fine_fallback"
+                ),
+                "map_build_localization_mode": (
+                    getattr(args, "map_build_localization_mode", None)
+                    if bool(getattr(args, "map_build_per_hole_reference", False)) else None
                 ),
                 "batch_fine_capture_round": int(
                     batch_fine_result.get("batch_fine_capture_round", 0)
@@ -2010,8 +2242,13 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     if cache_reused else "fresh_per_hole_coarse"
                 ),
                 "fine_quality_status": "deferred_fine_quality",
+                "in_group_per_hole_fallback_precaptured": bool(precaptured_fine is not None),
                 "fine_quality_note": fine_recovery["error"],
-                "localization_path": "fine_260_deferred",
+                "localization_path": (
+                    "same_capture_340_deferred"
+                    if bool(getattr(args, "map_build_same_capture_340", False))
+                    else "fine_260_deferred"
+                ),
                 "fine_stage_skipped": False,
                 "batch_coarse_center_base_mm": hole.get(
                     "batch_coarse_center_base_mm"
@@ -2038,7 +2275,13 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "coarse_normal_toward_camera_base": coarse_normal_base,
                 "coarse_plane_rmse_mm": hole["coarse_plane_rmse_mm"],
                 "coarse_valid_frames": hole["coarse_valid_frames"],
+                "coarse_total_frames": hole.get("coarse_total_frames"),
                 "coarse_center_scatter_p95_px": hole["coarse_center_scatter_p95_px"],
+                "coarse_ring_points_median": hole.get("coarse_ring_points_median"),
+                "coarse_ring_coverage_min_ratio": hole.get(
+                    "coarse_ring_coverage_min_ratio"
+                ),
+                "coarse_ring_max_gap_deg": hole.get("coarse_ring_max_gap_deg"),
                 "coarse_surface_model": hole.get("coarse_surface_model"),
                 "coarse_surface_selection_policy": hole.get("coarse_surface_selection_policy"),
                 "coarse_front_surface_z_mm": hole.get("coarse_front_surface_z_mm"),
@@ -2064,6 +2307,106 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "deferred_reason": fine_recovery["error"],
                 "timing": timing.scoped_snapshot(f"hole_{hole_id:02d}/"),
             }
+            if bool(getattr(args, "map_build_same_capture_340", False)):
+                fallback_validation = _same_capture_pointcloud_fallback_validation(
+                    hole,
+                    cfg,
+                    map_build_enabled=bool(
+                        getattr(args, "map_build_per_hole_reference", False)
+                    ),
+                    motion_disabled=not bool(getattr(args, "move_final_xy", False)),
+                    same_capture_available=accepted_same_capture_fine is not None,
+                )
+                if fallback_validation["eligible"]:
+                    coarse_center = np.asarray(
+                        hole["coarse_center_base_mm"], dtype=np.float64,
+                    ).reshape(3).copy()
+                    valid_fine_frames = sum(
+                        item.error is None and item.ellipse is not None
+                        for item in fine_observations
+                    )
+                    fallback_result = dict(deferred_result)
+                    fallback_result.update({
+                        "status": "completed",
+                        "deferred_reason": None,
+                        "pointcloud_center_fallback": True,
+                        "pointcloud_center_fallback_reason": fine_recovery["error"]
+                        or "严格RGB精定位结果不可用",
+                        "pointcloud_center_fallback_validation": fallback_validation,
+                        "fine_quality_status": "pointcloud_center_fallback",
+                        "fine_quality_note": fine_recovery["error"]
+                        or "严格RGB精定位结果不可用；使用通过质量门的340 mm点云中心",
+                        "fine_center_source": "coarse_pointcloud_center_fallback",
+                        "fine_center_source_counts": {
+                            "coarse_pointcloud_center_fallback": 1,
+                        },
+                        "fine_xy_source": "coarse_pointcloud_center_fallback",
+                        "fine_z_source": "coarse_pointcloud_center_z",
+                        "localization_path": "same_capture_340_pointcloud_center_fallback",
+                        "map_build_localization_mode": "same_capture_340",
+                        "map_build_fine_reference": True,
+                        "map_build_final_motion_disabled": True,
+                        "hole_result_type": "base_frame_3d_point",
+                        "hole_center_base_mm": coarse_center.copy(),
+                        "hole_center_base_naive_mm": coarse_center.copy(),
+                        "pointcloud_center_base_mm": coarse_center.copy(),
+                        "fine_plane_intersection_mm": None,
+                        "fine_tcp_pose_m_rad": None,
+                        "valid_frames": valid_fine_frames,
+                        "total_frames": len(fine_observations),
+                        "fine_valid_frames": valid_fine_frames,
+                        "target_point_base_mm": None,
+                        "final_pose_source": "map_reference_only_pointcloud_center_fallback",
+                    })
+                    for key in (
+                        "initial_selection_order", "operator_selection_order",
+                        "selection_source", "numbering_policy", "map_order",
+                        "layout_row", "layout_column", "numbering_center_px",
+                        "numbering_row_tolerance_px", "map_hole_key", "global_hole_key",
+                        "sector_id", "boundary_class", "boundary_layer",
+                        "boundary_component_index", "boundary_edge_score_deg",
+                        "boundary_local_degree", "boundary_distance",
+                        "boundary_distance_mm", "boundary_distance_px",
+                        "boundary_distance_unit", "boundary_coordinate_source",
+                        "boundary_classification_reason", "boundary_override",
+                        "boundary_override_source", "group_phase", "group_boundary_class",
+                        "edge_first_group_index", "edge_first_phase_group_index",
+                        "batch_coarse_group_index", "batch_coarse_group_hole_ids",
+                    ):
+                        if fallback_result.get(key) is None and hole.get(key) is not None:
+                            fallback_result[key] = hole.get(key)
+                    fallback_result["comparison_diagnostics"] = (
+                        _build_comparison_hole_diagnostics(fallback_result)
+                    )
+                    hole["final_result"] = fallback_result
+                    results.append(fallback_result)
+                    report["stages"][f"hole_{hole_id}"] = fallback_result
+                    report["stages"]["processed_holes"] = {
+                        "completed_count": sum(
+                            item.get("status") == "completed" for item in results
+                        ),
+                        "deferred_count": sum(
+                            item.get("status") != "completed" for item in results
+                        ),
+                        "total_count": len(results),
+                        "hole_order": [int(item["hole_id"]) for item in results],
+                        "holes": results,
+                    }
+                    _write_progress_checkpoint(run_dir, report, timing=timing)
+                    print(
+                        f"[SEQUENTIAL_HOLE] order={order} hole={hole_id} "
+                        "status=completed_pointcloud_center_fallback "
+                        f"center={np.round(coarse_center, 3).tolist()} "
+                        f"fine_failure={fine_recovery['error']}",
+                        flush=True,
+                    )
+                    _confirm_next_hole_if_needed(
+                        order, initial_holes, hole_id, timing,
+                    )
+                    return
+                deferred_result["pointcloud_center_fallback_validation"] = (
+                    fallback_validation
+                )
             _append_deferred_hole_result(
                 hole, deferred_result, results, report, run_dir, timing,
             )
@@ -2365,14 +2708,21 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             # 按下发前实测TCP判断高低，避免异常恢复时缓存位姿导致路径选错。
             _, measured_tcp = _require_safe_snapshot(pose_session)
             current_tcp = np.asarray(measured_tcp, dtype=np.float64).copy()
+            # In-group fallback RGB capture happened before the other groups
+            # and final-hole sequence. The live TCP now belongs to the previous
+            # completed hole; it is only the motion START, never this hole's
+            # target orientation. Before early capture existed these were the
+            # same pose, because capture immediately preceded final motion.
             fixed_offset = (
                 None if args.tcp_xy_offset_mm is None
                 else (float(args.tcp_xy_offset_mm[0]), float(args.tcp_xy_offset_mm[1]))
             )
-            xy_target, tcp_before = plan_final_tcp_xy(
-                current_tcp, final_target_point_base, fixed_offset,
+            pose_reference_tcp, xy_target, planned_final_tcp = _plan_per_hole_final_target(
+                current_tcp, fine_capture_tcp, final_target_point_base, fixed_offset,
                 use_charuco_model=use_charuco_model,
+                precaptured=precaptured_fine is not None,
             )
+            tcp_before = current_tcp[:3, 3].copy()
             correction_xy = xy_target[:2, 3] - final_target_point_base[:2]
             compensation = (
                 f"ChArUco仿射模型修正={np.round(correction_xy, 3).tolist()} mm"
@@ -2380,11 +2730,9 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 f"显式固定补偿={list(fixed_offset)} mm" if fixed_offset is not None
                 else "不使用ChArUco纠偏"
             )
-            planned_final_tcp = plan_final_tcp_base_z(
-                xy_target, final_target_point_base,
-            )
             needs_safe_lift = bool(
-                float(current_tcp[2, 3]) < float(planned_final_tcp[2, 3])
+                precaptured_fine is not None
+                or float(current_tcp[2, 3]) < float(planned_final_tcp[2, 3])
             )
             final_path_policy = (
                 "safe_z_lift_xy_guarded_z_descent"
@@ -2399,6 +2747,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 _execute_per_hole_final_motion(
                     hole_id, order, current_tcp, xy_target, planned_final_tcp,
                     compensation, args, motion_session, pose_session, timing,
+                    force_safe_path=precaptured_fine is not None,
                 )
             )
             final_xy_motion = {
@@ -2407,6 +2756,13 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 ),
                 "actual_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(current_tcp),
                 "tcp_position_before_mm": tcp_before,
+                "pose_reference_source": (
+                    "in_group_per_hole_fine_capture"
+                    if precaptured_fine is not None else "current_tcp"
+                ),
+                "pose_reference_tcp_pose_m_rad": transform_to_sdk_pose_m_rad(
+                    pose_reference_tcp
+                ),
                 "hole_center_base_mm": final_point_base,
                 "pose_point_base_mm": pose_point_base,
                 "target_point_base_mm": final_target_point_base,
@@ -2483,7 +2839,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             "batch_coarse_requested": bool(batch_coarse_for_cache),
             "batch_fine_requested": bool(cfg.batch_fine_localization),
             "map_build_localization_mode": (
-                "per_hole"
+                getattr(args, "map_build_localization_mode", "per_hole")
                 if bool(getattr(args, "map_build_per_hole_reference", False))
                 else None
             ),
@@ -2497,7 +2853,10 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             ),
             "batch_fine_source": (
                 str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
-                if batch_fine_available else "per_hole_fine"
+                if batch_fine_available else
+                "same_capture_340_fine"
+                if bool(getattr(args, "map_build_same_capture_340", False)) else
+                "per_hole_fine"
             ),
             "batch_fine_capture_round": int(
                 batch_fine_result.get("batch_fine_capture_round", 0)
@@ -2505,6 +2864,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             "batch_fine_fallback_from_shared": bool(batch_fine_fallback_active),
             "batch_fine_fallback_reason": hole.get("batch_fine_fallback_reason"),
             "batch_fine_group_index": batch_fine_plan.get("hole_group_indices", {}).get(str(hole_id)),
+            "in_group_per_hole_fallback_precaptured": bool(precaptured_fine is not None),
             "batch_coarse_fallback_reason": batch_fallback_reason,
             "batch_fine_joint_enabled": batch_fine_joint_enabled,
             "batch_fine_joint_applied": batch_fine_joint_applied,
@@ -2545,7 +2905,10 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             "fine_quality_note": fine.get("fine_quality_note"),
             "fine_recovery_attempts": fine.get("fine_recovery_attempts", []),
             "localization_path": (
-                "batch_fine_260" if batch_fine_available else "per_hole_fine_260"
+                "batch_fine_260" if batch_fine_available else
+                "same_capture_340_fine"
+                if bool(getattr(args, "map_build_same_capture_340", False)) else
+                "per_hole_fine_260"
             ),
             "fine_stage_skipped": False,
             "batch_coarse_center_base_mm": hole.get(

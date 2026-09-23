@@ -6,8 +6,8 @@
 -> 260 mm RGB/YOLO 精定位修正最终 XY -> 移动到当前目标点。建图模式还支持
 逐孔保存340 mm粗定位和260 mm精定位参考，但地图调用仍要求现场重新精定位。
 
-默认进入两阶段流程但只做预览；必须显式启用运动和相应的验证开关后，才会连接运动控制。
-默认不允许使用未通过生产验证的实验手眼结果。
+默认进入两阶段流程但只做预览；实验运动必须显式启用 --execute 和
+--allow-experimental-handeye，才会连接运动控制。
 
 本文件保留命令行入口和兼容导出；视觉、采集、共享定位、分组运动、缓存、
 地图辅助、诊断和参数解析分别由 aubo_workbench 下的专用模块实现。
@@ -196,7 +196,7 @@ from aubo_workbench.hole_localization_models import (  # noqa: E402
 # 只有明确传入 --execute 时才允许连接运动控制和下发机器人命令。
 DEFAULT_TWO_STAGE_HOLE_LOCALIZATION = True
 DEFAULT_EXECUTE_MOTION = False
-DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE = True
+DEFAULT_ALLOW_EXPERIMENTAL_HANDEYE = False
 DEFAULT_MOVE_FINAL_XY = True
 
 
@@ -341,6 +341,7 @@ def _wait_robot_reached(
     *,
     position_tolerance_mm: float = MOTION_REQUEST_IGNORE_POSITION_TOLERANCE_MM,
     rotation_tolerance_deg: float = MOTION_REQUEST_IGNORE_ROTATION_TOLERANCE_DEG,
+    command_start_pose: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
     """等待机器人真正到达目标，而不是仅凭可能滞后的 steady 标志返回。
 
@@ -356,6 +357,12 @@ def _wait_robot_reached(
     rot_tol = max(0.0, float(rotation_tolerance_deg))
     deadline = time.monotonic() + float(timeout_s)
     last_reason = ""
+    start_pose = (
+        None if command_start_pose is None else
+        np.asarray(command_start_pose, dtype=np.float64).reshape(4, 4).copy()
+    )
+    max_translation_from_start_mm = 0.0
+    max_rotation_from_start_deg = 0.0
     while time.monotonic() < deadline:
         snapshot = read_snapshot()
         if not bool(snapshot.get("power_on")):
@@ -365,6 +372,17 @@ def _wait_robot_reached(
         actual = pose_session.pose_sdk_to_transform_mm(
             snapshot["pose_values_sdk_m_rad"]
         )
+        if start_pose is None:
+            start_pose = np.asarray(actual, dtype=np.float64).copy()
+        else:
+            max_translation_from_start_mm = max(
+                max_translation_from_start_mm,
+                float(np.linalg.norm(actual[:3, 3] - start_pose[:3, 3])),
+            )
+            max_rotation_from_start_deg = max(
+                max_rotation_from_start_deg,
+                _rotation_delta_between_transforms_deg(actual, start_pose),
+            )
         position_error_mm = float(np.linalg.norm(actual[:3, 3] - desired[:3, 3]))
         rotation_error_deg = _rotation_delta_between_transforms_deg(actual, desired)
         power_on = bool(snapshot.get("power_on"))
@@ -374,9 +392,35 @@ def _wait_robot_reached(
         last_reason = (
             f"power={power_on} steady={steady} "
             f"position_error={position_error_mm:.3f}mm "
-            f"rotation_error={rotation_error_deg:.3f}deg"
+            f"rotation_error={rotation_error_deg:.3f}deg "
+            f"robot_mode={snapshot.get('robot_mode', 'unknown')} "
+            f"safety_mode={snapshot.get('safety_mode', 'unknown')}"
         )
         time.sleep(ROBOT_STEADY_POLL_INTERVAL_S)
+    if start_pose is not None:
+        start_position_error_mm = float(np.linalg.norm(
+            start_pose[:3, 3] - desired[:3, 3],
+        ))
+        start_rotation_error_deg = _rotation_delta_between_transforms_deg(
+            start_pose, desired,
+        )
+        commanded_motion = (
+            start_position_error_mm > pos_tol
+            or start_rotation_error_deg > rot_tol
+        )
+        if (
+            commanded_motion
+            and max_translation_from_start_mm < 1.0
+            and max_rotation_from_start_deg < 0.2
+        ):
+            observation_label = (
+                "下发后" if command_start_pose is not None else "等待期间"
+            )
+            last_reason += (
+                f"; {observation_label}TCP未见明显运动"
+                f"（最大位移={max_translation_from_start_mm:.3f}mm，"
+                f"最大转角={max_rotation_from_start_deg:.3f}deg）"
+            )
     raise RuntimeError(f"等待机器人到达目标超时：{last_reason}")
 
 
@@ -818,9 +862,15 @@ def _confirm_and_move_line(label: str, current: np.ndarray, target: np.ndarray, 
                 "SDK返回13(AUBO_REQUEST_IGNORE)，但实测TCP尚未到达目标"
             )
         raise RuntimeError(f"{label} moveLine 下发失败：{response}")
-    _, actual = _wait_robot_reached(
-        pose_session, target, timeout_s=wait_timeout,
-    )
+    try:
+        _, actual = _wait_robot_reached(
+            pose_session, target, timeout_s=wait_timeout,
+            command_start_pose=motion_start,
+        )
+    except MotionExecutionError as exc:
+        raise MotionExecutionError(
+            f"{label} moveLine返回{response}，但目标未到位：{exc}"
+        ) from exc
     _wait_motion_session_steady(motion_session, wait_timeout)
     _record_motion_distance(
         args, label, motion_start, target,
@@ -2598,6 +2648,30 @@ def _find_batch_pointcloud_archive(run_dir: Path, report: dict[str, Any]) -> Pat
     return max(existing, key=lambda path: path.stat().st_mtime)
 
 
+def _find_per_hole_surface_diagnostics(
+    run_dir: Path, report: dict[str, Any], hole_payload: dict[str, Any],
+) -> dict[int, Path]:
+    """Pick the final accepted 340 mm capture for each hole in this map build."""
+    results = {
+        int(item["hole_id"]): item
+        for item in ((report.get("final_result") or {}).get("holes") or [])
+        if isinstance(item, dict) and item.get("hole_id") is not None
+    }
+    sources: dict[int, Path] = {}
+    for hole in (hole_payload.get("holes") or {}).values():
+        hole_id = int(hole["hole_id"])
+        captures = (results.get(hole_id) or {}).get("coarse_captures") or []
+        accepted = [
+            item for item in captures
+            if str(item.get("status", "")) in {"accepted", "accepted_degraded_tracking"}
+            and item.get("capture_index") is not None
+        ]
+        if accepted:
+            capture_index = int(accepted[-1]["capture_index"])
+            sources[hole_id] = run_dir / f"hole_{hole_id:02d}_coarse_{capture_index}_surface_diagnostic.npz"
+    return sources
+
+
 def _write_hole_map_from_report(
     args: Any,
     report: dict[str, Any],
@@ -2660,7 +2734,10 @@ def _write_hole_map_from_report(
             charuco_model_bias_mm=CHARUCO_XY_MODEL_BIAS_MM,
             tcp_xy_offset_mm=getattr(args, "tcp_xy_offset_mm", None),
         )
-    pointcloud_archive = _find_batch_pointcloud_archive(run_dir, report)
+    per_hole_map = str(getattr(args, "map_build_localization_mode", "coarse_only")) in {
+        "per_hole", "same_capture_340",
+    }
+    pointcloud_archive = None if per_hole_map else _find_batch_pointcloud_archive(run_dir, report)
     overlay_source = (
         (report.get("stages") or {}).get("batch_coarse_results") or {}
     ).get("overlay_path")
@@ -2679,12 +2756,21 @@ def _write_hole_map_from_report(
             artifact_dir = map_path.parent / "sectors" / sector_name
             sector_payload = {
                 "holes": ((payload.get("sectors") or {}).get(sector_name) or {}).get("holes", {}),
+                "map_build_localization_mode": (
+                    ((payload.get("sectors") or {}).get(sector_name) or {}).get(
+                        "map_build_localization_mode"
+                    )
+                ),
             }
             sector_artifacts = export_hole_map_artifacts(
                 pointcloud_archive,
                 artifact_dir,
                 sector_payload,
                 overlay_path=overlay_source,
+                per_hole_sources=(
+                    _find_per_hole_surface_diagnostics(run_dir, report, sector_payload)
+                    if per_hole_map else None
+                ),
             )
             relative_prefix = Path("sectors") / sector_name
             prefixed_artifacts: dict[str, Any] = {}
@@ -2695,7 +2781,14 @@ def _write_hole_map_from_report(
                     prefixed_artifacts[key] = value
             payload["sectors"][sector_name]["artifacts"] = prefixed_artifacts
             payload["artifacts"] = {
-                "status": "ready",
+                "status": (
+                    "ready"
+                    if all(
+                        str((sector.get("artifacts") or {}).get("status")) == "ready"
+                        for sector in (payload.get("sectors") or {}).values()
+                        if sector.get("artifacts")
+                    ) else "partial"
+                ),
                 "coordinate_frame": "robot_base_mm",
                 "sectors": {
                     str(key): (value.get("artifacts") or {})
@@ -2709,6 +2802,10 @@ def _write_hole_map_from_report(
                 map_path.parent,
                 payload,
                 overlay_path=overlay_source,
+                per_hole_sources=(
+                    _find_per_hole_surface_diagnostics(run_dir, report, payload)
+                    if per_hole_map else None
+                ),
             )
     with artifact_measure(
         timing,
@@ -2785,6 +2882,30 @@ def _write_hole_map_from_report(
             if not rotary_map else
             (payload.get("quality_summary") or {}).get("fine_reference_missing_holes", 0)
         ),
+        "fine_localization_passed_holes": (
+            (payload.get("quality_summary") or {}).get("fine_localization_passed_holes", [])
+            if not rotary_map else
+            (payload.get("quality_summary") or {}).get("fine_localization_passed_holes", 0)
+        ),
+        "pointcloud_fallback_holes": (
+            (payload.get("quality_summary") or {}).get("pointcloud_fallback_holes", [])
+            if not rotary_map else
+            (payload.get("quality_summary") or {}).get("pointcloud_fallback_holes", 0)
+        ),
+        "pointcloud_fallback_hole_ids": (
+            (payload.get("quality_summary") or {}).get("pointcloud_fallback_holes", [])
+            if not rotary_map else
+            (((payload.get("sectors") or {}).get(sector_key(int(sector_id))) or {}).get(
+                "quality_summary"
+            ) or {}).get("pointcloud_fallback_holes", [])
+        ),
+        "fine_localization_passed_hole_ids": (
+            (payload.get("quality_summary") or {}).get("fine_localization_passed_holes", [])
+            if not rotary_map else
+            (((payload.get("sectors") or {}).get(sector_key(int(sector_id))) or {}).get(
+                "quality_summary"
+            ) or {}).get("fine_localization_passed_holes", [])
+        ),
         "scope": payload.get("scope"),
         "current_path": None if current_path is None else str(current_path),
         "current_updated": current_path is not None,
@@ -2814,13 +2935,25 @@ def _write_hole_map_from_report(
         "fine_reference_missing_holes": hole_map_summary[
             "fine_reference_missing_holes"
         ],
+        "fine_localization_passed_holes": hole_map_summary[
+            "fine_localization_passed_holes"
+        ],
+        "pointcloud_fallback_holes": hole_map_summary[
+            "pointcloud_fallback_holes"
+        ],
         "policy": (
+            "build_one_rotary_sector_with_per_hole_same_capture_340mm_fine_or_quality_gated_pointcloud_fallback;"
+            "call_requires_runtime_260mm_fine_localization"
+            if rotary_map and effective_map_mode == "same_capture_340" else
             "build_one_rotary_sector_with_per_hole_340mm_coarse_and_260mm_fine_reference;"
             "call_requires_runtime_260mm_fine_localization"
             if rotary_map and effective_map_mode == "per_hole" else
             "build_one_rotary_sector_with_340mm_coarse_only;"
             "call_requires_runtime_260mm_fine_localization"
             if rotary_map else
+            "build_per_hole_same_capture_340mm_fine_or_quality_gated_pointcloud_fallback;"
+            "call_requires_runtime_fine_localization"
+            if effective_map_mode == "same_capture_340" else
             "build_per_hole_340mm_coarse_and_260mm_fine_reference;"
             "call_requires_runtime_fine_localization"
             if effective_map_mode == "per_hole" else
@@ -2836,6 +2969,7 @@ def _write_hole_map_from_report(
         f"ready_holes={hole_map_summary['ready_holes']} "
         f"map_mode={hole_map_summary['map_build_localization_mode']} "
         f"fine_reference_ready={hole_map_summary['fine_reference_ready_holes']} "
+        f"pointcloud_fallback={hole_map_summary['pointcloud_fallback_holes']} "
         f"deferred={hole_map_summary['deferred_holes']} "
         f"current={hole_map_summary['current_path'] or 'unchanged'}",
         flush=True,
@@ -2973,9 +3107,9 @@ def run_hole_map_repair(args: Any, handeye: Any, model: Any) -> int:
         current_tcp = np.asarray(initial_tcp, dtype=np.float64).copy()
         report["robot_initial_tcp_pose_m_rad"] = initial_snapshot["pose_values_sdk_m_rad"]
         report["home_point"] = home.to_dict() if home is not None else None
-        if not handeye.validated_for_motion and not args.allow_experimental_handeye:
+        if not args.allow_experimental_handeye:
             raise RuntimeError(
-                "手眼证据未通过生产运动门，拒绝地图单孔返修；"
+                "地图单孔返修使用诊断手眼结果时必须显式开启实验运动；"
                 "实验验证请显式添加 --allow-experimental-handeye"
             )
         with timing.measure("robot/connect_motion_session"):
@@ -3397,6 +3531,8 @@ def _new_two_stage_report(
         "localization_strategy": (
             f"coarse_{float(cfg.coarse_height_mm):g}_pointcloud_center_only_edge_first"
             if bool(getattr(args, "coarse_direct_final", False)) else
+            "per_hole_same_capture_340_strict_fine_with_quality_gated_pointcloud_fallback_reference"
+            if hole_map_mode == "build" and map_build_mode == "same_capture_340" else
             "per_hole_coarse_340_then_fine_260_reference_only"
             if hole_map_mode == "build" and map_build_mode == "per_hole" else
             "shared_or_per_hole_fine"
@@ -4277,9 +4413,9 @@ def run_two_stage_hole_localization(
             getattr(args, "map_build_localization_mode", "coarse_only")
             or "coarse_only"
         ).strip().lower()
-        if map_build_localization_mode not in {"coarse_only", "per_hole"}:
+        if map_build_localization_mode not in {"coarse_only", "per_hole", "same_capture_340"}:
             raise ValueError(
-                "地图建图定位方式必须是coarse_only或per_hole"
+                "地图建图定位方式必须是coarse_only、per_hole或same_capture_340"
             )
         args.map_build_localization_mode = map_build_localization_mode
         args._map_build_localization_mode = map_build_localization_mode
@@ -4303,6 +4439,7 @@ def run_two_stage_hole_localization(
         )
         args.map_build_coarse_only = batch_coarse_for_map
         args.map_build_per_hole_reference = not batch_coarse_for_map
+        args.map_build_same_capture_340 = map_build_localization_mode == "same_capture_340"
         # 两种建图方式都不执行最终安放动作；逐孔模式的260 mm结果只作为
         # 每孔精定位参考写入地图。
         args.coarse_direct_final = False
@@ -4471,17 +4608,12 @@ def run_two_stage_hole_localization(
         report["home_point"] = home.to_dict() if home is not None else None
 
         if args.execute:
-            if not handeye.validated_for_motion and not args.allow_experimental_handeye:
+            if not args.allow_experimental_handeye:
                 raise RuntimeError(
-                    "手眼证据未通过生产运动门，拒绝两阶段自动运动；"
+                    "两阶段自动运动使用诊断手眼结果时必须显式开启实验运动；"
                     "若仅用于现场实验验证，请显式添加 --allow-experimental-handeye"
                 )
-            if not handeye.validated_for_motion:
-                print(
-                    "[EXPERIMENTAL] 使用未通过生产验证的当前手眼结果。"
-                    "本次仅可作实验验证，结果不会被标记为生产可用。",
-                    flush=True,
-                )
+            print("[EXPERIMENTAL] 使用诊断手眼结果执行实验运动。", flush=True)
             with timing.measure("robot/connect_motion_session"):
                 motion_session = AuboMotionSession()
                 motion_session.connect(
@@ -4639,11 +4771,7 @@ def run_two_stage_hole_localization(
             report["final_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(current_tcp)
             report["next_cycle_ready"] = False
             report["next_cycle_confirmation_required"] = True
-            report["status"] = (
-                "completed_experimental_handeye_waiting_for_next_cycle_confirmation"
-                if not handeye.validated_for_motion else
-                "completed_waiting_for_next_cycle_confirmation"
-            )
+            report["status"] = "completed_experimental_handeye_waiting_for_next_cycle_confirmation"
             _write_report(run_dir, report, rows, timing=timing)
             print(
                 f"[NEXT_CYCLE_CONFIRM_REQUIRED] cycle={int(cycle_index)} 已完成；"
@@ -4806,6 +4934,8 @@ _apply_robot_connection_overrides = apply_robot_connection_overrides
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _apply_robot_connection_overrides(args)
+    if args.image is not None and args.execute:
+        raise RuntimeError("--image 只用于离线预览，不能与 --execute 同用")
     if args.hole_map_mode == "repair":
         handeye = load_handeye_experiment_result(args.handeye)
         model = load_yolo(args.model)
@@ -4908,15 +5038,23 @@ def main(argv: list[str] | None = None) -> int:
                           "target_pose_xyzrpy": list(transform_to_pose6_rzryrx(target))},
                          ensure_ascii=False, indent=2))
         if args.execute:
-            if not handeye.validated_for_motion:
-                raise RuntimeError("手眼证据未通过生产运动门，拒绝下发；请先安装 validated E7 结果")
+            if not args.allow_experimental_handeye:
+                raise RuntimeError("实验手眼运动未启用；请显式添加 --allow-experimental-handeye")
             motion_session = AuboMotionSession()
             motion_session.connect(ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
                                     ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms)
-            pose = list(snapshot["pose_values_sdk_m_rad"])
-            pose[:3] = (p_base / 1000.0).tolist()
-            print("[MOTION] 下发 moveLine，目标 XYZ(m):", pose[:3])
-            print(motion_session.move_line(pose, args.speed_m_s, args.acc_m_s2))
+            try:
+                actual = _confirm_and_move_line(
+                    "单阶段诊断目标", T_base_tcp, target, args,
+                    motion_session, pose_session, require_confirmation=False,
+                )
+                print("[MOTION] 实测到位 TCP XYZ(mm):", actual[:3, 3].tolist())
+            except BaseException:
+                try:
+                    motion_session.stop_motion()
+                except Exception as stop_exc:
+                    print(f"[MOTION] 停止运动请求失败：{stop_exc}", flush=True)
+                raise
         return 0
     finally:
         if pipeline is not None:

@@ -168,7 +168,7 @@ def evaluate_image_quality(color_bgr: np.ndarray, pose_result: BoardPoseResult) 
     center_limit = cfg.max_rgb_center_offset_ratio if is_rgb else cfg.max_center_offset_ratio
     if center_offset_ratio > center_limit:
         reasons.append(f"标定板偏离画面过多：{center_offset_ratio:.2f}>{center_limit:.2f}")
-        add_advice("保证标定板完整可见；E7需要中心和边缘视野，但不能发生裁切。")
+        add_advice("保证标定板完整可见，避免角点被裁切。")
     if not (cfg.min_brightness <= brightness <= cfg.max_brightness):
         reasons.append(f"亮度不合适：{brightness:.0f}")
         if brightness < cfg.min_brightness:

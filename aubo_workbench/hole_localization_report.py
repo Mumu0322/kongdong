@@ -713,6 +713,8 @@ def _point(value: Any) -> list[float] | None:
 
 
 def _hole_source(result: dict[str, Any]) -> str:
+    if result.get("pointcloud_center_fallback"):
+        return "pointcloud_center_fallback"
     if result.get("status") == "capture_only":
         return "coarse_direct_capture_only"
     if result.get("coarse_direct_decision") in {

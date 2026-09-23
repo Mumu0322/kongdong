@@ -17,7 +17,7 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
-from .config import E7_HAND_EYE_CFG, ROBOT_CFG
+from .config import AUTO_CAPTURE_CFG, ROBOT_CFG
 from .geometry import ensure_finite_array, make_transform, rotation_error_deg, rotx, roty, rotz
 from .sdk_paths import add_aubo_sdk_to_path, aubo_sdk_hint
 
@@ -194,8 +194,8 @@ class AuboPoseSession:
         xyz_error = float(max(abs(predicted[:3, 3] - T_base_tcp[:3, 3])))
         rotation_error = rotation_error_deg(predicted[:3, :3], T_base_tcp[:3, :3])
         chain_ok = (
-            xyz_error <= E7_HAND_EYE_CFG.maximum_pose_bracket_xyz_mm
-            and rotation_error <= E7_HAND_EYE_CFG.maximum_pose_bracket_abc_deg
+            xyz_error <= AUTO_CAPTURE_CFG.burst_pose_stability_xyz_mm
+            and rotation_error <= AUTO_CAPTURE_CFG.burst_pose_stability_abc_deg
         )
         if steady and not chain_ok:
             raise RuntimeError(

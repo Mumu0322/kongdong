@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """粗定位导航地图的数据层。
 
-地图默认以 340 mm 粗定位几何作为导航基准。逐孔建图模式还可以在每个孔下
-保存一份 260 mm 精定位参考和质量信息，供建图诊断、种子纠正和复核使用；
+地图默认以 340 mm 粗定位几何作为导航基准。逐孔建图模式还可以保存260 mm
+精定位参考，或保存同拍340 mm精定位参考及通过严格粗质量门的点云中心回退；
 运行地图时仍必须重新执行现场精定位，最终孔心和最终 TCP 目标不能写入地图。
 旧版把最终 TCP 烘焙进地图的格式仍可被识别，但正常流程会明确拒绝它。
 """
@@ -120,21 +120,29 @@ def _coarse_capture_pose(result: dict[str, Any]) -> list[float] | None:
 
 
 def _fine_reference_record(result: dict[str, Any]) -> dict[str, Any] | None:
-    """按白名单保留逐孔 260 mm 精定位参考，不保留最终运动目标。"""
+    """按白名单保留逐孔精定位或点云回退参考，不保留最终运动目标。"""
     mode = str(result.get("map_build_localization_mode") or "").strip().lower()
     requested = bool(result.get("map_build_fine_reference")) or mode in {
         "per_hole",
         "per_hole_coarse_and_fine",
+        "same_capture_340",
     }
     if not requested:
         return None
+    pointcloud_fallback = bool(result.get("pointcloud_center_fallback"))
+    if pointcloud_fallback:
+        capture_policy = "per_hole_same_capture_340mm_pointcloud_fallback_reference_only"
+    elif mode == "same_capture_340":
+        capture_policy = "per_hole_same_capture_340mm_reference_only"
+    else:
+        capture_policy = "per_hole_fine_260mm_reference_only"
 
     hole_id = int(result.get("hole_id", 0) or 0)
     point = result.get("hole_center_base_mm")
     if point is None:
         return {
             "status": "missing",
-            "capture_policy": "per_hole_fine_260mm_reference_only",
+            "capture_policy": capture_policy,
             "fine_quality_status": result.get("fine_quality_status"),
             "fine_quality_note": result.get("fine_quality_note"),
         }
@@ -143,14 +151,18 @@ def _fine_reference_record(result: dict[str, Any]) -> dict[str, Any] | None:
     except ValueError as exc:
         return {
             "status": "invalid",
-            "capture_policy": "per_hole_fine_260mm_reference_only",
+            "capture_policy": capture_policy,
             "fine_quality_status": result.get("fine_quality_status"),
             "fine_quality_note": f"精定位参考点无效：{exc}",
         }
 
     reference: dict[str, Any] = {
-        "status": "ready",
-        "capture_policy": "per_hole_fine_260mm_reference_only",
+        "status": "coarse_fallback" if pointcloud_fallback else "ready",
+        "reference_source": (
+            "coarse_pointcloud_center_fallback" if pointcloud_fallback
+            else "rgb_fine_localization"
+        ),
+        "capture_policy": capture_policy,
         "hole_center_base_mm": fine_point,
         "fine_plane_intersection_mm": _optional_vector(
             result.get("fine_plane_intersection_mm"),
@@ -189,8 +201,15 @@ def _fine_reference_record(result: dict[str, Any]) -> dict[str, Any] | None:
         "yolo_fallback_frames": _optional_scalar(result.get("yolo_fallback_frames")),
         "fine_height_estimate_mm": _optional_scalar(result.get("fine_height_estimate_mm")),
     }
+    if pointcloud_fallback:
+        reference["pointcloud_fallback_reason"] = result.get(
+            "pointcloud_center_fallback_reason"
+        ) or result.get("fine_quality_note")
+        reference["pointcloud_fallback_validation"] = jsonable(
+            result.get("pointcloud_center_fallback_validation") or {}
+        )
     coarse_point = result.get("coarse_center_base_mm")
-    if coarse_point is not None:
+    if coarse_point is not None and not pointcloud_fallback:
         try:
             coarse_values = np.asarray(coarse_point, dtype=np.float64).reshape(-1)
             fine_values = np.asarray(fine_point, dtype=np.float64).reshape(-1)
@@ -319,8 +338,19 @@ def _coarse_hole_record(result: dict[str, Any]) -> dict[str, Any]:
             "hole_result_type": result.get("hole_result_type"),
             "coarse_source": result.get("coarse_source"),
         },
+        "pointcloud_center_fallback": bool(
+            result.get("pointcloud_center_fallback", False)
+        ),
         "fine_reference": _fine_reference_record(result),
     }
+    if result.get("pointcloud_center_fallback"):
+        record["pointcloud_center_fallback_reason"] = (
+            result.get("pointcloud_center_fallback_reason")
+            or result.get("fine_quality_note")
+        )
+        record["pointcloud_center_fallback_validation"] = jsonable(
+            result.get("pointcloud_center_fallback_validation") or {}
+        )
     return {key: value for key, value in record.items() if value is not None}
 
 
@@ -381,13 +411,17 @@ def build_hole_map_payload(
     fine_reference_requested = reported_mode in {
         "per_hole",
         "per_hole_coarse_and_fine",
+        "same_capture_340",
     } or any(
         bool(item.get("map_build_fine_reference"))
         or str(item.get("map_build_localization_mode") or "").strip().lower()
-        in {"per_hole", "per_hole_coarse_and_fine"}
+        in {"per_hole", "per_hole_coarse_and_fine", "same_capture_340"}
         for item in raw_results
     )
-    map_build_localization_mode = "per_hole" if fine_reference_requested else "coarse_only"
+    map_build_localization_mode = (
+        "same_capture_340" if reported_mode == "same_capture_340" else
+        "per_hole" if fine_reference_requested else "coarse_only"
+    )
     batch_requested = bool(
         (report.get("configuration") or {}).get("batch_coarse_localization", False)
     )
@@ -463,6 +497,8 @@ def build_hole_map_payload(
     errors: list[str] = []
     fine_reference_missing: list[int] = []
     fine_reference_ready: list[int] = []
+    fine_localization_passed: list[int] = []
+    pointcloud_fallback_holes: list[int] = []
     for result in raw_results:
         try:
             hole_id = int(result["hole_id"])
@@ -476,7 +512,10 @@ def build_hole_map_payload(
             deferred.append({
                 "hole_id": hole_id,
                 "status": result.get("status"),
-                "error": result.get("error") or result.get("coarse_quality_note"),
+                "error": (
+                    result.get("error") or result.get("deferred_reason")
+                    or result.get("fine_quality_note") or result.get("coarse_quality_note")
+                ),
             })
             continue
         try:
@@ -491,13 +530,18 @@ def build_hole_map_payload(
             continue
         if fine_reference_requested:
             fine_reference = record.get("fine_reference") or {}
-            if str(fine_reference.get("status", "")).lower() == "ready":
+            reference_status = str(fine_reference.get("status", "")).lower()
+            if reference_status in {"ready", "coarse_fallback"}:
                 fine_reference_ready.append(hole_id)
+                if reference_status == "coarse_fallback":
+                    pointcloud_fallback_holes.append(hole_id)
+                else:
+                    fine_localization_passed.append(hole_id)
             else:
                 fine_reference_missing.append(hole_id)
                 reason = (
                     fine_reference.get("fine_quality_note")
-                    or "逐孔260 mm精定位参考缺失或无效"
+                    or "逐孔精定位参考缺失或无效"
                 )
                 errors.append(f"孔 {hole_id} {reason}")
                 deferred.append({
@@ -525,6 +569,10 @@ def build_hole_map_payload(
         "source_report_path": str(source_path / "report.json"),
         "map_build_localization_mode": map_build_localization_mode,
         "reference_policy": (
+            "per_hole_same_capture_340mm_fine_reference_saved_for_diagnostics;"
+            "failed_fine_may_use_quality_gated_pointcloud_center_fallback;"
+            "runtime_requires_fresh_fine_and_does_not_use_persisted_final_tcp"
+            if map_build_localization_mode == "same_capture_340" else
             "per_hole_260mm_fine_reference_saved_for_diagnostics_and_seed_correction;"
             "runtime_requires_fresh_fine_and_does_not_use_persisted_final_tcp"
             if fine_reference_requested else
@@ -544,6 +592,8 @@ def build_hole_map_payload(
             "fine_reference_requested": fine_reference_requested,
             "fine_reference_ready_holes": sorted(fine_reference_ready),
             "fine_reference_missing_holes": sorted(fine_reference_missing),
+            "fine_localization_passed_holes": sorted(fine_localization_passed),
+            "pointcloud_fallback_holes": sorted(pointcloud_fallback_holes),
             "batch_coarse_requested": batch_requested,
         },
         "safety": {
@@ -600,6 +650,8 @@ def _rotary_sector_common_payload(
             "deferred_holes": 0,
             "fine_reference_ready_holes": 0,
             "fine_reference_missing_holes": 0,
+            "fine_localization_passed_holes": 0,
+            "pointcloud_fallback_holes": 0,
         },
     }
 
@@ -672,6 +724,8 @@ def build_rotary_sector_map_payload(
         "status": "valid" if sector_source.get("status") == "valid" else "partial",
         "nominal_angle_deg": nominal_sector_angle_deg(sector_number),
         "reference_policy": (
+            "per_hole_same_capture_340mm_fine_reference_or_quality_gated_pointcloud_fallback"
+            if sector_mode == "same_capture_340" else
             "per_hole_260mm_fine_reference_saved_for_diagnostics_and_seed_correction"
             if sector_source.get("map_build_localization_mode") == "per_hole" else
             "coarse_geometry_from_this_sector_build"
@@ -696,6 +750,8 @@ def _recompute_rotary_quality_summary(payload: dict[str, Any]) -> None:
     deferred_hole_count = 0
     fine_reference_ready_count = 0
     fine_reference_missing_count = 0
+    fine_localization_passed_count = 0
+    pointcloud_fallback_count = 0
     for sector in sectors.values():
         if not isinstance(sector, dict):
             continue
@@ -718,6 +774,16 @@ def _recompute_rotary_quality_summary(payload: dict[str, Any]) -> None:
             if isinstance(sector_quality.get("fine_reference_missing_holes"), int)
             else len(sector_quality.get("fine_reference_missing_holes") or [])
         )
+        fine_localization_passed_count += int(
+            sector_quality.get("fine_localization_passed_holes", [])
+            if isinstance(sector_quality.get("fine_localization_passed_holes"), int)
+            else len(sector_quality.get("fine_localization_passed_holes") or [])
+        )
+        pointcloud_fallback_count += int(
+            sector_quality.get("pointcloud_fallback_holes", [])
+            if isinstance(sector_quality.get("pointcloud_fallback_holes"), int)
+            else len(sector_quality.get("pointcloud_fallback_holes") or [])
+        )
         if ready:
             ready_sector_ids.append(sid)
     payload["quality_summary"] = {
@@ -728,6 +794,8 @@ def _recompute_rotary_quality_summary(payload: dict[str, Any]) -> None:
         "deferred_holes": int(deferred_hole_count),
         "fine_reference_ready_holes": int(fine_reference_ready_count),
         "fine_reference_missing_holes": int(fine_reference_missing_count),
+        "fine_localization_passed_holes": int(fine_localization_passed_count),
+        "pointcloud_fallback_holes": int(pointcloud_fallback_count),
         "map_build_localization_mode": payload.get(
             "map_build_localization_mode", "coarse_only"
         ),
@@ -879,7 +947,7 @@ def _validate_hole_record(key: str, hole: dict[str, Any]) -> int:
         if not isinstance(fine_reference, dict):
             raise ValueError(f"孔位地图条目 {key} 的 fine_reference 不是对象")
         fine_status = str(fine_reference.get("status", "")).lower()
-        if fine_status == "ready":
+        if fine_status in {"ready", "coarse_fallback"}:
             _finite_vector(
                 fine_reference.get("hole_center_base_mm"),
                 3,

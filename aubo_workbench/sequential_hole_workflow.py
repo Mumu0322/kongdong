@@ -409,6 +409,8 @@ def _run_sequential_hole_workflow(
         "mode": (
             f"coarse_{float(cfg.coarse_height_mm):g}_pointcloud_center_only_no_fallback_edge_first"
             if direct_strategy else
+            "per_hole_same_capture_340_coarse_and_strict_fine_with_quality_gated_pointcloud_fallback_reference"
+            if bool(getattr(args, "map_build_same_capture_340", False)) else
             "per_hole_coarse_340_then_fine_260_reference_only"
             if bool(getattr(args, "map_build_per_hole_reference", False)) else
             "grouped_shared_coarse_then_grouped_shared_fine_with_per_hole_fallback"
@@ -427,6 +429,9 @@ def _run_sequential_hole_workflow(
         "capture_policy": (
             f"{float(cfg.coarse_height_mm):g}mm_pointcloud_center_only_direct_no_fallback_edge_first"
             if direct_strategy else
+            "each_selected_hole_fresh_340mm_rgbd_coarse_and_strict_rgb_fine_same_capture;"
+            "failed_fine_uses_quality_gated_pointcloud_center_or_defers_without_final_motion"
+            if bool(getattr(args, "map_build_same_capture_340", False)) else
             "each_selected_hole_fresh_340mm_coarse_then_260mm_fine;"
             "fine_reference_persisted_without_final_motion"
             if bool(getattr(args, "map_build_per_hole_reference", False)) else

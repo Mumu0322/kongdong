@@ -63,17 +63,22 @@ def select_front_surface(points: np.ndarray, pixels: np.ndarray, center: tuple[f
     return normal, anchor, rmse, active, front_z
 
 
-def save_surface_diagnostic(path, plane, *, hole_id=None, frame_index=None):
+def save_surface_diagnostic(path, plane, *, hole_id=None, frame_index=None,
+                            T_base_camera=None):
     """Persist the last raw annulus and mask, including quality-rejected holes."""
     if plane.raw_points_camera_mm is None:
         return None
-    np.savez_compressed(
-        path, raw_points_camera_mm=plane.raw_points_camera_mm,
-        raw_pixels=plane.raw_pixels, selected_mask=plane.surface_selected_mask,
-        ring_pixels=plane.ring_pixels if plane.ring_pixels is not None else plane.raw_pixels,
-        plane_normal_camera=plane.normal_camera,
-        plane_anchor_camera_mm=plane.surface_plane_point_camera_mm,
-        hole_id=-1 if hole_id is None else hole_id,
-        frame_index=-1 if frame_index is None else frame_index,
-    )
+    arrays = {
+        "raw_points_camera_mm": plane.raw_points_camera_mm,
+        "raw_pixels": plane.raw_pixels,
+        "selected_mask": plane.surface_selected_mask,
+        "ring_pixels": plane.ring_pixels if plane.ring_pixels is not None else plane.raw_pixels,
+        "plane_normal_camera": plane.normal_camera,
+        "plane_anchor_camera_mm": plane.surface_plane_point_camera_mm,
+        "hole_id": -1 if hole_id is None else hole_id,
+        "frame_index": -1 if frame_index is None else frame_index,
+    }
+    if T_base_camera is not None:
+        arrays["T_base_camera"] = np.asarray(T_base_camera, dtype=np.float64).reshape(4, 4)
+    np.savez_compressed(path, **arrays)
     return str(path)

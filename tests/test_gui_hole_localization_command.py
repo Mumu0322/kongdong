@@ -159,6 +159,20 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         self.assertIn("--no-batch-fine-pointcloud-xy-fusion", command)
         self.assertIn("--no-move-final-xy", command)
 
+    def test_map_build_same_capture_340_is_separate_mode(self) -> None:
+        command = self._map_execution_command(
+            allow_experimental=True,
+            mode="hole_map_build",
+            map_build_mode="same_capture_340",
+        )
+        self.assertEqual(
+            command[command.index("--map-build-localization-mode") + 1],
+            "same_capture_340",
+        )
+        self.assertIn("--no-batch-coarse-localization", command)
+        self.assertIn("--no-batch-fine-localization", command)
+        self.assertIn("--no-move-final-xy", command)
+
     def test_map_execution_always_moves_successful_fine_result_to_final_point(self) -> None:
         command = self._map_execution_command(
             allow_experimental=True, final_xy_checked=False,
@@ -167,10 +181,9 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         self.assertIn("--move-final-xy", command)
         self.assertNotIn("--no-move-final-xy", command)
 
-    def test_map_execution_can_require_validated_handeye(self) -> None:
+    def test_map_execution_requires_explicit_experimental_handeye(self) -> None:
         command = self._map_execution_command(allow_experimental=False)
 
-        self.assertIn("--require-validated-handeye", command)
         self.assertNotIn("--allow-experimental-handeye", command)
 
     def test_visual_selection_order_is_passed_to_map_execution(self) -> None:

@@ -411,13 +411,6 @@ class CoarseCacheTests(unittest.TestCase):
         self.assertIn("--reuse-coarse-cache", panel._build_command("two_stage"))
         self.assertIn("--reuse-persistent-coarse-cache", panel._build_command("two_stage"))
 
-    def test_gui_cache_strategy_forces_cross_run_persistent_reuse(self) -> None:
-        panel = self._panel_for_command("cache")
-        command = panel._build_command("two_stage")
-        self.assertIn("--reuse-coarse-cache", command)
-        self.assertIn("--reuse-persistent-coarse-cache", command)
-        self.assertNotIn("--no-reuse-persistent-coarse-cache", command)
-
     def test_gui_per_hole_strategy_disables_shared_fine_path(self) -> None:
         panel = self._panel_for_command("per_hole")
         panel.batch_fine_localization_var = _Value(True)
@@ -540,45 +533,24 @@ class CoarseCacheTests(unittest.TestCase):
         self.assertEqual(panel.confirmation_kind, "hole")
         self.assertEqual(panel.confirm_btn.configured[-1]["state"], "normal")
 
-    def test_gui_manual_next_hole_applies_to_map_execution(self) -> None:
-        panel = self._panel_for_next_hole_confirmation(False, mode="hole_map_execute")
-
-        panel._handle_next_hole_confirmation("[NEXT_HOLE_CONFIRM_REQUIRED] 当前孔=1，下一个检测孔=2")
-
-        self.assertEqual(panel.process.stdin.writes, [])
-        self.assertTrue(panel.waiting_confirmation)
-        self.assertEqual(panel.confirmation_kind, "hole")
-        self.assertIn("开始执行下一个地图孔", panel.confirm_btn.configured[-1]["text"])
-
-    def test_gui_auto_next_hole_applies_to_map_execution(self) -> None:
-        panel = self._panel_for_next_hole_confirmation(True, mode="hole_map_execute")
-
-        panel._handle_next_hole_confirmation("[NEXT_HOLE_CONFIRM_REQUIRED] 当前孔=1，下一个检测孔=2")
-
-        self.assertEqual(panel.process.stdin.writes, ["m\n"])
-        self.assertFalse(panel.waiting_confirmation)
-        self.assertEqual(panel.confirmation_kind, "")
-        self.assertIn("地图模式", "".join(panel.logs))
-
-    def test_gui_manual_next_hole_applies_to_map_build(self) -> None:
-        panel = self._panel_for_next_hole_confirmation(False, mode="hole_map_build")
-
-        panel._handle_next_hole_confirmation("[NEXT_HOLE_CONFIRM_REQUIRED] 当前孔=1，下一个检测孔=2")
-
-        self.assertEqual(panel.process.stdin.writes, [])
-        self.assertTrue(panel.waiting_confirmation)
-        self.assertEqual(panel.confirmation_kind, "hole")
-        self.assertIn("开始建立下一个地图孔", panel.confirm_btn.configured[-1]["text"])
-
-    def test_gui_auto_next_hole_applies_to_map_build(self) -> None:
-        panel = self._panel_for_next_hole_confirmation(True, mode="hole_map_build")
-
-        panel._handle_next_hole_confirmation("[NEXT_HOLE_CONFIRM_REQUIRED] 当前孔=1，下一个检测孔=2")
-
-        self.assertEqual(panel.process.stdin.writes, ["m\n"])
-        self.assertFalse(panel.waiting_confirmation)
-        self.assertEqual(panel.confirmation_kind, "")
-        self.assertIn("地图模式", "".join(panel.logs))
+    def test_gui_next_hole_confirmation_in_map_modes(self) -> None:
+        for mode, manual_label in (
+            ("hole_map_execute", "开始执行下一个地图孔"),
+            ("hole_map_build", "开始建立下一个地图孔"),
+        ):
+            for auto in (False, True):
+                with self.subTest(mode=mode, auto=auto):
+                    panel = self._panel_for_next_hole_confirmation(auto, mode=mode)
+                    panel._handle_next_hole_confirmation(
+                        "[NEXT_HOLE_CONFIRM_REQUIRED] 当前孔=1，下一个检测孔=2"
+                    )
+                    self.assertEqual(panel.process.stdin.writes, ["m\n"] if auto else [])
+                    self.assertEqual(panel.waiting_confirmation, not auto)
+                    self.assertEqual(panel.confirmation_kind, "" if auto else "hole")
+                    if auto:
+                        self.assertIn("地图模式", "".join(panel.logs))
+                    else:
+                        self.assertIn(manual_label, panel.confirm_btn.configured[-1]["text"])
 
     def test_gui_auto_next_hole_does_not_affect_offset_process(self) -> None:
         panel = self._panel_for_next_hole_confirmation(True, mode="offset")

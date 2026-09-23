@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from aubo_workbench import sequential_hole_execution as _hole_execution
 from aubo_workbench import sequential_workflow_shared as _shared_stages
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -70,6 +70,10 @@ class SequentialWorkflowContext:
     invalidated_cache_ids: set[int]
     batch_fine_results: dict[Any, Any]
     batch_fine_plan: dict[Any, Any]
+    # RGB observations captured immediately after their shared group failed.
+    # Kept in memory until the normal per-hole final-motion stage; never written
+    # into the JSON report as raw SDK/NumPy objects.
+    in_group_fine_recoveries: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def ensure_rgbd_pipeline(self) -> tuple[Any, Any, Any]:
         if self.runtime.get("rgbd_pipeline") is None:

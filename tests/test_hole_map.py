@@ -215,6 +215,34 @@ class HoleMapTests(unittest.TestCase):
         self.assertNotIn("final_tcp_pose_m_rad", reference)
         self.assertNotIn("target_point_base_mm", reference)
 
+    def test_same_capture_340_map_excludes_failed_fine_and_keeps_reason(self) -> None:
+        ready = _completed_result(1)
+        ready.update({
+            "map_build_localization_mode": "same_capture_340",
+            "map_build_fine_reference": True,
+            "fine_height_estimate_mm": 340.0,
+        })
+        report = {
+            "map_build_localization_mode": "same_capture_340",
+            "final_result": {"holes": [
+                ready,
+                {"hole_id": 2, "status": "deferred_fine_quality",
+                 "deferred_reason": "精定位有效帧不足：4/12"},
+            ]},
+        }
+        payload = build_hole_map_payload(
+            report, map_id="same-capture-map", source_run_dir="source-run",
+            handeye_path=None, camera_identity=None,
+        )
+        self.assertEqual(payload["map_build_localization_mode"], "same_capture_340")
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["quality_summary"]["fine_reference_ready_holes"], [1])
+        self.assertEqual(payload["quality_summary"]["fine_reference_missing_holes"], [2])
+        self.assertIn("4/12", payload["quality_summary"]["deferred_holes"][0]["error"])
+        self.assertEqual(get_hole(payload, 1)["fine_reference"]["capture_policy"],
+                         "per_hole_same_capture_340mm_reference_only")
+        self.assertEqual(validate_hole_map(payload), [1])
+
     def test_invalid_requested_hole_is_rejected(self) -> None:
         report = {"final_result": {"holes": [_completed_result(1)]}}
         payload = build_hole_map_payload(
@@ -282,3 +310,41 @@ class HoleMapTests(unittest.TestCase):
             preview = cv2.imread(str(root / "map" / "pointcloud_preview.jpg"))
             self.assertIsNotNone(preview)
             self.assertGreater(int(preview.shape[1]), 1000)
+
+    def test_per_hole_map_exports_3d_cloud_from_individual_captures(self) -> None:
+        report = {"final_result": {"holes": [_completed_result(1), _completed_result(2)]}}
+        payload = build_hole_map_payload(
+            report,
+            map_id="per-hole-cloud",
+            source_run_dir="source-run",
+            handeye_path=None,
+            camera_identity=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {}
+            for hole_id in (1, 2):
+                source = root / f"hole_{hole_id:02d}_coarse_1_surface_diagnostic.npz"
+                transform = np.eye(4, dtype=np.float64)
+                transform[0, 3] = float(hole_id * 10)
+                np.savez_compressed(
+                    source,
+                    raw_points_camera_mm=np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
+                    T_base_camera=transform,
+                    frame_index=np.asarray(hole_id, dtype=np.int32),
+                )
+                sources[hole_id] = source
+            artifacts = export_hole_map_artifacts(
+                None, root / "map", payload, per_hole_sources=sources,
+            )
+            self.assertEqual(artifacts["status"], "ready")
+            self.assertEqual(artifacts["hole_ids"], [1, 2])
+            self.assertEqual(artifacts["point_count"], 4)
+            for key in ("raw_npz", "ply", "centers_ply", "preview_jpg"):
+                self.assertTrue((root / "map" / artifacts[key]).is_file())
+            with np.load(root / "map" / artifacts["raw_npz"], allow_pickle=False) as saved:
+                np.testing.assert_allclose(saved["points_base_mm"][0], [11, 2, 3])
+                np.testing.assert_allclose(saved["points_base_mm"][2], [21, 2, 3])
+            for source in sources.values():
+                source.unlink()
+            self.assertTrue((root / "map" / artifacts["ply"]).is_file())

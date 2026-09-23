@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """孔位地图的点云归档和可视化产物。
 
-地图正文保存孔位几何，并可附带逐孔260 mm精定位参考；本模块把共享340 mm
-粗定位产生的点云另存为：
+地图正文保存孔位几何，并可附带逐孔260 mm或同拍340 mm精定位/点云回退参考；
+本模块把共享或逐孔340 mm粗定位产生的点云另存为：
 
 * ``pointcloud_raw.npz``：带相机坐标、基坐标和帧/孔标签的可复算数据；
 * ``pointcloud_base.ply``：可直接用 Open3D、CloudCompare 等工具打开的三维点云；
@@ -108,6 +108,39 @@ def _load_batch_archive(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
         points_base.astype(np.float32),
         hole_ids,
         frame_indices,
+    )
+
+
+def _load_per_hole_diagnostics(
+    sources: dict[int, Path],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Combine the last accepted coarse capture for each mapped hole."""
+    if not sources:
+        raise ValueError("没有可用于三维地图的逐孔粗定位点云")
+    camera_chunks: list[np.ndarray] = []
+    base_chunks: list[np.ndarray] = []
+    hole_labels: list[np.ndarray] = []
+    frame_labels: list[np.ndarray] = []
+    for hole_id, source in sorted(sources.items()):
+        with np.load(source, allow_pickle=False) as archive:
+            if "raw_points_camera_mm" not in archive or "T_base_camera" not in archive:
+                raise ValueError(f"逐孔点云缺少坐标或相机位姿：{source}")
+            points = np.asarray(archive["raw_points_camera_mm"], dtype=np.float64).reshape(-1, 3)
+            transform = np.asarray(archive["T_base_camera"], dtype=np.float64).reshape(4, 4)
+            frame_index = int(archive["frame_index"]) if "frame_index" in archive else -1
+        if not len(points) or not np.isfinite(points).all() or not np.isfinite(transform).all():
+            raise ValueError(f"逐孔点云为空或含有非有限值：{source}")
+        if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0]):
+            raise ValueError(f"逐孔点云相机位姿无效：{source}")
+        camera_chunks.append(points.astype(np.float32))
+        base_chunks.append((points @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32))
+        hole_labels.append(np.full(len(points), hole_id, dtype=np.int32))
+        frame_labels.append(np.full(len(points), frame_index, dtype=np.int32))
+    return (
+        np.concatenate(camera_chunks),
+        np.concatenate(base_chunks),
+        np.concatenate(hole_labels),
+        np.concatenate(frame_labels),
     )
 
 
@@ -253,6 +286,7 @@ def _write_preview(
     max_points: int = 120_000,
 ) -> None:
     centers: list[tuple[int, np.ndarray]] = []
+    fallback_hole_ids: list[int] = []
     for raw in _iter_payload_holes(payload):
         if not isinstance(raw, dict):
             continue
@@ -263,15 +297,24 @@ def _write_preview(
             continue
         if np.isfinite(coarse).all():
             centers.append((hole_id, coarse))
+            if bool(raw.get("pointcloud_center_fallback")):
+                fallback_hole_ids.append(hole_id)
     indices = _balanced_downsample(labels, max_points)
     points = np.asarray(points_base, dtype=np.float64)[indices]
     point_labels = np.asarray(labels, dtype=np.int32)[indices]
     canvas = np.full((1000, 1800, 3), 255, dtype=np.uint8)
     cv2.putText(canvas, "Hole map point cloud | robot base frame (mm)", (45, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2, cv2.LINE_AA)
     cv2.putText(canvas, f"points={len(points_base):,}  displayed={len(points):,}  holes={len(centers)}", (48, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (70, 70, 70), 1, cv2.LINE_AA)
+    if fallback_hole_ids:
+        fallback_text = "point-cloud center fallback: " + ", ".join(
+            f"H{hole_id:02d}" for hole_id in sorted(fallback_hole_ids)
+        )
+        cv2.putText(canvas, fallback_text, (48, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 190), 1, cv2.LINE_AA)
     _panel_projection(canvas, (45, 110, 865, 940), points, point_labels, centers, 0, 1, "XY top view")
     _panel_projection(canvas, (935, 110, 1755, 940), points, point_labels, centers, 0, 2, "XZ side view")
     preview_policy = (
+        "gray cross=340mm coarse center   same-capture RGB fine or quality-gated point-cloud fallback; runtime reacquires fine"
+        if payload.get("map_build_localization_mode") == "same_capture_340" else
         "gray cross=340mm coarse center   per-hole 260mm fine reference is stored; runtime still reacquires fine"
         if payload.get("map_build_localization_mode") == "per_hole" else
         "gray cross=340mm coarse center   map stores no 260mm fine point or TCP target"
@@ -289,22 +332,46 @@ def export_hole_map_artifacts(
     payload: dict[str, Any],
     *,
     overlay_path: str | Path | None = None,
+    per_hole_sources: dict[int, Path] | None = None,
 ) -> dict[str, Any]:
     """导出地图点云和预览；返回的路径均相对于地图版本目录。"""
     result: dict[str, Any] = {
         "status": "unavailable",
         "coordinate_frame": "robot_base_mm",
     }
-    if source_npz is None:
+    if source_npz is None and not per_hole_sources:
+        if per_hole_sources is not None:
+            result["reason"] = "逐孔建图没有可用的粗定位点云诊断归档"
+            return result
         result["reason"] = "run中没有共享粗定位点云NPZ"
         return result
-    source = Path(source_npz).expanduser()
-    if not source.is_file():
+    source = None if source_npz is None else Path(source_npz).expanduser()
+    if source is not None and not source.is_file():
         result["reason"] = f"共享粗定位点云NPZ不存在：{source}"
         return result
     directory = Path(map_dir).expanduser()
     try:
-        points_camera, points_base, labels, frame_indices = _load_batch_archive(source)
+        if source is not None:
+            points_camera, points_base, labels, frame_indices = _load_batch_archive(source)
+            source_metadata = {"source_npz": str(source)}
+            raw_source_metadata = {"source_npz_path": np.asarray(str(source))}
+        else:
+            sources = {int(hole_id): Path(path) for hole_id, path in (per_hole_sources or {}).items()}
+            expected_holes = {
+                int(hole["hole_id"])
+                for hole in _iter_payload_holes(payload)
+                if isinstance(hole, dict) and hole.get("hole_id") is not None
+            }
+            missing_holes = expected_holes - sources.keys()
+            if missing_holes:
+                raise ValueError(f"逐孔点云缺少已建图孔：{sorted(missing_holes)}")
+            points_camera, points_base, labels, frame_indices = _load_per_hole_diagnostics(sources)
+            source_metadata = {
+                "source_diagnostics": {str(hole_id): str(path) for hole_id, path in sorted(sources.items())}
+            }
+            raw_source_metadata = {
+                "source_diagnostic_paths": np.asarray([str(path) for _, path in sorted(sources.items())])
+            }
         raw_name = "pointcloud_raw.npz"
         _atomic_save_npz(
             directory / raw_name,
@@ -312,7 +379,7 @@ def export_hole_map_artifacts(
             points_base_mm=points_base,
             point_hole_ids=labels,
             point_frame_indices=frame_indices,
-            source_npz_path=np.asarray(str(source)),
+            **raw_source_metadata,
             coordinate_frame=np.asarray("robot_base_mm"),
         )
         _write_point_ply(directory / "pointcloud_base.ply", points_base, labels)
@@ -329,7 +396,7 @@ def export_hole_map_artifacts(
             "frame_count": int(len(set(int(value) for value in frame_indices))),
             "hole_ids": sorted(set(int(value) for value in labels)),
             "center_hole_count": int(center_count),
-            "source_npz": str(source),
+            **source_metadata,
         }
         if overlay_path is not None and Path(overlay_path).is_file():
             overlay_target = directory / "map_overlay.jpg"

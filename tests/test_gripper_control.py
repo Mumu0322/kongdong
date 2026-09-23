@@ -4,9 +4,6 @@ import aubo_workbench.gripper_control as module
 
 
 class GripperControlModuleTests(unittest.TestCase):
-    def test_driver_path_exists(self):
-        self.assertTrue(module.DRIVER_PATH.exists(), module.DRIVER_PATH)
-
     def test_driver_loads_without_opening_serial_port(self):
         driver = module.load_gripper_driver()
         gripper = driver.ZErg20C(

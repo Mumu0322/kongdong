@@ -710,8 +710,9 @@ class TwoStageConfig:
     batch_coarse_quality_singleton_retry: bool = True
     fine_stable_min_frames: int = 15
     fine_stable_center_scatter_p95_px: float = 0.6
-    # 机械臂到达精定位高度后，先丢弃相机队列和末端微振动产生的预热帧。
-    fine_settle_discard_frames: int = 10
+    # 相机管线持续运行；精定位只自适应清理旧帧，不固定丢弃一批“预热帧”。
+    # 显式设置为正数时仍保留最少丢帧下限，用于现场需要更强稳定性的情况。
+    fine_settle_discard_frames: int = 0
     # 单孔精定位质量门失败时只重拍当前孔，不中断整个多孔流程。
     fine_retry_count: int = 2
     # 多次重拍仍略超严格门槛时，允许稳定但降级的结果继续执行并留痕。
@@ -801,9 +802,9 @@ class TwoStageConfig:
     batch_fine_frames: int = 8
     batch_fine_min_valid: int = 5
     batch_fine_stable_min_frames: int = 5
-    # 260mm下降后RGB pipeline里会残留运动过程帧。现场实测丢3帧只耗时
-    # 3.7ms，仍未清空队列；默认与可靠的逐孔精定位一致，至少丢10帧。
-    batch_fine_settle_discard_frames: int = 10
+    # 260mm下降后RGB pipeline里可能残留运动过程帧；默认按时间戳自适应
+    # 清理到实时流，不固定丢弃10帧。显式设为正数时才增加最少丢帧下限。
+    batch_fine_settle_discard_frames: int = 0
     # 共享精拍首拍质量不足时，先在当前位置继续补少量帧；仍不满足质量门
     # 才由外层规划新的共享观察位，避免为“只差一两帧”的孔重复移动机械臂。
     batch_fine_inplace_recovery_frames: int = 4

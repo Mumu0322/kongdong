@@ -208,7 +208,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.batch_fine_frames_var = tk.StringVar(value="8")
         self.batch_fine_min_valid_var = tk.StringVar(value="5")
         self.batch_fine_stable_min_frames_var = tk.StringVar(value="5")
-        self.batch_fine_settle_discard_frames_var = tk.StringVar(value="10")
+        self.batch_fine_settle_discard_frames_var = tk.StringVar(value="0")
         self.batch_fine_inplace_recovery_frames_var = tk.StringVar(value="4")
         self.batch_fine_supplement_rounds_var = tk.StringVar(value="2")
         self.batch_fine_view_margin_var = tk.StringVar(value="50.0")
@@ -226,7 +226,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self.coarse_direct_final_capture_only_var = tk.BooleanVar(value=False)
         self.optimize_hole_order_var = tk.BooleanVar(value=False)
         self.execute_var = tk.BooleanVar(value=False)
-        self.experimental_var = tk.BooleanVar(value=True)
+        self.experimental_var = tk.BooleanVar(value=False)
         self.shared_cache_validation_var = tk.BooleanVar(value=False)
         self.shared_cache_validation_frames_var = tk.StringVar(value="3")
         self.shared_cache_validation_min_valid_var = tk.StringVar(value="2")
@@ -427,7 +427,7 @@ class HoleLocalizationPanel(ttk.Frame):
 
         map_panel = ttk.LabelFrame(
             parent,
-            text="孔位地图（建图可选340 mm粗定位或逐孔粗+精定位；调用时按当前策略执行）",
+            text="孔位地图（可选快速粗定位、逐孔260 mm精定位或逐孔340 mm同拍；调用时重新定位）",
             padding=8,
         )
         map_panel.pack(fill=tk.X, pady=(8, 0))
@@ -510,11 +510,17 @@ class HoleLocalizationPanel(ttk.Frame):
             variable=self.map_build_localization_mode_var,
             value="per_hole",
         ).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            build_localization_panel,
+            text="逐孔同拍：340 mm点云粗定位 + RGB精定位",
+            variable=self.map_build_localization_mode_var,
+            value="same_capture_340",
+        ).grid(row=0, column=2, sticky="w", padx=(14, 0))
         ttk.Label(
             build_localization_panel,
-            text="逐孔模式会每孔移动并保存粗定位与精定位参考；不执行最终安放，地图调用时仍重新精定位。",
+            text="同拍模式不下降到260 mm；精定位失败时，粗点云质量合格则用点云中心入图，否则暂缓。调用地图时仍重新精定位。",
             foreground="#555555",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
         ttk.Label(
             map_panel,
             text="从当前扇区粗地图选择一个孔；返修会重新做粗/精定位但不执行最终安放，成功后生成新地图版本。",
@@ -540,7 +546,7 @@ class HoleLocalizationPanel(ttk.Frame):
         )
         ttk.Label(
             map_panel,
-            text="粗定位用于地图导航；逐孔模式额外保存每孔260 mm精定位参考，调用地图时仍重新采集点云和ChArUco结果。",
+            text="粗定位用于地图导航；逐孔模式保存相应高度的精定位参考，调用地图时仍重新定位。",
             foreground="#555555",
         ).grid(row=8, column=0, columnspan=3, sticky="w", padx=(0, 0), pady=(6, 0))
 
@@ -622,7 +628,7 @@ class HoleLocalizationPanel(ttk.Frame):
             ("260 mm 批量帧数", self.batch_fine_frames_var, 7),
             ("260 mm 最少有效帧", self.batch_fine_min_valid_var, 7),
             ("260 mm 稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
-            ("260 mm 最少预热丢弃帧", self.batch_fine_settle_discard_frames_var, 7),
+            ("260 mm 旧帧清理下限", self.batch_fine_settle_discard_frames_var, 7),
             ("260 mm 原位补帧数", self.batch_fine_inplace_recovery_frames_var, 7),
             ("260 mm 失败孔组内调整/补拍次数", self.batch_fine_supplement_rounds_var, 7),
             ("组内最多调整次数", self.batch_fine_in_group_max_adjustments_var, 7),
@@ -982,15 +988,17 @@ class HoleLocalizationPanel(ttk.Frame):
         try:
             map_path = resolve_hole_map_path(raw_path)
             payload = load_hole_map(raw_path)
-            artifact = (payload.get("artifacts") or {}).get(artifact_name)
+            artifact_record = payload.get("artifacts") or {}
             if int(payload.get("schema_version", -1)) == 4:
                 sector_key = f"S{int(self.sector_id_var.get()):02d}"
-                artifact = (
+                artifact_record = (
                     ((payload.get("artifacts") or {}).get("sectors") or {})
                     .get(sector_key, {})
-                    .get(artifact_name)
                 )
+            artifact = artifact_record.get(artifact_name)
             if not artifact:
+                if artifact_record.get("reason"):
+                    raise ValueError(f"{label}不可用：{artifact_record['reason']}")
                 raise ValueError(f"该地图没有{label}；请重新建立地图")
             preview = map_path.parent / str(artifact)
             if not preview.is_file():
@@ -1080,11 +1088,8 @@ class HoleLocalizationPanel(ttk.Frame):
         ]
         command.append("--execute" if execute else "--no-execute")
         # 地图调用同样是实时视觉运动流程，遵守实验手眼放行策略。
-        if not is_offset:
-            command.append(
-                "--allow-experimental-handeye"
-                if self.experimental_var.get() else "--require-validated-handeye"
-            )
+        if not is_offset and self.experimental_var.get():
+            command.append("--allow-experimental-handeye")
         # 自动分区只用于现场初始选孔和建图入口；地图调用/返修使用已有
         # 孔位身份，不能再次用初始候选筛选覆盖目标。
         if mode in {"two_stage", "hole_map_build"}:
@@ -1280,8 +1285,8 @@ class HoleLocalizationPanel(ttk.Frame):
                         lambda: "coarse_only",
                     )()
                 ).strip().lower()
-                if map_build_localization_mode not in {"coarse_only", "per_hole"}:
-                    raise ValueError("建图定位方式必须是快速粗定位或逐孔粗+精定位")
+                if map_build_localization_mode not in {"coarse_only", "per_hole", "same_capture_340"}:
+                    raise ValueError("建图定位方式必须是快速粗定位、逐孔粗+精定位或逐孔同拍")
                 auto_enabled = bool(
                     getattr(getattr(self, "auto_sector_selection_var", None), "get", lambda: False)()
                 )
@@ -1722,6 +1727,8 @@ class HoleLocalizationPanel(ttk.Frame):
             map_build_description = (
                 "逐孔执行340 mm粗定位和260 mm精定位，并保存每孔精定位参考；"
                 if map_build_localization_mode == "per_hole" else
+                "逐孔在340 mm同批帧完成点云粗定位和严格RGB精定位；精定位失败时，仅在点云质量合格时回退收录；"
+                if map_build_localization_mode == "same_capture_340" else
                 "只执行340 mm粗定位并保存粗定位地图；"
             )
             auto_enabled = bool(
@@ -2392,6 +2399,15 @@ class HoleLocalizationPanel(ttk.Frame):
                             )
                             lines.append(
                                 f"逐孔精定位参考：有效={map_summary.get('fine_reference_ready_holes', [])}，"
+                                f"缺失={map_summary.get('fine_reference_missing_holes', [])}"
+                            )
+                        elif map_build_mode == "same_capture_340":
+                            lines.append(
+                                "建图内容：每孔340mm同批帧点云粗定位与严格RGB精定位；精定位失败时，点云合格则用点云中心回退入图，否则暂缓。"
+                            )
+                            lines.append(
+                                f"中心参考：精定位通过={map_summary.get('fine_localization_passed_hole_ids', map_summary.get('fine_localization_passed_holes', []))}，"
+                                f"点云回退={map_summary.get('pointcloud_fallback_hole_ids', map_summary.get('pointcloud_fallback_holes', []))}，"
                                 f"缺失={map_summary.get('fine_reference_missing_holes', [])}"
                             )
                         else:

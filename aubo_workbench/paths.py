@@ -56,9 +56,7 @@ CHARUCO_CALIBRATION_DIR = _path_from_env(
 # 资源文件默认保持现有位置；环境变量用于在另一台机器上复用同一套源码。
 MODEL_PATH = _path_from_env("AUBO_WORKBENCH_MODEL", WORKSPACE_DIR / "models" / "small_silu.pt")
 CAMERA_CALIBRATION_PATH = DATA_DIR / "camera_calibration" / "current_rgb_intrinsics.json"
-HANDEYE_CANDIDATE_PATH = DATA_DIR / "e7_candidates" / "e7_handeye_candidate_current.json"
 HANDEYE_DIAGNOSTIC_PATH = DATA_DIR / "handeye_diagnostic_current.json"
-HANDEYE_VALIDATION_PATH = DATA_DIR / "e7_handeye_validation_current.json"
 
 HOLE_LOCALIZATION_RUNS_DIR = DATA_DIR / "hole_localization_runs"
 # 自动扇区的定义、按扇区拆分的候选和审计快照单独保存，避免与一次运行
@@ -85,8 +83,3 @@ TCP_XY_MODEL_PATH = _path_from_env(
     "AUBO_WORKBENCH_TCP_XY_MODEL",
     TCP_ABSOLUTE_XY_MODEL_DIR / "current.json",
 )
-HANDEYE_CANDIDATE_DIR = DATA_DIR / "e7_candidates"
-
-HANDEYE_40_POSE_PLAN_PATH = DATA_DIR / "handeye_40_pose_plan_current.json"
-HANDEYE_40_POSE_PROGRESS_PATH = DATA_DIR / "handeye_40_pose_progress_current.json"
-HANDEYE_40_POSE_CSV_PATH = DATA_DIR / "handeye_40_pose_plan_current.csv"
