@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from aubo_workbench.gui_hole_localization import HoleLocalizationPanel
 
@@ -20,9 +21,7 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         self, *, allow_experimental: bool, final_xy_checked: bool = True,
         hole_ids: str = "", strategy: str | None = None,
         mode: str = "hole_map_execute", map_build_mode: str | None = None,
-        direct_height: str = "340", direct_group_size: str = "5",
-        direct_extra_frames: str = "5", direct_settle_delay: str = "1.0",
-        direct_capture_only: bool = False,
+        fine_height: float = 260.0,
         in_group_pose: bool = True, in_group_adjustments: str = "1",
         in_group_xy: str = "8.0", in_group_z: str = "3.0",
         in_group_rotation: str = "2.0", in_group_normal_holes: str = "2",
@@ -46,14 +45,10 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         panel.experimental_var = _Value(allow_experimental)
         panel.final_xy_var = _Value(final_xy_checked)
         panel.charuco_xy_var = _Value(True)
+        panel.flyby_speed_var = _Value("0.03")
         panel.hole_map_path_var = _Value(str(hole_map))
         panel.sector_id_var = _Value("1")
         panel.hole_map_ids_var = _Value(hole_ids)
-        panel.coarse_direct_final_height_var = _Value(direct_height)
-        panel.coarse_direct_final_max_group_size_var = _Value(direct_group_size)
-        panel.coarse_direct_final_early_stop_extra_frames_var = _Value(direct_extra_frames)
-        panel.coarse_direct_final_settle_delay_var = _Value(direct_settle_delay)
-        panel.coarse_direct_final_capture_only_var = _Value(direct_capture_only)
         panel.batch_fine_in_group_pose_adjustment_var = _Value(in_group_pose)
         panel.batch_fine_in_group_max_adjustments_var = _Value(in_group_adjustments)
         panel.batch_fine_in_group_max_xy_var = _Value(in_group_xy)
@@ -79,7 +74,7 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         panel._numbers = lambda: {
             "confidence": 0.35,
             "coarse_height": 340.0,
-            "fine_height": 260.0,
+            "fine_height": fine_height,
             "per_hole_fine_safe_z_margin": per_hole_fine_safe_z_margin,
             "coarse_frames": 15,
             "fine_frames": 30,
@@ -101,6 +96,12 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         self.assertNotIn("--final-target-mode", command)
         margin_index = command.index("--per-hole-fine-safe-z-margin-mm")
         self.assertEqual(command[margin_index + 1], "20.0")
+        stable_index = command.index("--fine-stable-min-frames")
+        self.assertEqual(command[stable_index + 1], "12")
+        from run_yolo_eye_in_hand_optimized import build_parser
+        self.assertEqual(
+            build_parser().parse_args(command[3:]).fine_stable_min_frames, 12,
+        )
 
     def test_shared_fine_in_group_pose_settings_are_passed(self) -> None:
         command = self._map_execution_command(
@@ -194,50 +195,87 @@ class HoleLocalizationCommandTests(unittest.TestCase):
         index = command.index("--hole-ids")
         self.assertEqual(command[index + 1:index + 4], ["12", "3", "27"])
 
-    def test_map_execution_coarse_direct_strategy_uses_pointcloud_only(self) -> None:
+    def test_height_comparison_map_execution_keeps_fresh_fine_and_disables_final_motion(self) -> None:
+        for height in (260.0, 300.0, 320.0):
+            with self.subTest(height=height):
+                command = self._map_execution_command(
+                    allow_experimental=True,
+                    strategy="fine_height_compare",
+                    fine_height=height,
+                )
+                self.assertEqual(
+                    command[command.index("--fine-height-mm") + 1],
+                    str(height),
+                )
+                self.assertIn("--fine-height-comparison-capture-only", command)
+                self.assertEqual(command[-2:], [
+                    "--fine-height-comparison-capture-only", "--no-move-final-xy",
+                ])
+                self.assertNotIn("--coarse-direct-final", command)
+                from run_yolo_eye_in_hand_optimized import build_parser
+                parsed = build_parser().parse_args(command[3:])
+                self.assertTrue(parsed.fine_height_comparison_capture_only)
+                self.assertFalse(parsed.move_final_xy)
+                self.assertEqual(parsed.fine_height_mm, height)
+
+    def test_height_comparison_rejects_unselected_height(self) -> None:
+        with self.assertRaisesRegex(ValueError, "260、300 或 320"):
+            self._map_execution_command(
+                allow_experimental=True,
+                strategy="fine_height_compare",
+                fine_height=310.0,
+            )
+
+    def test_flyby_map_command_is_capture_only(self) -> None:
         command = self._map_execution_command(
-            allow_experimental=True, strategy="coarse_direct",
+            allow_experimental=True, strategy="flyby", fine_height=300.0,
         )
+        from run_yolo_eye_in_hand_optimized import build_parser
+        args = build_parser().parse_args(command[3:])
+        self.assertTrue(args.flyby_capture_only)
+        self.assertEqual(args.hole_map_mode, "execute")
+        self.assertFalse(args.move_final_xy)
+        self.assertEqual(args.flyby_speed_m_s, 0.03)
 
-        self.assertIn("--coarse-direct-final", command)
-        self.assertIn("--no-batch-fine-localization", command)
-        self.assertIn("--no-batch-fine-joint-localization", command)
-        self.assertIn("--no-batch-fine-pointcloud-xy-fusion", command)
-        for obsolete_flag in (
-            "--coarse-direct-min-valid-frames",
-            "--coarse-direct-max-center-scatter-p95-px",
-            "--coarse-direct-max-tracking-distance-p95-px",
-            "--coarse-direct-max-plane-rmse-mm",
-            "--coarse-direct-same-pose-fusion",
-            "--coarse-direct-same-pose-min-geometric-frames",
-            "--coarse-direct-same-pose-max-geometric-scatter-p95-px",
-            "--no-coarse-direct-center-recheck",
-            "--coarse-direct-max-reference-xy-delta-mm",
-        ):
-            self.assertNotIn(obsolete_flag, command)
+    def test_flyby_rejects_non_map_entry(self) -> None:
+        with self.assertRaisesRegex(ValueError, "只能调用已建立"):
+            self._map_execution_command(
+                allow_experimental=True, strategy="flyby", mode="two_stage",
+            )
 
-    def test_map_execution_coarse_direct_strategy_passes_configured_height_group_and_settle_delay(self) -> None:
-        command = self._map_execution_command(
-            allow_experimental=True,
-            strategy="coarse_direct",
-            direct_height="320",
-            direct_group_size="3",
-            direct_extra_frames="5",
-            direct_settle_delay="2.5",
-            direct_capture_only=True,
-        )
+    def test_height_comparison_backend_forces_capture_only(self) -> None:
+        import run_yolo_eye_in_hand_optimized as localization
 
-        def value_after(flag: str) -> str:
-            return command[command.index(flag) + 1]
+        for mode in ("none", "execute"):
+            with self.subTest(mode=mode):
+                args = localization.build_parser().parse_args([
+                    "--fine-height-mm", "300",
+                    "--fine-height-comparison-capture-only",
+                    "--move-final-xy",
+                    "--hole-map-mode", mode,
+                ])
+                with patch.object(
+                    localization, "_new_two_stage_run_dir",
+                    side_effect=RuntimeError("configuration_checked"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "configuration_checked"):
+                        localization.run_two_stage_hole_localization(
+                            args, object(), object(),
+                            initial_holes_override=[{}] if mode == "execute" else None,
+                        )
+                self.assertFalse(args.move_final_xy)
 
-        self.assertEqual(value_after("--coarse-direct-final-height-mm"), "320.0")
-        self.assertEqual(value_after("--coarse-direct-final-max-group-size"), "3")
-        self.assertEqual(
-            value_after("--coarse-direct-final-early-stop-extra-frames"), "5",
-        )
-        self.assertEqual(value_after("--coarse-direct-final-settle-delay-s"), "2.5")
-        self.assertIn("--coarse-direct-final-capture-only", command)
-        self.assertIn("--no-move-final-xy", command)
+    def test_missing_map_build_defers_height_comparison(self) -> None:
+        import run_yolo_eye_in_hand_optimized as localization
+
+        args = localization.build_parser().parse_args([
+            "--hole-map-mode", "execute",
+            "--fine-height-comparison-capture-only",
+        ])
+        localization._prepare_rotary_sector_rebuild_args(args)
+        self.assertEqual(args.hole_map_mode, "build")
+        self.assertFalse(args.fine_height_comparison_capture_only)
+        self.assertFalse(args.move_final_xy)
 
     def test_map_repair_forces_single_hole_safe_flags(self) -> None:
         temporary = tempfile.TemporaryDirectory()

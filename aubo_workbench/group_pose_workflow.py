@@ -66,6 +66,7 @@ def _move_to_shared_observation_pose(
     *,
     target_height_mm: float,
     descent_profile: str,
+    separate_attitude: bool = False,
     steady_timeout_s: float | None = None,
 ) -> np.ndarray:
     """共享粗/精定位共同观察位的安全移动路径。
@@ -117,7 +118,9 @@ def _move_to_shared_observation_pose(
     high_target[2, 3] = lift_z
     # 建图先保持当前姿态完成高位水平移动，再在同一高位单独改变
     # 姿态。这样不会在一次斜向运动里同时叠加XY和RZ变化。
-    map_build_path = bool(getattr(args, "map_build_coarse_only", False))
+    map_build_path = bool(
+        getattr(args, "map_build_coarse_only", False) or separate_attitude
+    )
     if map_build_path:
         high_target[:3, :3] = actual[:3, :3]
     actual = _confirm_and_move_line(
@@ -137,18 +140,29 @@ def _move_to_shared_observation_pose(
     if map_build_path and rotation_error > 0.5:
         high_attitude_target = desired.copy()
         high_attitude_target[2, 3] = lift_z
-        actual = _confirm_and_move_line(
-            f"{label}：高位单独调整共同视野姿态",
-            actual,
-            high_attitude_target,
-            args,
-            motion_session,
-            pose_session,
-            "保持安全横移高度；姿态变化与水平位移分段执行",
-            require_confirmation=False,
-            motion_profile="transit",
-            steady_timeout_s=steady_timeout_s,
-        )
+        if separate_attitude:
+            actual = _move_shared_attitude_joint(
+                f"{label}：高位单独调整共同视野姿态",
+                actual,
+                high_attitude_target,
+                args,
+                motion_session,
+                pose_session,
+                steady_timeout_s=steady_timeout_s,
+            )
+        else:
+            actual = _confirm_and_move_line(
+                f"{label}：高位单独调整共同视野姿态",
+                actual,
+                high_attitude_target,
+                args,
+                motion_session,
+                pose_session,
+                "保持安全横移高度；姿态变化与水平位移分段执行",
+                require_confirmation=False,
+                motion_profile="transit",
+                steady_timeout_s=steady_timeout_s,
+            )
     descent_clearance_mm = float(lift_z - desired[2, 3])
     if descent_clearance_mm < SHARED_OBSERVATION_MIN_DESCENT_MM:
         raise RuntimeError(
@@ -1718,6 +1732,7 @@ _RUNTIME_DEPENDENCIES = {
     "_assign_detections_to_projection",
     "_coarse_expected_point_base",
     "_confirm_and_move_line",
+    "_move_shared_attitude_joint",
     "_draw_black_text",
     "_fuse_coarse",
     "_observation_rows",

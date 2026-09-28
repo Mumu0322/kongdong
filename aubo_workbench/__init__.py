@@ -1,4 +1,4 @@
-"""aubo_workbench: AUBO + Gemini 435Le 手眼标定 / 机械臂信息 / TCP 示教工具集。
+"""aubo_workbench: AUBO + Gemini 338Le 手眼标定 / 机械臂信息 / TCP 示教工具集。
 
 模块地图
 --------
@@ -7,7 +7,7 @@ paths.py            项目、运行数据和模型路径约定
 sector_info.py      扇区定义与自动分区结果的独立归档
 geometry.py          4x4 变换、旋转、位姿格式转换等纯数学函数
 io_utils.py          文件系统小工具（建目录、时间戳、矩阵<->list）
-camera.py            Gemini 435Le 相机封装（依赖 pyorbbecsdk）
+camera.py            Gemini 338Le 相机封装（依赖 pyorbbecsdk）
 robot.py             AUBO 只读位姿会话（手眼标定专用，依赖 pyaubo_sdk）
 charuco_detect.py    ChArUco 检测 + 点云 3D 板位姿拟合
 drawing.py           OpenCV 中文绘制、面板/进度条等 UI 基础组件

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from aubo_workbench.paths import TCP_XY_MODEL_PATH
+from aubo_workbench.paths import CAMERA_CALIBRATION_PATH, HANDEYE_DIAGNOSTIC_PATH, TCP_XY_MODEL_PATH
 
 
 # 旧版最终点到位后还会追加基坐标Y和工具系Y微调。该补偿已经取消；
@@ -19,7 +20,7 @@ FINAL_TOOL_Y_AFTER_Z_MM = 0.0
 THREE_HOLE_PLACE_SAFE_Z_MARGIN_MM = 60.0
 
 # 模型从 current.json 读取；运行默认使用，关闭纠偏时直接使用视觉孔中心。
-# 文件不存在或无效时保留单位变换供离线规划。
+# 文件不存在或无效时保留单位变换供离线规划；正式纠偏必须有新模型。
 CHARUCO_XY_MODEL_MATRIX = np.eye(2, dtype=np.float64)
 CHARUCO_XY_MODEL_BIAS_MM = np.zeros(2, dtype=np.float64)
 CHARUCO_XY_MODEL_SOURCE = Path(TCP_XY_MODEL_PATH)
@@ -31,7 +32,27 @@ def _load_tcp_xy_model() -> tuple[np.ndarray, np.ndarray, bool]:
         return CHARUCO_XY_MODEL_MATRIX, CHARUCO_XY_MODEL_BIAS_MM, False
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("record_type") != "charuco_tcp_xy_current_candidate":
+            raise ValueError("当前 TCP-XY 模型来源类型不匹配")
+        if payload.get("camera_serial") != "CHL5663000JD":
+            raise ValueError("当前 TCP-XY 模型相机序列号不匹配")
+        intrinsics = json.loads(Path(CAMERA_CALIBRATION_PATH).read_text(encoding="utf-8"))
+        if intrinsics.get("device", {}).get("serial_number") != payload["camera_serial"]:
+            raise ValueError("RGB 内参与 TCP-XY 模型不属于同一相机")
+        for source_key, digest_key, expected_path in (
+            ("source_handeye", "source_handeye_sha256", Path(HANDEYE_DIAGNOSTIC_PATH)),
+            ("source_report", "source_report_sha256", path.parent),
+        ):
+            source = Path(payload[source_key]).resolve()
+            if source_key == "source_handeye" and source != expected_path.resolve():
+                raise ValueError("当前手眼文件路径与 TCP-XY 模型来源不一致")
+            if source_key == "source_report" and not source.is_relative_to(expected_path.resolve()):
+                raise ValueError("TCP-XY 模型来源报告不在当前模型目录")
+            if hashlib.sha256(source.read_bytes()).hexdigest() != payload[digest_key].lower():
+                raise ValueError(f"{source_key} 已变化，需要重新验证 TCP-XY 模型")
         model = payload.get("model", payload)
+        if model.get("status") != "ready" or int(model.get("corner_count", 0)) != 9:
+            raise ValueError("当前模型不是已完成的九点模型")
         matrix = np.asarray(model["matrix_2x2"], dtype=np.float64)
         bias = np.asarray(model["bias_mm"], dtype=np.float64).reshape(2)
         if matrix.shape != (2, 2) or not np.isfinite(matrix).all() or not np.isfinite(bias).all():
@@ -56,6 +77,8 @@ def plan_final_tcp_xy(T_base_tcp: np.ndarray, hole_center_base: np.ndarray,
     if xy_offset_mm is not None:
         target[:2, 3] = visual_xy + np.asarray(xy_offset_mm, dtype=np.float64)
     elif use_charuco_model:
+        if not CHARUCO_XY_MODEL_READY:
+            raise RuntimeError("当前 Gemini 338Le 尚无 ChArUco XY 纠偏模型；请先完成新相机标定")
         target[:2, 3] = CHARUCO_XY_MODEL_MATRIX @ visual_xy + CHARUCO_XY_MODEL_BIAS_MM
     else:
         target[:2, 3] = visual_xy

@@ -76,9 +76,15 @@ class CameraConfig:
 
     # 孔定位使用的彩色流必须显式选择，不能依赖 SDK 返回的 profile index=0。
     # 0 表示不强制该维度；在满足指定项的 profile 中优先选分辨率最高者。
-    preferred_color_width: int = 0
-    preferred_color_height: int = 0
-    preferred_color_fps: int = 30
+    preferred_color_width: int = 1280
+    preferred_color_height: int = 800
+    preferred_depth_width: int = 1280
+    preferred_depth_height: int = 800
+    preferred_depth_fps: int = 15
+    preferred_depth_format: str = "Y16"
+    # RGB+Depth 同时开启时两路 15 FPS；单 RGB 流单独选择 60 FPS。
+    preferred_color_fps: int = 15
+    rgb_only_color_fps: int = 60
     preferred_color_formats: tuple[str, ...] = ("RGB", "BGR", "YUYV", "UYVY", "MJPG")
 
     # 生产测量前应先让自动曝光稳定，再锁定曝光/增益。None 表示只读取、不修改。
@@ -111,7 +117,7 @@ class RobotCameraIntegrationConfig:
     """现场相机身份绑定配置。"""
 
     # 新副本不预设旧设备序列号；现场核对后通过环境变量绑定实际相机。
-    production_camera_serial: str = os.environ.get("AUBO_WORKBENCH_CAMERA_SERIAL", "").strip()
+    production_camera_serial: str = os.environ.get("AUBO_WORKBENCH_CAMERA_SERIAL", "CHL5663000JD").strip()
 
 
 @dataclass

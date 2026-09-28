@@ -1292,7 +1292,9 @@ class RgbPrecisionRangeExperiment:
 
     def start(self) -> None:
         self.pipeline = init_rgb_handeye_pipeline()
-        self.actual_color_profile = _video_profile_metadata(get_color_profile(self.pipeline))
+        self.actual_color_profile = _video_profile_metadata(
+            get_color_profile(self.pipeline, fps=CAMERA_CFG.rgb_only_color_fps)
+        )
         self.device_identity = get_device_identity(self.pipeline)
         actual_serial = str(self.device_identity.get("serial_number", "")).strip()
         expected = self.config.expected_camera_serial.strip()

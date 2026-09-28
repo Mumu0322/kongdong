@@ -101,6 +101,23 @@ def build_parser(
     p.add_argument("--fine-height-mm", type=float, default=260.0,
                    help="两阶段模式的孔面RGB-Z精定位高度，默认260")
     p.add_argument(
+        "--fine-height-comparison-capture-only",
+        action="store_true",
+        default=False,
+        help=(
+            "按所选精拍高度执行当轮RGB精定位并保存报告；允许移动到拍摄位，"
+            "不执行最终XY/Z落位"
+        ),
+    )
+    p.add_argument(
+        "--flyby-capture-only", action="store_true", default=False,
+        help="按地图排号连续移动并在运动中采集 RGB 精定位；只保存评估结果，不执行最终 XY/Z 落位",
+    )
+    p.add_argument(
+        "--flyby-speed-m-s", type=float, default=0.03,
+        help="运动取帧的逐排匀速扫描速度(m/s)，默认0.03；仅用于实验采集",
+    )
+    p.add_argument(
         "--per-hole-fine-safe-z-margin-mm",
         type=float,
         default=20.0,
@@ -664,6 +681,10 @@ def build_parser(
         help="按当前批量精定位目标XY的最近邻顺序处理孔；默认保持初始选择顺序",
     )
     p.add_argument("--fine-frames", type=int, default=20, help="两阶段精定位最大有效RGB帧数")
+    p.add_argument(
+        "--fine-stable-min-frames", type=int, default=15,
+        help="逐孔精定位满足稳定质量门后允许提前结束的最少有效帧数，默认15",
+    )
     p.add_argument("--fine-settle-discard-frames", type=int, default=0,
                    help="每次精定位自适应清理旧RGB帧；0表示不固定丢帧，仅确认实时帧，默认0")
     p.add_argument("--fine-retries", type=int, default=2,

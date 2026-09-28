@@ -126,7 +126,7 @@ class VisualToolsPanel(ttk.Frame):
         vision.pack(fill=tk.X)
         self._tool_row(
             vision, 0, "料框镜片实时检测",
-            "Gemini 435Le 左/右 IR、实时 YOLO、曝光/增益/激光控制和当前帧保存。",
+            "Gemini 338Le 左/右 IR、实时 YOLO、曝光/增益/激光控制和当前帧保存。",
             "lens", lambda: [sys.executable, str(LENS_GUI_SCRIPT)], LENS_GUI_SCRIPT,
         )
         self._tool_row(

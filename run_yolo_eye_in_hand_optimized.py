@@ -24,6 +24,7 @@ import shutil
 import sys
 import time
 import traceback
+from threading import Event, Thread
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,22 @@ from aubo_workbench.camera import (  # noqa: E402
     get_device_identity,
     get_rgb_frame_bundle,
     init_pipeline,
+    init_rgb_handeye_pipeline,
+)
+from aubo_workbench.flyby_fine import (
+    build_contact_sheet as flyby_build_contact_sheet,
+    continuous_scan_waypoints as flyby_continuous_scan_waypoints,
+    draw_flyby_overlay as flyby_draw_overlay,
+    thumbnail as flyby_thumbnail,
+    frame_time_ns as flyby_frame_time_ns,
+    interpolate_pose as flyby_interpolate_pose,
+    robust_xy as flyby_robust_xy,
+    retain_nearest_frame as flyby_retain_nearest_frame,
+    rows_from_map as flyby_rows_from_map,
+    sample_tcp as flyby_sample_tcp,
+    scan_pose_waypoints as flyby_scan_pose_waypoints,
+    translation_speed_mm_s as flyby_translation_speed_mm_s,
+    validate_camera_preflight as flyby_validate_camera_preflight,
 )
 from aubo_workbench.camera_stream_health import (
     camera_stream_session,
@@ -310,10 +327,39 @@ def _overlay(image: np.ndarray, detection: dict[str, Any] | None,
 
 
 def _require_safe_snapshot(pose_session: Any) -> tuple[dict[str, Any], np.ndarray]:
-    snapshot = pose_session.read_pose_snapshot()
-    if not snapshot["power_on"] or not snapshot["steady"] or snapshot["collision"]:
-        raise MotionExecutionError("机器人状态不满足安全门：需要上电、稳定且无碰撞")
-    return snapshot, pose_session.pose_sdk_to_transform_mm(snapshot["pose_values_sdk_m_rad"])
+    # Power/steady can be transient for a short period immediately after RPC
+    # login.  Re-read the controller state without sending any command.
+    deadline = time.monotonic() + 2.0
+    snapshot: dict[str, Any] = {}
+    while True:
+        snapshot = pose_session.read_pose_snapshot()
+        if bool(snapshot.get("collision")):
+            raise MotionExecutionError(
+                "机器人状态不满足安全门：控制器存在碰撞标志；"
+                f"power_on={snapshot.get('power_on')}, "
+                f"steady={snapshot.get('steady')}"
+            )
+        if bool(snapshot.get("power_on")) and bool(snapshot.get("steady")):
+            return snapshot, pose_session.pose_sdk_to_transform_mm(
+                snapshot["pose_values_sdk_m_rad"]
+            )
+        if time.monotonic() >= deadline:
+            reasons = []
+            if not bool(snapshot.get("power_on")):
+                reasons.append("控制器反馈未上电")
+            if not bool(snapshot.get("steady")):
+                reasons.append("机械臂未稳定")
+            if snapshot.get("within_safety_limits") is False:
+                reasons.append("超出安全范围")
+            raise MotionExecutionError(
+                "机器人状态不满足安全门：" + "、".join(reasons or ["状态不可用"]) +
+                f"（power_on={snapshot.get('power_on')}, "
+                f"steady={snapshot.get('steady')}, "
+                f"collision={snapshot.get('collision')}, "
+                f"robot_mode={snapshot.get('robot_mode')}, "
+                f"safety_mode={snapshot.get('safety_mode')}）"
+            )
+        time.sleep(ROBOT_STEADY_POLL_INTERVAL_S)
 
 
 @motion_failure_boundary
@@ -2474,7 +2520,106 @@ def _move_to_shared_fine_pose(
         pose_session,
         target_height_mm=target_height_mm,
         descent_profile="approach",
+        separate_attitude=True,
     )
+
+
+@motion_failure_boundary
+def _move_shared_attitude_joint(
+    label: str,
+    current: np.ndarray,
+    target: np.ndarray,
+    args: Any,
+    motion_session: Any,
+    pose_session: Any,
+    *,
+    steady_timeout_s: float | None = None,
+) -> np.ndarray:
+    """Use a seeded IK solution for the stationary high-height attitude change."""
+    from aubo_workbench.motion_control import sdk_ok
+
+    snapshot = motion_session.snapshot()
+    seed_joints = [float(value) for value in snapshot.get("joints_rad", [])]
+    algorithm = getattr(motion_session.robot_if, "getRobotAlgorithm", lambda: None)()
+    if algorithm is None or len(seed_joints) != 6:
+        raise RuntimeError(f"{label}无法读取当前关节或控制器逆解接口")
+    target_pose = transform_to_sdk_pose_m_rad(target)
+    solved_joints, code = algorithm.inverseKinematics(seed_joints, target_pose)
+    if int(code) != 0:
+        raise RuntimeError(f"{label}逆解预检失败：返回码 {code}，已拒绝运动")
+    solved_joints = [float(value) for value in solved_joints]
+    _wait_motion_session_steady(motion_session, steady_timeout_s or 45.0)
+    response = motion_session.move_joint(
+        solved_joints, math.radians(15.0), math.radians(30.0),
+    )
+    print(f"[MOTION] {label} moveJoint response={response}", flush=True)
+    settled_snapshot, actual = _wait_robot_joints_reached(
+        pose_session, solved_joints, timeout_s=steady_timeout_s or 45.0,
+    )
+    if not response or not sdk_ok(response[-1]):
+        if _joint_error_deg(settled_snapshot.get("joints_rad", []), solved_joints) > 0.5:
+            raise RuntimeError(f"{label} moveJoint下发失败：{response}")
+    return actual
+
+
+def _preflight_continuous_path_ik(
+    motion_session: Any,
+    poses: list[np.ndarray],
+) -> dict[str, Any]:
+    """Check every queued Cartesian endpoint with a continuous IK seed chain.
+
+    AUBO's seeded IK can reject a reachable pose when the current seed is on a
+    different branch.  The all-solutions API is used only as a read-only
+    preflight fallback; no motion command is sent by this function.
+    """
+    snapshot = motion_session.snapshot()
+    seed = [float(value) for value in snapshot.get("joints_rad", [])]
+    algorithm = getattr(motion_session.robot_if, "getRobotAlgorithm", lambda: None)()
+    if algorithm is None or len(seed) != 6:
+        raise RuntimeError("连续扫描无法读取控制器逆解接口或当前关节")
+    fallback_count = 0
+    for index, pose in enumerate(poses, start=1):
+        sdk_pose = transform_to_sdk_pose_m_rad(pose)
+        solved, code = algorithm.inverseKinematics(seed, sdk_pose)
+        try:
+            numeric_code = int(code)
+        except (TypeError, ValueError):
+            numeric_code = code
+        if numeric_code != 0:
+            candidates: list[list[float]] = []
+            all_code: Any = None
+            all_solver = getattr(algorithm, "inverseKinematicsAll", None)
+            if callable(all_solver):
+                try:
+                    raw_candidates, all_code = all_solver(sdk_pose)
+                    if int(all_code) == 0:
+                        candidates = [
+                            [float(value) for value in candidate]
+                            for candidate in raw_candidates
+                            if len(candidate) == 6
+                            and all(math.isfinite(float(value)) for value in candidate)
+                        ]
+                except Exception:
+                    candidates = []
+            if not candidates:
+                raise RuntimeError(
+                    f"连续扫描路径第 {index} 个位姿逆解预检失败："
+                    f"返回码 {code}，全部分支返回码 {all_code}"
+                )
+            solved = min(
+                candidates,
+                key=lambda candidate: sum(
+                    (float(value) - float(previous)) ** 2
+                    for value, previous in zip(candidate, seed)
+                ),
+            )
+            fallback_count += 1
+        seed = [float(value) for value in solved]
+    return {
+        "checked_waypoints": len(poses),
+        "ik_preflight": "passed",
+        "ik_all_solutions_fallback_count": fallback_count,
+    }
 
 
 def _move_to_fine_pose(
@@ -3350,6 +3495,9 @@ def _rotary_sector_map_ready_for_auto_call(args: Any) -> bool:
 def _prepare_rotary_sector_rebuild_args(args: Any) -> Any:
     """为地图缺失时准备纯340 mm粗定位建图参数。"""
     args.hole_map_mode = "build"
+    # 建图轮没有可调用的孔位种子；下一轮地图调用再进行高度对比。
+    args.fine_height_comparison_capture_only = False
+    args.flyby_capture_only = False
     args.batch_coarse_localization = True
     args.batch_fine_localization = False
     args.batch_fine_joint_localization = False
@@ -3361,6 +3509,647 @@ def _prepare_rotary_sector_rebuild_args(args: Any) -> Any:
     args.reuse_persistent_coarse_cache = False
     args.shared_cache_validation = False
     return args
+
+
+@camera_stream_session
+def _run_flyby_map_capture(
+    args: Any, handeye: Any, model: Any,
+    seeds: list[dict[str, Any]], map_path: Path, map_id: str | None,
+) -> int:
+    """Scan each mapped row without stopping above its individual holes."""
+    if not args.execute or not args.allow_experimental_handeye:
+        raise ValueError("运动取帧实验要求启用真实运动与实验手眼放行")
+    height_mm = float(args.fine_height_mm)
+    if height_mm not in {260.0, 300.0, 320.0}:
+        raise ValueError("运动取帧实验高度只能为 260、300 或 320 mm")
+    speed_m_s = float(getattr(args, "flyby_speed_m_s", 0.03))
+    if not 0.005 <= speed_m_s <= 0.1:
+        raise ValueError("运动取帧实验扫描速度必须在 0.005 到 0.1 m/s 之间")
+    args.move_final_xy = False
+    rows_to_scan = flyby_rows_from_map(seeds)
+    planned_scan_mm = sum(
+        float(np.linalg.norm(
+            np.asarray(row[-1]["initial_center_base_mm"], dtype=float)[:2]
+            - np.asarray(row[0]["initial_center_base_mm"], dtype=float)[:2]
+        )) + 30.0 for row in rows_to_scan
+    )
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / f"flyby-{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    report: dict[str, Any] = {
+        "mode": "moving_rgb_fine_capture_only",
+        "status": "running",
+        "map_path": str(map_path),
+        "map_id": map_id,
+        "camera_height_mm": height_mm,
+        "scan_speed_m_s": speed_m_s,
+        "max_frames_per_hole": 6,
+        "required_valid_frames_per_hole": 5,
+        "maximum_capture_pose_position_error_mm": 15.0,
+        "maximum_capture_pose_rotation_error_deg": 2.0,
+        "minimum_capture_speed_fraction": 0.25,
+        "target_visual_s_per_hole": 0.85,
+        "target_visual_total_s": round(0.85 * len(seeds), 3),
+        "planned_scan_length_mm": round(planned_scan_mm, 1),
+        "theoretical_constant_speed_scan_s": round(planned_scan_mm / (speed_m_s * 1000), 3),
+        "timing_note": (
+            "run_wall_s includes setup and robot motion; camera_stream_poll_s includes "
+            "RGB polling during motion; "
+            "selected_frame_acquisition_estimate_s uses accepted RGB frames / measured FPS "
+            "and is an estimate, not a hardware timing measurement"
+        ),
+        "rows": [],
+        "holes": {},
+        "selected_images": [],
+        "motion_executed": False,
+        "final_xy_z_motion_executed": False,
+    }
+    camera = pose_session = motion_session = None
+    camera_stream_poll_s = 0.0
+    visual_compute_s = 0.0
+    selected_frame_count = 0
+    run_wall_started = time.perf_counter()
+    points_by_hole: dict[int, list[np.ndarray]] = {
+        int(seed["hole_id"]): [] for seed in seeds
+    }
+    records_by_hole: dict[int, list[dict[str, Any]]] = {
+        int(seed["hole_id"]): [] for seed in seeds
+    }
+    representative_by_hole: dict[int, dict[str, Any]] = {}
+    try:
+        from aubo_workbench.motion_control import AuboMotionSession
+        from aubo_workbench.robot import AuboPoseSession
+
+        pose_session = AuboPoseSession()
+        pose_session.connect()
+        _, current_tcp = _require_safe_snapshot(pose_session)
+        motion_session = AuboMotionSession()
+        motion_session.connect(
+            ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
+            ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms,
+        )
+        camera = init_rgb_handeye_pipeline()
+        identity = get_device_identity(camera)
+        expected_serial = str(handeye.payload.get("camera_serial") or "").strip()
+        actual_serial = str(identity.get("serial_number") or "").strip()
+        if expected_serial and actual_serial != expected_serial:
+            raise RuntimeError(f"相机序列号不匹配：手眼={expected_serial}，当前={actual_serial}")
+        map_serial = str(getattr(args, "_coarse_map_expected_camera_serial", "") or "").strip()
+        if map_serial and actual_serial != map_serial:
+            raise RuntimeError(f"相机序列号不匹配：地图={map_serial}，当前={actual_serial}")
+        report["camera"] = identity
+        preflight_frames = []
+        preflight_started = time.perf_counter()
+        while len(preflight_frames) < 12:
+            bundle = get_rgb_frame_bundle(camera)
+            if bundle is None:
+                raise RuntimeError("运动取帧预检无法取得 RGB 帧")
+            if bundle.intrinsics is None:
+                raise RuntimeError("运动取帧预检无法取得 RGB 内参")
+            preflight_frames.append(bundle)
+        camera_stream_poll_s += time.perf_counter() - preflight_started
+        exposure_limit_us = min(10_000, int(300.0 / speed_m_s))
+        report["camera_preflight"] = flyby_validate_camera_preflight(
+            preflight_frames, max_exposure_us=exposure_limit_us,
+        )
+        camera_clock_offset_ns = int(report["camera_preflight"]["clock_offset_ns"])
+        report["maximum_exposure_us_for_0_3mm_blur"] = exposure_limit_us
+        pose_read_limit_ns = min(8_000_000, int(400_000 / speed_m_s))
+        pose_preflight = [flyby_sample_tcp(pose_session) for _ in range(5)]
+        if max(item.read_duration_ns for item in pose_preflight) > pose_read_limit_ns:
+            raise RuntimeError(
+                f"TCP 采样 RPC 超过 {pose_read_limit_ns / 1e6:.1f} ms，"
+                "不能与运动图像可靠同步"
+            )
+        report["tcp_preflight_max_read_ms"] = round(
+            max(item.read_duration_ns for item in pose_preflight) / 1e6, 3,
+        )
+        report["tcp_read_limit_ms"] = round(pose_read_limit_ns / 1e6, 3)
+        fine_cfg = TwoStageConfig.from_namespace(args)
+        planned_rows = []
+        planning_reference = current_tcp
+        for row in rows_to_scan:
+            hole_poses = []
+            for seed in row:
+                source = seed["coarse_map_source"]
+                target, _ = _plan_hole_tcp_pose_fixed_rz(
+                    np.asarray(seed["initial_center_base_mm"], dtype=float),
+                    np.asarray(source["coarse_normal_toward_camera_base"], dtype=float),
+                    planning_reference, handeye.T_tcp_rgb_camera,
+                    camera_height_mm=height_mm,
+                )
+                camera_axis = (target @ handeye.T_tcp_rgb_camera)[:3, 2]
+                if camera_axis[2] > -0.8:
+                    raise ValueError(f"孔 {seed['hole_id']} 的拍摄光轴没有充分朝向工件")
+                hole_poses.append(target)
+                planning_reference = target
+            start_tcp, scan_targets, geometry = flyby_scan_pose_waypoints(hole_poses)
+            planned_rows.append((hole_poses, start_tcp, scan_targets, geometry))
+            planning_reference = scan_targets[-1]
+        planned_scan_mm = sum(item[3]["path_length_mm"] for item in planned_rows)
+        start_tcp, scan_targets, full_geometry = flyby_continuous_scan_waypoints(
+            [item[0] for item in planned_rows],
+            tcp_to_camera=handeye.T_tcp_rgb_camera,
+            mapped_points_mm=np.asarray([
+                seed["initial_center_base_mm"] for seed in seeds
+            ], dtype=float),
+            initial_tcp=current_tcp,
+        )
+        planned_scan_mm = full_geometry["path_length_mm"]
+        report["continuous_path"] = full_geometry
+        report["continuous_path"].update(
+            _preflight_continuous_path_ik(
+                motion_session, scan_targets,
+            )
+        )
+        report["planned_scan_length_mm"] = round(planned_scan_mm, 1)
+        report["theoretical_constant_speed_scan_s"] = round(
+            planned_scan_mm / (speed_m_s * 1000), 3,
+        )
+        target_by_hole = {
+            int(seed["hole_id"]): target
+            for row, planned in zip(rows_to_scan, planned_rows)
+            for seed, target in zip(row, planned[0])
+        }
+        for row, planned in zip(rows_to_scan, planned_rows):
+            row_ids = [int(seed["hole_id"]) for seed in row]
+            hole_poses, _, _, geometry = planned
+            row_report: dict[str, Any] = {
+                "row": int(row[0]["coarse_map_source"]["layout_row"]),
+                "hole_ids": row_ids,
+                **geometry,
+                "planned_hole_tcp_pose_m_rad": {
+                    str(seed["hole_id"]): transform_to_sdk_pose_m_rad(target)
+                    for seed, target in zip(row, hole_poses)
+                },
+                "accepted_frames": 0,
+            }
+            report["rows"].append(row_report)
+        report["motion_executed"] = True
+        # The approach is already the prefix of the same blended queue.  Do not
+        # split it into lift/横移/姿态 moveJoint calls: that was the source of
+        # the -27 high-height attitude IK failure and introduced a stop before
+        # the first hole.
+        report["motion_start_tcp_xyz_mm"] = current_tcp[:3, 3].tolist()
+        approach_count = int(full_geometry.get("approach_waypoint_count", 0))
+        if approach_count > 0:
+            report["scan_start_tcp_xyz_mm"] = scan_targets[approach_count - 1][
+                :3, 3
+            ].tolist()
+        stop_sampling = Event()
+        samples = []
+        sampling_error: list[Exception] = []
+
+        def sample_loop() -> None:
+            while not stop_sampling.is_set():
+                try:
+                    samples.append(flyby_sample_tcp(pose_session))
+                except Exception as exc:
+                    sampling_error.append(exc)
+                    stop_sampling.set()
+                    return
+                time.sleep(0.004)
+
+        motion_done = Event()
+        motion_abort = Event()
+        motion_queue_log: list[dict[str, Any]] = []
+        motion_path_info: dict[str, Any] = {}
+        motion_error: list[Exception] = []
+        # Read before the motion thread owns the RPC session.  The pendant
+        # slider scales every commanded speed (field value was 0.5).
+        speed_fraction = motion_session.speed_fraction() or 1.0
+        report["controller_speed_fraction"] = speed_fraction
+        if speed_fraction < 0.999:
+            print(
+                f"[FLYBY] 注意：控制器速度倍率为 {speed_fraction:g}，实际扫描速度约 "
+                f"{speed_m_s * speed_fraction * 1000:.0f} mm/s（指令 {speed_m_s * 1000:.0f} mm/s）",
+                flush=True,
+            )
+
+        def move_scan() -> None:
+            try:
+                transit_speed_m_s = min(0.08, max(0.05, speed_m_s * 2.0))
+                transit_flags = list(full_geometry.get("transit_segment_flags", []))
+                if len(transit_flags) != len(scan_targets):
+                    raise RuntimeError("连续路径分段速度标记数量不一致")
+                segment_speeds = [
+                    transit_speed_m_s if is_transit else speed_m_s
+                    for is_transit in transit_flags
+                ]
+                report["transit_speed_m_s"] = transit_speed_m_s
+                motion_session.move_line_blended_path(
+                    [transform_to_sdk_pose_m_rad(target) for target in scan_targets],
+                    speed_m_s, float(args.approach_acc_m_s2), 0.005,
+                    segment_speeds_m_s=segment_speeds,
+                    abort_event=motion_abort,
+                    queue_log=motion_queue_log,
+                    # Without a running RuntimeMachine the controller takes one
+                    # moveLine at a time and the scan stops at every waypoint.
+                    use_runtime_machine=True,
+                    path_info=motion_path_info,
+                )
+            except Exception as exc:
+                motion_error.append(exc)
+            finally:
+                motion_done.set()
+
+        sampler = Thread(target=sample_loop, name="flyby-pose", daemon=True)
+        mover = Thread(target=move_scan, name="flyby-motion", daemon=True)
+        sampler.start()
+        time.sleep(0.05)
+        scan_started = time.perf_counter()
+        mover.start()
+        selected_by_hole: dict[int, list[tuple[float, int, Any]]] = {
+            hole_id: [] for hole_id in target_by_hole
+        }
+        scan_capture = report["scan_capture"] = {
+            "captured_frames": 0,
+            "rejected_timestamp_frames": 0,
+            "rejected_pose_frames": 0,
+            "rejected_stationary_frames": 0,
+        }
+        deadline = time.monotonic() + max(
+            15.0,
+            2.0 * planned_scan_mm / (speed_m_s * max(0.05, speed_fraction) * 1000.0) + 10.0,
+        )
+        reached_count = 0
+        scan_complete = False
+        # A motion/sampling failure must not discard frames already retained in
+        # memory: stop the robot, then still save and annotate them offline.
+        scan_failure: Exception | None = None
+        try:
+            while time.monotonic() < deadline:
+                if sampling_error or motion_error:
+                    scan_failure = RuntimeError(str((sampling_error or motion_error)[0]))
+                    break
+                if motion_done.is_set() and samples:
+                    distance = float(np.linalg.norm(
+                        samples[-1].tcp[:3, 3] - scan_targets[-1][:3, 3]
+                    ))
+                    reached_count = reached_count + 1 if distance <= 1.0 else 0
+                    if reached_count >= 3:
+                        scan_complete = True
+                        break
+                started = time.perf_counter()
+                bundle = get_rgb_frame_bundle(camera)
+                camera_stream_poll_s += time.perf_counter() - started
+                if bundle is None:
+                    continue
+                scan_capture["captured_frames"] += 1
+                frame_ns = flyby_frame_time_ns(
+                    bundle, clock_offset_ns=camera_clock_offset_ns,
+                )
+                if frame_ns is None:
+                    scan_capture["rejected_timestamp_frames"] += 1
+                    continue
+                approximate_pose = flyby_interpolate_pose(
+                    samples, frame_ns, max_read_ns=pose_read_limit_ns,
+                )
+                if approximate_pose is None:
+                    scan_capture["rejected_pose_frames"] += 1
+                    continue
+                motion_speed = flyby_translation_speed_mm_s(
+                    samples, frame_ns, max_read_ns=pose_read_limit_ns,
+                )
+                if motion_speed is None or motion_speed < speed_m_s * 250.0:
+                    scan_capture["rejected_stationary_frames"] += 1
+                    continue
+                nearby = [
+                    (hole_id, target) for hole_id, target in target_by_hole.items()
+                    if np.linalg.norm(approximate_pose[:3, 3] - target[:3, 3]) <= 15.0
+                ]
+                if not nearby:
+                    continue
+                approximate_camera = camera_transform(
+                    approximate_pose, handeye.T_tcp_rgb_camera,
+                )
+                for hole_id, target_pose in nearby:
+                    seed = next(item for item in seeds if int(item["hole_id"]) == hole_id)
+                    anchor = _project_base_point_to_pixel(
+                        np.asarray(seed["initial_center_base_mm"], dtype=float),
+                        approximate_camera, bundle.intrinsics,
+                    )
+                    center_distance_px = float(np.linalg.norm(
+                        np.asarray(anchor) - np.array([
+                            bundle.intrinsics.cx, bundle.intrinsics.cy,
+                        ])
+                    ))
+                    rotation_error_deg = _rotation_distance_deg(
+                        approximate_pose[:3, :3], target_pose[:3, :3],
+                    )
+                    if center_distance_px <= 105.0 and rotation_error_deg <= 2.0:
+                        position_error_mm = float(np.linalg.norm(
+                            approximate_pose[:3, 3] - target_pose[:3, 3]
+                        ))
+                        flyby_retain_nearest_frame(
+                            selected_by_hole[hole_id],
+                            score=position_error_mm + 2.0 * rotation_error_deg,
+                            timestamp_ns=frame_ns, bundle=bundle,
+                        )
+            else:
+                scan_failure = RuntimeError("连续扫描运动或取帧超时")
+        finally:
+            stop_sampling.set()
+            if not scan_complete:
+                # Stop the feeder first so a retry cannot re-queue after stopMove.
+                motion_abort.set()
+                emergency_session = None
+                try:
+                    emergency_session = AuboMotionSession()
+                    emergency_session.connect(
+                        ROBOT_CFG.ip, ROBOT_CFG.rpc_port, ROBOT_CFG.user,
+                        ROBOT_CFG.password, ROBOT_CFG.request_timeout_ms,
+                    )
+                    report["emergency_stop_result"] = str(emergency_session.stop_motion())
+                except Exception as stop_exc:
+                    report["emergency_stop_error"] = str(stop_exc)
+                finally:
+                    if emergency_session is not None:
+                        emergency_session.disconnect()
+            mover.join(timeout=10.0)
+            sampler.join(timeout=5.0)
+        report["motion_queue_log"] = motion_queue_log
+        report["motion_path_info"] = motion_path_info
+        report["motion_ignored_retry_segments"] = [
+            item["segment"] for item in motion_queue_log if item.get("ignored_retries")
+        ]
+        if mover.is_alive():
+            atomic_write_json(run_dir / "report.json", jsonable(report))
+            raise RuntimeError("连续扫描运动线程未结束，请用示教器确认停机")
+        if scan_failure is None and (motion_error or sampling_error):
+            scan_failure = RuntimeError(str((motion_error or sampling_error)[0]))
+        report["scan_wall_s"] = round(time.perf_counter() - scan_started, 3)
+        if scan_failure is None:
+            _, current_tcp = _wait_robot_steady(pose_session)
+            report["scan_end_tcp_xyz_mm"] = current_tcp[:3, 3].tolist()
+        else:
+            report["scan_failure"] = f"{type(scan_failure).__name__}: {scan_failure}"
+            print(
+                f"[FLYBY] 扫描中断：{scan_failure}；机器人已下发停止，"
+                "继续保存已取得的运动帧以便查看。",
+                flush=True,
+            )
+        report["pose_samples"] = len(samples)
+        overview_tiles: list[tuple[np.ndarray, str]] = []
+        for row_index, row in enumerate(rows_to_scan, start=1):
+            row_ids = [int(seed["hole_id"]) for seed in row]
+            row_report = report["rows"][row_index - 1]
+            selected_frames: dict[int, tuple[Any, list[int]]] = {}
+            for hole_id in row_ids:
+                choices = selected_by_hole[hole_id]
+                for _, frame_ns, bundle in choices:
+                    if frame_ns not in selected_frames:
+                        selected_frames[frame_ns] = (bundle, [])
+                    selected_frames[frame_ns][1].append(hole_id)
+            captured = [
+                (bundle, frame_ns, hole_ids)
+                for frame_ns, (bundle, hole_ids) in sorted(selected_frames.items())
+            ]
+            row_report["accepted_frames"] = len(captured)
+            image_dir = run_dir / "selected_rgb"
+            image_dir.mkdir(exist_ok=True)
+            for image_number, (bundle, frame_ns, candidates) in enumerate(captured, start=1):
+                image_path = image_dir / f"row{row_index:02d}_image{image_number:03d}.jpg"
+                if not cv2.imwrite(
+                    str(image_path), bundle.color_bgr,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92],
+                ):
+                    raise OSError(f"无法保存运动取帧照片：{image_path}")
+                relative_image_path = str(image_path.relative_to(run_dir))
+                image_record: dict[str, Any] = {
+                    "path": relative_image_path,
+                    "row": row_report["row"],
+                    "hole_ids": candidates,
+                    "frame_index": bundle.color_frame_index,
+                    "frame_system_timestamp_us": bundle.color_system_timestamp_us,
+                }
+                pose = flyby_interpolate_pose(
+                    samples, frame_ns, max_read_ns=pose_read_limit_ns,
+                )
+                if pose is None:
+                    row_report["rejected_pose_frames"] = (
+                        int(row_report.get("rejected_pose_frames", 0)) + 1
+                    )
+                    image_record["pose_status"] = "unavailable"
+                    report["selected_images"].append(image_record)
+                    overview_tiles.append((
+                        flyby_thumbnail(bundle.color_bgr),
+                        f"R{row_report['row']} #{image_number} H{candidates} pose unavailable",
+                    ))
+                    continue
+                image_record["pose_status"] = "interpolated"
+                image_record["tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(pose)
+                image_record["tcp_speed_mm_s"] = flyby_translation_speed_mm_s(
+                    samples, frame_ns, max_read_ns=pose_read_limit_ns,
+                )
+                image_record["target_pose_error_by_hole"] = {
+                    str(hole_id): {
+                        "position_mm": float(np.linalg.norm(
+                            pose[:3, 3] - target_by_hole[hole_id][:3, 3]
+                        )),
+                        "rotation_deg": _rotation_distance_deg(
+                            pose[:3, :3], target_by_hole[hole_id][:3, :3],
+                        ),
+                    }
+                    for hole_id in candidates
+                }
+                report["selected_images"].append(image_record)
+                selected_frame_count += 1
+                started = time.perf_counter()
+                detections = detect(model, bundle.color_bgr, args.confidence)
+                camera_pose = camera_transform(pose, handeye.T_tcp_rgb_camera)
+                overlay_holes: list[dict[str, Any]] = []
+                for seed in row:
+                    hole_id = int(seed["hole_id"])
+                    if hole_id not in candidates:
+                        continue
+                    anchor = np.asarray(_project_base_point_to_pixel(
+                        np.asarray(seed["initial_center_base_mm"], dtype=float),
+                        camera_pose, bundle.intrinsics,
+                    ), dtype=float)
+                    overlay_hole: dict[str, Any] = {
+                        "hole_id": hole_id, "anchor_px": anchor, "status": "no_detection",
+                    }
+                    overlay_holes.append(overlay_hole)
+                    matching = [
+                        detection for detection in detections
+                        if int(detection["class_id"]) == int(seed["class_id"])
+                        and np.linalg.norm(np.asarray(detection["center"]) - anchor) <= 55.0
+                    ]
+                    if not matching:
+                        continue
+                    detection = min(
+                        matching, key=lambda item: float(np.linalg.norm(
+                            np.asarray(item["center"]) - anchor,
+                        )),
+                    )
+                    ellipse = fit_hole_ellipse(bundle.color_bgr, detection, bundle.intrinsics)
+                    if ellipse is not None:
+                        # Draw in the raw image domain; center_px is undistorted.
+                        overlay_hole["ellipse_center_px"] = ellipse.get("center_px_distorted")
+                        overlay_hole["ellipse_axes_px"] = ellipse.get("axes_px_distorted")
+                        overlay_hole["ellipse_angle_deg"] = ellipse.get("angle_deg_distorted", 0.0)
+                    if not _ellipse_ok(ellipse, fine_cfg):
+                        overlay_hole["status"] = "ellipse_rejected" if ellipse else "no_ellipse"
+                        continue
+                    overlay_hole["status"] = "accepted"
+                    source = seed["coarse_map_source"]
+                    point = pixel_to_base_plane(
+                        np.asarray(ellipse["center_px"], dtype=float),
+                        bundle.intrinsics, pose, handeye.T_tcp_rgb_camera,
+                        np.asarray(source["coarse_plane_point_base_mm"], dtype=float),
+                        np.asarray(source["coarse_normal_toward_camera_base"], dtype=float),
+                        center_is_undistorted=True,
+                    )
+                    points_by_hole[hole_id].append(np.asarray(point[:2], dtype=float))
+                    records_by_hole[hole_id].append({
+                        "image_path": relative_image_path,
+                        "tcp_speed_mm_s": image_record["tcp_speed_mm_s"],
+                        "target_pose_error": image_record["target_pose_error_by_hole"][str(hole_id)],
+                        "frame_index": bundle.color_frame_index,
+                        "frame_system_timestamp_us": bundle.color_system_timestamp_us,
+                        "exposure_us": bundle.color_exposure_us,
+                        "center_px": np.asarray(ellipse["center_px"]).tolist(),
+                        "xy_base_mm": np.asarray(point[:2]).tolist(),
+                    })
+                    if (
+                        hole_id not in representative_by_hole
+                        or float(ellipse["residual_px"])
+                        < representative_by_hole[hole_id]["residual_px"]
+                    ):
+                        representative_by_hole[hole_id] = {
+                            "residual_px": float(ellipse["residual_px"]),
+                            "center_px": np.asarray(ellipse["center_px"], dtype=float),
+                            "intrinsics": bundle.intrinsics,
+                            "tcp": pose,
+                            "raw_xy": np.asarray(point[:2], dtype=float),
+                            "plane_point": np.asarray(source["coarse_plane_point_base_mm"], dtype=float),
+                            "plane_normal": np.asarray(source["coarse_normal_toward_camera_base"], dtype=float),
+                        }
+                visual_compute_s += time.perf_counter() - started
+                pose_errors = image_record["target_pose_error_by_hole"]
+                speed_value = image_record["tcp_speed_mm_s"]
+                overlay = flyby_draw_overlay(
+                    bundle.color_bgr,
+                    header_lines=[
+                        f"row {row_report['row']} image {image_number}  frame {bundle.color_frame_index}",
+                        "speed " + (f"{speed_value:.1f} mm/s" if speed_value is not None else "-")
+                        + f"  exposure {bundle.color_exposure_us} us",
+                        "  ".join(
+                            f"H{hole_id}: {error['position_mm']:.1f}mm/{error['rotation_deg']:.2f}deg"
+                            for hole_id, error in pose_errors.items()
+                        ),
+                    ],
+                    holes=overlay_holes, detections=detections,
+                )
+                overlay_path = run_dir / "annotated_rgb" / image_path.name
+                overlay_path.parent.mkdir(exist_ok=True)
+                if cv2.imwrite(str(overlay_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+                    image_record["annotated_path"] = str(overlay_path.relative_to(run_dir))
+                image_record["hole_status"] = {
+                    str(item["hole_id"]): item["status"] for item in overlay_holes
+                }
+                overview_tiles.append((
+                    flyby_thumbnail(overlay),
+                    f"R{row_report['row']} #{image_number} "
+                    + " ".join(f"H{item['hole_id']}:{item['status']}" for item in overlay_holes),
+                ))
+            row_report["pose_samples"] = len(samples)
+            row_report["saved_images"] = len(captured)
+            row_report["frame_count_by_hole"] = {
+                hole_id: len(selected_by_hole[hole_id]) for hole_id in row_ids
+            }
+            report["camera_stream_poll_s"] = round(camera_stream_poll_s, 3)
+            report["visual_compute_s"] = round(visual_compute_s, 3)
+            atomic_write_json(run_dir / "report.json", jsonable(report))
+        if overview_tiles:
+            overview_path = run_dir / "flyby_overview.jpg"
+            if cv2.imwrite(
+                str(overview_path), flyby_build_contact_sheet(overview_tiles),
+                [cv2.IMWRITE_JPEG_QUALITY, 88],
+            ):
+                report["overview_image"] = overview_path.name
+                print(f"[FLYBY] 飞拍总览图：{overview_path}", flush=True)
+        else:
+            print("[FLYBY] 本次没有任何孔位附近的合格运动帧，未生成总览图。", flush=True)
+        if scan_failure is not None:
+            atomic_write_json(run_dir / "report.json", jsonable(report))
+            raise scan_failure
+        for seed in seeds:
+            hole_id = int(seed["hole_id"])
+            result = flyby_robust_xy(points_by_hole[hole_id])
+            if result["success"] and fine_cfg.enable_tilt_center_correction:
+                started = time.perf_counter()
+                representative = representative_by_hole[hole_id]
+                diameter = seed.get("matched_diameter_mm") or seed.get("diameter_estimate_mm") or 70.0
+                nearest_diameter = min(
+                    HOLE_DIAMETERS_MM, key=lambda value: abs(value - float(diameter)),
+                )
+                try:
+                    corrected, correction = correct_projected_circle_center(
+                        representative["center_px"], representative["intrinsics"],
+                        representative["tcp"], handeye.T_tcp_rgb_camera,
+                        representative["plane_point"], representative["plane_normal"],
+                        nearest_diameter,
+                        iterations=fine_cfg.tilt_correction_iterations,
+                        samples=fine_cfg.tilt_correction_samples,
+                        max_correction_mm=fine_cfg.max_tilt_correction_mm,
+                    )
+                    adjustment = np.asarray(corrected[:2]) - representative["raw_xy"]
+                    result["xy_base_mm"] = (
+                        np.asarray(result["xy_base_mm"]) + adjustment
+                    ).tolist()
+                    result["tilt_correction_xy_mm"] = adjustment.tolist()
+                    result["tilt_correction"] = jsonable(correction)
+                except Exception as exc:
+                    result["success"] = False
+                    result["reason"] = f"tilt_center_correction_failed: {exc}"
+                visual_compute_s += time.perf_counter() - started
+            result["frames"] = records_by_hole[hole_id]
+            report["holes"][str(hole_id)] = result
+        report["run_wall_s"] = round(time.perf_counter() - run_wall_started, 3)
+        # This is one continuous controller path; there are no per-row stop times.
+        report["scan_wall_s"] = round(float(report.get("scan_wall_s", 0.0)), 3)
+        report["selected_frame_count"] = selected_frame_count
+        report["selected_frame_acquisition_estimate_s"] = round(
+            selected_frame_count / report["camera_preflight"]["measured_fps"], 3,
+        )
+        report["visual_active_estimate_s"] = round(
+            report["selected_frame_acquisition_estimate_s"] + visual_compute_s, 3,
+        )
+        report["visual_active_estimate_s_per_hole"] = round(
+            report["visual_active_estimate_s"] / len(seeds), 3,
+        )
+        report["visual_target_estimate_met"] = bool(
+            report["visual_active_estimate_s_per_hole"] <= 0.85
+        )
+        report["completed_holes"] = sum(
+            bool(value["success"]) for value in report["holes"].values()
+        )
+        report["status"] = "completed" if report["completed_holes"] == len(seeds) else "partial"
+        atomic_write_json(run_dir / "report.json", jsonable(report))
+        print(
+            f"[FLYBY] report={run_dir / 'report.json'}; "
+            f"valid={report['completed_holes']}/{len(seeds)}; "
+            f"visual_estimate={report['visual_active_estimate_s']:.3f}s, "
+            f"per_hole={report['visual_active_estimate_s_per_hole']:.3f}s; "
+            f"scan_wall={report['scan_wall_s']:.3f}s",
+            flush=True,
+        )
+        return 0 if report["status"] == "completed" else 2
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        report["run_wall_s"] = round(time.perf_counter() - run_wall_started, 3)
+        atomic_write_json(run_dir / "report.json", jsonable(report))
+        raise
+    finally:
+        if camera is not None:
+            camera.stop()
+        if motion_session is not None:
+            motion_session.disconnect()
+        if pose_session is not None:
+            pose_session.disconnect()
 
 
 def run_hole_map_execution(args: Any) -> int:
@@ -3446,9 +4235,10 @@ def run_hole_map_execution(args: Any) -> int:
     args.batch_fine_localization = not coarse_direct_final
     args.batch_fine_joint_localization = not coarse_direct_final
     args.batch_fine_pointcloud_xy_fusion = not coarse_direct_final
-    # 地图调用在成功后必须执行完整最终点运动；点云中心不可用的孔由
-    # 逐孔流程记录为失败，不会下发最终目标。第四策略不执行260 mm精拍。
-    args.move_final_xy = True
+    # 高度对比只移动到拍摄位并保存当轮视觉结果，不进入最终XY/Z落位。
+    args.move_final_xy = not bool(getattr(
+        args, "fine_height_comparison_capture_only", False,
+    ))
     args._coarse_map_path = str(map_path)
     args._coarse_map_id = payload.get("map_id")
     args._coarse_map_expected_camera_serial = str(environment.get("camera_serial") or "").strip()
@@ -3488,6 +4278,10 @@ def run_hole_map_execution(args: Any) -> int:
         int(seed["hole_id"]): dict(seed["coarse_map_source"])
         for seed in seeds
     }
+    if bool(getattr(args, "flyby_capture_only", False)):
+        return _run_flyby_map_capture(
+            args, handeye, model, seeds, map_path, payload.get("map_id"),
+        )
     return run_two_stage_hole_localization(
         args,
         handeye,
@@ -3529,6 +4323,8 @@ def _new_two_stage_report(
             if hole_map_mode == "build" else None
         ),
         "localization_strategy": (
+            f"fine_height_comparison_{float(cfg.fine_height_mm):g}_capture_only"
+            if bool(getattr(args, "fine_height_comparison_capture_only", False)) else
             f"coarse_{float(cfg.coarse_height_mm):g}_pointcloud_center_only_edge_first"
             if bool(getattr(args, "coarse_direct_final", False)) else
             "per_hole_same_capture_340_strict_fine_with_quality_gated_pointcloud_fallback_reference"
@@ -3585,6 +4381,8 @@ def _new_two_stage_report(
             if bool(getattr(args, "coarse_direct_final", False)) else False
         ),
         "fine_stage_policy": (
+            "fresh_fine_at_selected_height_no_final_motion"
+            if bool(getattr(args, "fine_height_comparison_capture_only", False)) else
             "coarse_direct_pointcloud_capture_only_no_final_motion"
             if bool(getattr(args, "coarse_direct_final", False))
             and bool(getattr(args, "coarse_direct_final_capture_only", False)) else
@@ -4389,6 +5187,14 @@ def run_two_stage_hole_localization(
         )
     setattr(args, "_map_hole_selection_mode", map_hole_selection_mode)
     coarse_direct_final = bool(getattr(args, "coarse_direct_final", False))
+    fine_height_comparison = bool(getattr(
+        args, "fine_height_comparison_capture_only", False,
+    ))
+    if fine_height_comparison:
+        if coarse_direct_final or hole_map_mode in {"build", "repair"}:
+            raise ValueError("不同高度精定位对比不能与纯点云或地图建图/返修同时使用")
+        if float(cfg.fine_height_mm) not in {260.0, 300.0, 320.0}:
+            raise ValueError("不同高度精定位对比只能选择 260、300 或 320 mm")
     if auto_sector_config is not None and hole_map_mode == "build":
         requested_sector = getattr(args, "sector_id", None)
         if requested_sector is not None:
@@ -4455,9 +5261,9 @@ def run_two_stage_hole_localization(
         args.reuse_persistent_coarse_cache = False
         args.shared_cache_validation = False
     elif hole_map_mode == "execute":
-        # 地图调用默认执行现场精定位；第四策略重新按独立高度采集点云中心。
+        # 地图调用默认执行现场精定位；高度对比仅采集，不最终落位。
         args.map_build_coarse_only = False
-        args.move_final_xy = True
+        args.move_final_xy = not fine_height_comparison
         if coarse_direct_final:
             args.batch_fine_localization = False
             args.batch_fine_joint_localization = False
@@ -4478,7 +5284,7 @@ def run_two_stage_hole_localization(
         if initial_holes_override is None:
             raise ValueError("粗定位地图调用缺少地图孔位种子")
     elif coarse_direct_final:
-        # 第四策略强制走独立高度点云采集；单孔也使用同一批量采集函数。
+        # 保留历史CLI点云路线；单孔也使用同一批量采集函数。
         args.batch_coarse_localization = True
         args.batch_fine_localization = False
         args.batch_fine_joint_localization = False
@@ -4496,7 +5302,7 @@ def run_two_stage_hole_localization(
             batch_coarse_group_pose_refinement=False,
             shared_cache_validation=False,
         )
-    # 第四策略的高度、分组上限和采集提前结束参数独立于普通两阶段粗定位。
+    # 历史CLI点云路线的高度、分组上限和采集提前结束参数独立于普通两阶段粗定位。
     # 将其折叠进本轮有效配置，确保分组规划、点云采集和最终点规划使用同一组值。
     if coarse_direct_final:
         direct_height_mm = float(cfg.coarse_direct_final_height_mm)
@@ -4516,6 +5322,8 @@ def run_two_stage_hole_localization(
         if bool(getattr(args, "coarse_direct_final_capture_only", False)):
             # 仅采集评估必须保留观察位运动，但严禁进入最终XY/Z动作。
             args.move_final_xy = False
+    elif fine_height_comparison:
+        args.move_final_xy = False
     else:
         setattr(args, "_coarse_direct_final_height_mm", None)
         setattr(args, "_coarse_direct_final_max_group_size", None)
@@ -4934,6 +5742,8 @@ _apply_robot_connection_overrides = apply_robot_connection_overrides
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _apply_robot_connection_overrides(args)
+    if args.flyby_capture_only and args.hole_map_mode != "execute":
+        raise ValueError("--flyby-capture-only 只能与 --hole-map-mode execute 一起使用")
     if args.image is not None and args.execute:
         raise RuntimeError("--image 只用于离线预览，不能与 --execute 同用")
     if args.hole_map_mode == "repair":
@@ -4944,8 +5754,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_hole_map_repair(args, handeye, model)
     if args.hole_map_mode == "execute":
         # 当前扇区没有地图时进入首轮340 mm粗定位建图；已有地图则把
-        # 粗几何作为种子，并启动当前相机重新执行260 mm精定位。
+        # 粗几何作为种子，并启动当前相机在所选高度重新执行精定位。
         if getattr(args, "sector_id", None) is not None and not _rotary_sector_map_ready_for_auto_call(args):
+            if args.flyby_capture_only:
+                raise RuntimeError("运动取帧需要现成的有效孔位地图；请先完成建图")
             print(
                 f"[ROTARY_SECTOR_MAP_MISSING] sector={int(args.sector_id)} "
                 "当前扇区无可用地图，进入首轮共享粗/精定位建图。",

@@ -2743,7 +2743,6 @@ def run_shared_fine_stage(ctx: Any) -> None:
                         ):
                             break
                         round_made_progress = False
-                        round_had_clipped_motion = False
                         pending_group_raw = [
                             fine_planning_holes_by_id[hole_id]
                             for hole_id in pending_holes
@@ -2950,12 +2949,6 @@ def run_shared_fine_stage(ctx: Any) -> None:
                                             adjustment_details["translation_clipped"]
                                             or adjustment_details["rotation_clipped"]
                                         )
-                                    )
-                                    round_had_clipped_motion = bool(
-                                        round_had_clipped_motion
-                                        or adjustment_details[
-                                            "followup_adjustment_candidate"
-                                        ]
                                     )
                                     supplement_report[
                                         "in_group_pose_adjustment"
@@ -3211,15 +3204,28 @@ def run_shared_fine_stage(ctx: Any) -> None:
                                 "success", False
                             )
                         ]
-                        # A second direct adjustment is useful only when the
-                        # first step was clipped, or when that capture accepted
-                        # part of the group and left a smaller failed subset to
-                        # re-centre. A no-op full-group recapture must not turn
-                        # into another identical robot motion/capture cycle.
+                        # A clipped move alone does not justify another shared
+                        # capture: if no hole passed, retain the quality gates
+                        # and use the existing per-hole fallback instead.
+                        # Progress leaves a smaller subset that may benefit
+                        # from one more bounded adjustment.
                         continue_in_group_adjustment = bool(
-                            pending_holes
-                            and (round_had_clipped_motion or round_made_progress)
+                            pending_holes and round_made_progress
                         )
+                        if (
+                            cfg.batch_fine_in_group_pose_adjustment
+                            and pending_holes
+                            and not round_made_progress
+                            and supplement_round < supplement_round_limit
+                        ):
+                            group_report["supplement_stop_reason"] = (
+                                "no_new_accepted_holes_after_supplement"
+                            )
+                            print(
+                                f"[BATCH_FINE] 第{group_index}组第{supplement_round}轮"
+                                "未新增通过孔，跳过后续共享补拍，转逐孔精定位",
+                                flush=True,
+                            )
 
                     group_report["accepted_holes"] = [
                         hole_id for hole_id in group_ids

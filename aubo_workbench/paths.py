@@ -32,16 +32,21 @@ def _path_from_env(name: str, default: Path) -> Path:
     return Path(value).expanduser() if value else default
 
 
-# 第三方运行组件随副本部署；环境变量允许现场把它们放到独立安装目录。
-# 这里不再回退到原 MM 工作区，避免新副本悄悄加载旧 SDK。
+# 第三方运行组件随副本部署。相机始终使用随项目固定的 338Le SDK，
+# 避免遗留环境变量指向旧相机的运行时。
 AUBO_SDK_DIR = _path_from_env(
     "AUBO_WORKBENCH_AUBO_SDK_DIR",
     WORKSPACE_DIR / "third_party" / "aubo_sdk",
 )
-ORBBEC_RUNTIME_DIR = _path_from_env(
-    "AUBO_WORKBENCH_ORBBEC_RUNTIME_DIR",
-    WORKSPACE_DIR / "third_party" / "orbbec_runtime",
-)
+def _orbbec_runtime_dir() -> Path:
+    bundled = WORKSPACE_DIR / "third_party" / "orbbec_runtime_338le"
+    configured = os.environ.get("AUBO_WORKBENCH_ORBBEC_RUNTIME_DIR", "").strip()
+    if configured and Path(configured).expanduser().resolve() != bundled.resolve():
+        print(f"[WARN] 忽略 Orbbec SDK 环境变量 {configured}，使用 Gemini 338Le SDK {bundled}")
+    return bundled
+
+
+ORBBEC_RUNTIME_DIR = _orbbec_runtime_dir()
 
 
 # 运行数据留在 aubo_tools/data，便于和源码、三方依赖分开，也兼容已有实验报告路径。

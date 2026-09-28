@@ -1119,9 +1119,9 @@ def _batch_fine_localization_at_260mm(
     artifact_prefix: str | None = None,
     additional_capture_frames: int = 0,
 ) -> dict[Any, dict[str, Any]]:
-    """在一个260mm共同位姿同时精定位当前视野内的全部选中孔。
+    """在所选共同精拍位姿同时精定位当前视野内的全部选中孔。
 
-    机器人在本函数调用前已经移动到共同260mm位姿。本函数只采集RGB帧，
+    机器人在本函数调用前已经移动到所选共同位姿。本函数只采集RGB帧，
     每帧运行一次YOLO并把检测框一对一分配给所有目标孔；椭圆质量门和
     融合/验收沿用单孔精定位逻辑。启用联合开关时，先分别对每个孔的
     多帧圆心做时间方向稳健融合，再用这些“每孔一个”的基坐标XY拟合
@@ -1131,6 +1131,7 @@ def _batch_fine_localization_at_260mm(
     """
     if not selected_holes:
         raise RuntimeError("批量精定位：没有选中孔")
+    fine_height_label = f"{float(cfg.fine_height_mm):g}"
 
     T_base_camera = camera_transform(current_tcp, handeye.T_tcp_rgb_camera)
     projected_holes = {
@@ -1594,14 +1595,14 @@ def _batch_fine_localization_at_260mm(
                     )
             cv2.putText(
                 view,
-                f"Batch RGB 260mm frame={frame_index} valid={valid_hole_count}/{len(selected_holes)}",
+                f"Batch RGB {fine_height_label}mm frame={frame_index} valid={valid_hole_count}/{len(selected_holes)}",
                 (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA,
             )
             latest_view = view
             overlay_path = None
             if bool(getattr(cfg, "save_all_capture_overlays", False)):
                 overlay_path = run_dir / (
-                    f"{artifact_tag}batch_fine_260_frame_{frame_index:02d}.png"
+                    f"{artifact_tag}batch_fine_{fine_height_label}_frame_{frame_index:02d}.png"
                 )
                 with artifact_measure(
                     timing,
@@ -1625,7 +1626,7 @@ def _batch_fine_localization_at_260mm(
     if latest_view is not None and not bool(
         getattr(cfg, "save_all_capture_overlays", False)
     ):
-        overlay_path = run_dir / f"{artifact_tag}batch_fine_260_last_frame.png"
+        overlay_path = run_dir / f"{artifact_tag}batch_fine_{fine_height_label}_last_frame.png"
         with artifact_measure(
             timing,
             "batch_fine/write_last_frame_overlay",
@@ -1691,7 +1692,7 @@ def _batch_fine_localization_at_260mm(
                     "capture_status": "completed",
                     "total_frames": len(observations),
                     "valid_frames": int(summary["valid_frames"]),
-                    "mode": "batch_fine_at_260mm",
+                    "mode": f"batch_fine_at_{fine_height_label}mm",
                 }],
             })
             if fused_anchor_distance > float(
@@ -1990,7 +1991,7 @@ def _batch_fine_localization_at_260mm(
         "max_attempts": max_attempts,
         "inplace_recovery_frames": inplace_recovery_frames,
         "inplace_recovery_policy": (
-            "continue_at_current_260mm_pose_for_unlocked_holes_before_moving"
+            f"continue_at_current_{fine_height_label}mm_pose_for_unlocked_holes_before_moving"
             if inplace_recovery_frames > 0 else "disabled"
         ),
         "locked_holes": sorted(locked_holes),

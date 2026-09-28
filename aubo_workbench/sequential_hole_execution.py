@@ -1237,7 +1237,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     )
             elif per_hole_fine_route == "batch_fine_result":
                 hole["batch_fine_localization_source"] = str(
-                    batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+                    batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm")
                 )
                 hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
                     batch_fine_result["capture_tcp"]
@@ -1295,7 +1295,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     )
             elif per_hole_fine_route == "batch_fine_result":
                 hole["batch_fine_localization_source"] = str(
-                    batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+                    batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm")
                 )
                 hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
                     batch_fine_result["capture_tcp"]
@@ -1358,7 +1358,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     )
             elif per_hole_fine_route == "batch_fine_result":
                 hole["batch_fine_localization_source"] = str(
-                    batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm")
+                    batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm")
                 )
                 hole["batch_fine_capture_tcp_pose_m_rad"] = transform_to_sdk_pose_m_rad(
                     batch_fine_result["capture_tcp"]
@@ -1823,7 +1823,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     "batch_fine_joint_summary"
                 ),
                 "batch_fine_source": (
-                    str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                    str(batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm"))
                     if batch_fine_available else "per_hole_fine_fallback"
                 ),
                 "batch_fine_capture_round": int(
@@ -2218,7 +2218,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                     "batch_fine_joint_summary"
                 ),
                 "batch_fine_source": (
-                    str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                    str(batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm"))
                     if batch_fine_available else
                     "same_capture_340_fine"
                     if bool(getattr(args, "map_build_same_capture_340", False)) else
@@ -2247,7 +2247,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 "localization_path": (
                     "same_capture_340_deferred"
                     if bool(getattr(args, "map_build_same_capture_340", False))
-                    else "fine_260_deferred"
+                    else f"fine_{cfg.fine_height_mm:g}_deferred"
                 ),
                 "fine_stage_skipped": False,
                 "batch_coarse_center_base_mm": hole.get(
@@ -2852,7 +2852,7 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
                 else None
             ),
             "batch_fine_source": (
-                str(batch_fine_result.get("batch_fine_source", "batch_fine_at_260mm"))
+                    str(batch_fine_result.get("batch_fine_source", f"batch_fine_at_{cfg.fine_height_mm:g}mm"))
                 if batch_fine_available else
                 "same_capture_340_fine"
                 if bool(getattr(args, "map_build_same_capture_340", False)) else
@@ -2905,10 +2905,10 @@ def _process_one_hole(ctx: Any, order: int, hole: dict[str, Any]) -> None:
             "fine_quality_note": fine.get("fine_quality_note"),
             "fine_recovery_attempts": fine.get("fine_recovery_attempts", []),
             "localization_path": (
-                "batch_fine_260" if batch_fine_available else
+                f"batch_fine_{cfg.fine_height_mm:g}" if batch_fine_available else
                 "same_capture_340_fine"
                 if bool(getattr(args, "map_build_same_capture_340", False)) else
-                "per_hole_fine_260"
+                f"per_hole_fine_{cfg.fine_height_mm:g}"
             ),
             "fine_stage_skipped": False,
             "batch_coarse_center_base_mm": hole.get(

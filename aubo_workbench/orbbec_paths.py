@@ -26,16 +26,12 @@ def _runtime_paths() -> list[Path]:
     ]
 
 
-def add_orbbec_runtime_path() -> Path | None:
-    """Make the local Orbbec extension and DLL directories importable.
-
-    The returned directory is ``None`` when the bundled runtime is absent. In
-    that case the normal Python environment may still provide pyorbbecsdk.
-    """
+def add_orbbec_runtime_path() -> Path:
+    """Make the bundled Gemini 338Le extension and DLL directories importable."""
 
     root = Path(ORBBEC_RUNTIME_DIR)
-    if not root.exists():
-        return None
+    if not root.is_dir():
+        raise FileNotFoundError(f"Gemini 338Le SDK 目录不存在: {root}")
 
     for path in _runtime_paths():
         if not path.exists():
@@ -50,4 +46,3 @@ def add_orbbec_runtime_path() -> Path | None:
             # remove the DLL search path while the SDK is still in use.
             _DLL_HANDLES.append(add_dll_directory(str(path)))
     return root
-

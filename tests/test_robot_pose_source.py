@@ -47,6 +47,23 @@ def test_controller_tool_change_is_read_on_next_snapshot():
     assert old["actual_tcp_offset_sdk_m_rad"] != new["actual_tcp_offset_sdk_m_rad"]
 
 
+def test_snapshot_refreshes_robot_state_after_connect():
+    session, _ = session_with_offset([0.0] * 6)
+    refreshed = SimpleNamespace(
+        isPowerOn=lambda: True, isSteady=lambda: True,
+        isCollisionOccurred=lambda: False,
+        isWithinSafetyLimits=lambda: True,
+        getToolPose=session.state.getToolPose,
+        getTcpPose=session.state.getTcpPose,
+        getActualTcpOffset=session.state.getActualTcpOffset,
+        getRobotModeType=lambda: "running", getSafetyModeType=lambda: "normal",
+        getJointPositions=lambda: [0.0] * 6,
+    )
+    session.robot_if = SimpleNamespace(getRobotState=lambda: refreshed)
+    session.read_pose_snapshot()
+    assert session.state is refreshed
+
+
 def test_inconsistent_controller_pose_is_rejected():
     session, _ = session_with_offset([0.0] * 6)
     session.state.getActualTcpOffset = lambda: [0.0, 0.0, 0.02, 0.0, 0.0, 0.0]

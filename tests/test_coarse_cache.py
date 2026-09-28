@@ -465,34 +465,29 @@ class CoarseCacheTests(unittest.TestCase):
         self.assertIn("--no-batch-fine-localization", command)
         self.assertNotIn("--batch-fine-frames", command)
 
-    def test_gui_coarse_direct_strategy_uses_pointcloud_only(self) -> None:
-        panel = self._panel_for_command("coarse_direct")
-        panel.batch_fine_localization_var = _Value(True)
-        panel.batch_fine_joint_localization_var = _Value(True)
-        panel.batch_fine_pointcloud_xy_fusion_var = _Value(True)
+    def test_gui_height_comparison_keeps_fine_and_disables_final_motion(self) -> None:
+        panel = self._panel_for_command("fine_height_compare")
+        panel.fine_height_var = _Value("300")
+        panel.batch_fine_localization_var = _Value(False)
+        panel.batch_fine_joint_localization_var = _Value(False)
+        panel.batch_fine_pointcloud_xy_fusion_var = _Value(False)
         panel.shared_cache_validation_var = _Value(False)
         panel._update_strategy_controls = lambda: None
 
         panel._apply_strategy()
 
-        self.assertFalse(panel.batch_fine_localization_var.get())
-        self.assertFalse(panel.batch_fine_joint_localization_var.get())
-        self.assertFalse(panel.batch_fine_pointcloud_xy_fusion_var.get())
+        self.assertTrue(panel.batch_fine_localization_var.get())
+        self.assertTrue(panel.batch_fine_joint_localization_var.get())
+        self.assertTrue(panel.batch_fine_pointcloud_xy_fusion_var.get())
         command = panel._build_command("two_stage")
-        self.assertIn("--coarse-direct-final", command)
+        self.assertNotIn("--coarse-direct-final", command)
         self.assertIn("--batch-coarse-localization", command)
-        for obsolete_flag in (
-            "--coarse-direct-min-valid-frames",
-            "--coarse-direct-max-center-scatter-p95-px",
-            "--coarse-direct-max-tracking-distance-p95-px",
-            "--coarse-direct-max-plane-rmse-mm",
-            "--coarse-direct-same-pose-fusion",
-            "--coarse-direct-center-recheck",
-        ):
-            self.assertNotIn(obsolete_flag, command)
-        self.assertIn("--no-batch-fine-localization", command)
-        self.assertIn("--no-batch-fine-joint-localization", command)
-        self.assertIn("--no-batch-fine-pointcloud-xy-fusion", command)
+        self.assertIn("--batch-fine-localization", command)
+        self.assertIn("--batch-fine-joint-localization", command)
+        self.assertIn("--batch-fine-pointcloud-xy-fusion", command)
+        self.assertIn("--fine-height-comparison-capture-only", command)
+        self.assertEqual(command[-1], "--no-move-final-xy")
+        self.assertEqual(command[command.index("--fine-height-mm") + 1], "300.0")
         self.assertIn("--no-reuse-coarse-cache", command)
         self.assertIn("--no-reuse-persistent-coarse-cache", command)
 

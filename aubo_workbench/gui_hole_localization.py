@@ -178,16 +178,18 @@ class HoleLocalizationPanel(ttk.Frame):
         self.confidence_var = tk.StringVar(value="0.35")
         self.coarse_height_var = tk.StringVar(value="340")
         self.fine_height_var = tk.StringVar(value="260")
+        self.flyby_speed_var = tk.StringVar(value="0.03")
         self.per_hole_fine_safe_z_margin_var = tk.StringVar(value="20.0")
         self.coarse_frames_var = tk.StringVar(value="15")
-        self.fine_frames_var = tk.StringVar(value="30")
+        self.fine_frames_var = tk.StringVar(value="20")
+        self.fine_stable_min_frames_var = tk.StringVar(value="12")
         # 初始孔数由相机窗口中的点击数量决定，按 Enter 结束选择。
-        self.speed_var = tk.StringVar(value="0.08")
-        self.acc_var = tk.StringVar(value="0.25")
-        self.transit_speed_var = tk.StringVar(value="0.15")
-        self.transit_acc_var = tk.StringVar(value="0.45")
-        self.approach_speed_var = tk.StringVar(value="0.12")
-        self.approach_acc_var = tk.StringVar(value="0.35")
+        self.speed_var = tk.StringVar(value="0.10")
+        self.acc_var = tk.StringVar(value="0.35")
+        self.transit_speed_var = tk.StringVar(value="0.20")
+        self.transit_acc_var = tk.StringVar(value="0.60")
+        self.approach_speed_var = tk.StringVar(value="0.15")
+        self.approach_acc_var = tk.StringVar(value="0.45")
         self.offset_radii_var = tk.StringVar(value="0 5 10 15 20")
         self.offset_angles_var = tk.StringVar(value="0 45 90 135 180 225 270 315")
         self.batch_coarse_frames_var = tk.StringVar(value="15")
@@ -219,11 +221,6 @@ class HoleLocalizationPanel(ttk.Frame):
         self.batch_fine_in_group_max_rotation_var = tk.StringVar(value="2.0")
         self.batch_fine_in_group_min_normal_holes_var = tk.StringVar(value="2")
         self.batch_fine_in_group_max_normal_spread_var = tk.StringVar(value="3.0")
-        self.coarse_direct_final_height_var = tk.StringVar(value="340")
-        self.coarse_direct_final_max_group_size_var = tk.StringVar(value="5")
-        self.coarse_direct_final_early_stop_extra_frames_var = tk.StringVar(value="5")
-        self.coarse_direct_final_settle_delay_var = tk.StringVar(value="1.0")
-        self.coarse_direct_final_capture_only_var = tk.BooleanVar(value=False)
         self.optimize_hole_order_var = tk.BooleanVar(value=False)
         self.execute_var = tk.BooleanVar(value=False)
         self.experimental_var = tk.BooleanVar(value=False)
@@ -332,16 +329,17 @@ class HoleLocalizationPanel(ttk.Frame):
             ("逐孔检测：每个孔独立粗定位和精定位", "per_hole"),
             ("多孔分组共享定位：340 mm 分组粗定位，260 mm 分组精定位", "batch"),
             ("复用粗定位缓存：一拍多验证，失败逐孔粗定位", "cache"),
-            ("第四策略：340 mm点云中心直达（外围最多3孔，内部最多5孔）", "coarse_direct"),
+            ("不同高度精定位对比：每轮选择 260 / 300 / 320 mm", "fine_height_compare"),
+            ("运动中 RGB 精定位实验：逐孔按地图法向连续变姿态并拍摄", "flyby"),
         )):
             ttk.Radiobutton(
                 strategy, text=label, variable=self.strategy_var, value=value,
             ).grid(row=row, column=0, sticky="w", pady=2)
         ttk.Label(
             strategy,
-            text="第四策略只使用独立高度的点云中心，默认340 mm；选区外围先分组且最多3孔，内部最多5孔，均优先3～5孔，必要时允许1～2孔；所有组保持紧凑并执行长宽比门限；确认停稳后默认等待1秒，最终XY仅使用ChArUco纠偏。",
+            text="高度对比仍使用当轮 RGB 精定位；机械臂移动到拍摄位，但不执行最终 XY/Z 落位。每轮仅选一个高度，报告记录共享通过孔、回退孔和视觉节拍。",
             foreground="#555555",
-        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
         auto_panel = ttk.LabelFrame(parent, text="初始自动分区/选孔实验", padding=8)
         auto_panel.pack(fill=tk.X, pady=(8, 0))
@@ -573,8 +571,9 @@ class HoleLocalizationPanel(ttk.Frame):
             ("粗定位高度 mm", self.coarse_height_var, 8),
             ("精定位高度 mm", self.fine_height_var, 8),
             ("逐孔精拍横移Z余量 mm", self.per_hole_fine_safe_z_margin_var, 8),
-            ("粗定位帧", self.coarse_frames_var, 6),
-            ("精定位帧", self.fine_frames_var, 6),
+            ("逐孔粗拍上限帧", self.coarse_frames_var, 6),
+            ("逐孔精拍上限帧", self.fine_frames_var, 6),
+            ("逐孔精拍稳定门帧数", self.fine_stable_min_frames_var, 6),
             ("精确速度 m/s", self.speed_var, 7),
             ("加速度 m/s²", self.acc_var, 7),
             ("安全过渡速度 m/s", self.transit_speed_var, 7),
@@ -595,14 +594,14 @@ class HoleLocalizationPanel(ttk.Frame):
         ttk.Checkbutton(
             batch,
             text=(
-                "260 mm 分组共享精定位（默认最多4孔；失败孔进行一次"
+                "所选高度分组共享精定位（默认最多4孔；失败孔进行一次"
                 "受限XY/Z/RX/RY组内微调）"
             ),
             variable=self.batch_fine_localization_var,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
         ttk.Checkbutton(
             batch,
-            text="260 mm 多孔联合精定位（共享XY；保留逐孔残差、倾斜纠偏和ChArUco补偿）",
+            text="所选高度多孔联合精定位（共享XY；保留逐孔残差、倾斜纠偏和ChArUco补偿）",
             variable=self.batch_fine_joint_localization_var,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 2))
         ttk.Checkbutton(
@@ -624,13 +623,13 @@ class HoleLocalizationPanel(ttk.Frame):
             ("建图安全横移Z余量 mm", self.map_build_safe_z_margin_var, 7),
         ], columns=2, start_row=6)
         self._grid_fields(batch, [
-            ("260 mm 精定位视野边缘余量 px", self.batch_fine_view_margin_var, 7),
-            ("260 mm 批量帧数", self.batch_fine_frames_var, 7),
-            ("260 mm 最少有效帧", self.batch_fine_min_valid_var, 7),
-            ("260 mm 稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
-            ("260 mm 旧帧清理下限", self.batch_fine_settle_discard_frames_var, 7),
-            ("260 mm 原位补帧数", self.batch_fine_inplace_recovery_frames_var, 7),
-            ("260 mm 失败孔组内调整/补拍次数", self.batch_fine_supplement_rounds_var, 7),
+            ("精拍视野边缘余量 px", self.batch_fine_view_margin_var, 7),
+            ("精拍批量帧数", self.batch_fine_frames_var, 7),
+            ("精拍最少有效帧", self.batch_fine_min_valid_var, 7),
+            ("精拍稳定门帧数", self.batch_fine_stable_min_frames_var, 7),
+            ("精拍旧帧清理下限", self.batch_fine_settle_discard_frames_var, 7),
+            ("精拍原位补帧数", self.batch_fine_inplace_recovery_frames_var, 7),
+            ("精拍失败孔组内调整/补拍次数", self.batch_fine_supplement_rounds_var, 7),
             ("组内最多调整次数", self.batch_fine_in_group_max_adjustments_var, 7),
             ("组内最大XY mm", self.batch_fine_in_group_max_xy_var, 7),
             ("组内最大Z mm", self.batch_fine_in_group_max_z_var, 7),
@@ -643,27 +642,24 @@ class HoleLocalizationPanel(ttk.Frame):
             ("粗精一致性门限 mm", self.batch_fine_pointcloud_xy_agreement_gate_var, 7),
         ], columns=2, start_row=8)
 
-        direct_info = ttk.LabelFrame(
-            parent, text="第四策略：独立高度点云中心直达", padding=8,
-        )
-        self.coarse_direct_info_frame = direct_info
-        direct_info.pack(fill=tk.X, pady=(8, 0))
+        height_info = ttk.LabelFrame(parent, text="不同高度精定位对比", padding=8)
+        self.fine_height_compare_frame = height_info
+        height_info.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(height_info, text="本轮精拍高度 mm").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            height_info, textvariable=self.fine_height_var,
+            values=("260", "300", "320"), state="readonly", width=8,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 16))
         ttk.Label(
-            direct_info,
-            text="默认340 mm；选区最外围孔先分组且每组最多3孔，内部孔每组最多5孔，均优先3～5孔并允许余数为1～2孔；外围组同样执行紧凑度门限，近似直线的三孔会拆分；停稳后额外等待1秒。仅采集评估会移动到观察位并保存点云结果，不执行最终XY/Z动作。",
+            height_info,
+            text="每轮选择一个高度；高度对比使用停稳精拍，飞拍使用地图逐排连续扫描。两者均不执行最终 XY/Z 落位。",
             foreground="#555555",
-        ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 2))
-        self._grid_fields(direct_info, [
-            ("点云拍摄高度 mm", self.coarse_direct_final_height_var, 7),
-            ("内部每组最多孔数（1-5；外围最多3）", self.coarse_direct_final_max_group_size_var, 7),
-            ("额外确认帧数", self.coarse_direct_final_early_stop_extra_frames_var, 7),
-            ("停稳后额外等待 s", self.coarse_direct_final_settle_delay_var, 7),
-        ], columns=3, start_row=1)
-        ttk.Checkbutton(
-            direct_info,
-            text="仅采集评估（不执行最终 XY/Z 动作）",
-            variable=self.coarse_direct_final_capture_only_var,
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(3, 0))
+        ).grid(row=0, column=2, sticky="w")
+        ttk.Label(height_info, text="飞拍扫描速度 m/s").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.flyby_speed_entry = ttk.Entry(
+            height_info, textvariable=self.flyby_speed_var, width=10,
+        )
+        self.flyby_speed_entry.grid(row=1, column=1, sticky="w", padx=(8, 16), pady=(5, 0))
 
         shared = ttk.LabelFrame(parent, text="缓存检测策略参数", padding=8)
         self.shared_cache_validation_frame = shared
@@ -706,11 +702,14 @@ class HoleLocalizationPanel(ttk.Frame):
     def _apply_strategy(self, *_args: Any) -> None:
         """把互斥策略同步到所有会改变执行路径的开关。"""
         strategy = self.strategy_var.get()
+        previous_strategy = getattr(self, "_previous_strategy", None)
+        if strategy == "flyby" and previous_strategy != "flyby" and self.fine_height_var.get() == "260":
+            self.fine_height_var.set("300")
+        self._previous_strategy = strategy
         per_hole_strategy = strategy == "per_hole"
-        coarse_direct_strategy = strategy == "coarse_direct"
         # 逐孔模式不能残留共享精定位或联合XY；否则多孔任务仍会被
         # sequential workflow 识别为“两拍共享”并先执行共享粗/精定位。
-        fine_enabled = not per_hole_strategy and not coarse_direct_strategy
+        fine_enabled = not per_hole_strategy
         self.batch_fine_localization_var.set(fine_enabled)
         self.batch_fine_joint_localization_var.set(fine_enabled)
         pointcloud_fusion_var = getattr(
@@ -720,6 +719,10 @@ class HoleLocalizationPanel(ttk.Frame):
             pointcloud_fusion_var.set(fine_enabled)
         cache_strategy = strategy == "cache"
         self.shared_cache_validation_var.set(cache_strategy)
+        if strategy in {"fine_height_compare", "flyby"} and self.fine_height_var.get() not in {
+            "260", "300", "320",
+        }:
+            self.fine_height_var.set("300" if strategy == "flyby" else "260")
         self._update_strategy_controls()
 
     def _build_monitor_tab(self, parent: ttk.Frame) -> None:
@@ -772,33 +775,34 @@ class HoleLocalizationPanel(ttk.Frame):
     def _update_strategy_controls(self) -> None:
         """只允许当前选中的策略编辑自己的专属参数。"""
         strategy = self.strategy_var.get()
-        coarse_direct_strategy = strategy == "coarse_direct"
         state = tk.NORMAL if strategy == "cache" else tk.DISABLED
         for widget in self.shared_cache_validation_frame.winfo_children():
             try:
                 widget.configure(state=state)
             except tk.TclError:
                 pass
-        # 逐孔策略下共享参数没有执行意义，全部置灰。第四策略仍使用
-        # 批量点云采集参数，但高度和每组孔数由其专属面板控制。
+        # 逐孔策略下共享参数没有执行意义，全部置灰。
         shared_state = tk.DISABLED if strategy == "per_hole" else tk.NORMAL
         for widget in self.shared_localization_frame.winfo_children():
             try:
-                if coarse_direct_strategy and shared_state == tk.NORMAL:
-                    row = int(widget.grid_info().get("row", -1))
-                    widget.configure(state=tk.DISABLED if row >= 2 else tk.NORMAL)
-                else:
-                    widget.configure(state=shared_state)
+                widget.configure(state=shared_state)
             except tk.TclError:
                 pass
-        direct_frame = getattr(self, "coarse_direct_info_frame", None)
-        if direct_frame is not None:
-            direct_state = tk.NORMAL if coarse_direct_strategy else tk.DISABLED
-            for widget in direct_frame.winfo_children():
+        compare_frame = getattr(self, "fine_height_compare_frame", None)
+        if compare_frame is not None:
+            for widget in compare_frame.winfo_children():
                 try:
-                    widget.configure(state=direct_state)
+                    if isinstance(widget, ttk.Combobox):
+                        widget.configure(
+                            state="readonly" if strategy in {"fine_height_compare", "flyby"}
+                            else tk.DISABLED
+                        )
                 except tk.TclError:
                     pass
+        if hasattr(self, "flyby_speed_entry"):
+            self.flyby_speed_entry.configure(
+                state=tk.NORMAL if strategy == "flyby" else tk.DISABLED,
+            )
 
     def _browse_model(self) -> None:
         path = filedialog.askopenfilename(parent=self, title="选择 YOLO 模型", filetypes=[("模型", "*.pt"), ("所有文件", "*.*")])
@@ -1022,6 +1026,10 @@ class HoleLocalizationPanel(ttk.Frame):
                 ),
                 "coarse_frames": int(self.coarse_frames_var.get()),
                 "fine_frames": int(self.fine_frames_var.get()),
+                "fine_stable_min_frames": int(getattr(
+                    getattr(self, "fine_stable_min_frames_var", None),
+                    "get", lambda: "12",
+                )()),
                 "speed": float(self.speed_var.get()),
                 "acc": float(self.acc_var.get()),
                 "transit_speed": float(self.transit_speed_var.get()),
@@ -1031,6 +1039,10 @@ class HoleLocalizationPanel(ttk.Frame):
             }
             if float(numbers["per_hole_fine_safe_z_margin"]) < 10.0:
                 raise ValueError("逐孔精拍横移Z余量不能小于10 mm")
+            if int(numbers["fine_stable_min_frames"]) < 12:
+                raise ValueError("精拍稳定门帧数不能少于 12")
+            if int(numbers["fine_frames"]) < int(numbers["fine_stable_min_frames"]):
+                raise ValueError("精定位帧数不能少于精拍稳定门帧数")
             return numbers
         except ValueError as exc:
             raise ValueError("定位参数必须是有效数字") from exc
@@ -1058,13 +1070,24 @@ class HoleLocalizationPanel(ttk.Frame):
         model = Path(self.model_var.get().strip())
         handeye = Path(self.handeye_var.get().strip())
         execute = self.execute_var.get() if execute_override is None else bool(execute_override)
-        # 地图调用也要启动相机、加载YOLO和当前手眼；是否执行260 mm精定位
-        # 由当前检测策略决定。
+        # 地图调用也要启动相机、加载YOLO和当前手眼；精拍高度由当前策略决定。
         if not is_offset and not model.is_file():
             raise FileNotFoundError(f"YOLO 模型不存在：{model}")
         if not is_offset and not handeye.is_file():
             raise FileNotFoundError(f"手眼结果不存在：{handeye}")
         values = self._numbers()
+        strategy_name = getattr(
+            getattr(self, "strategy_var", None), "get", lambda: "batch",
+        )()
+        height_compare = strategy_name == "fine_height_compare"
+        flyby = strategy_name == "flyby"
+        if flyby and not is_map_execute:
+            raise ValueError("运动中 RGB 精定位实验只能调用已建立的孔位地图")
+        if height_compare or flyby:
+            if mode not in {"two_stage", "hole_map_execute"}:
+                raise ValueError("不同高度精定位对比仅支持检测或调用现有孔位地图")
+            if float(values["fine_height"]) not in {260.0, 300.0, 320.0}:
+                raise ValueError("不同高度精定位对比只能选择 260、300 或 320 mm")
         connection = self.connection_provider()
         command = [
             # 无缓冲输出，确保 GUI 能在机器人开始运动前看到确认事件。
@@ -1087,6 +1110,11 @@ class HoleLocalizationPanel(ttk.Frame):
             "--robot-timeout-ms", str(connection["timeout_ms"]),
         ]
         command.append("--execute" if execute else "--no-execute")
+        if not is_offset:
+            command.extend([
+                "--fine-stable-min-frames",
+                str(values.get("fine_stable_min_frames", 12)),
+            ])
         # 地图调用同样是实时视觉运动流程，遵守实验手眼放行策略。
         if not is_offset and self.experimental_var.get():
             command.append("--allow-experimental-handeye")
@@ -1178,52 +1206,6 @@ class HoleLocalizationPanel(ttk.Frame):
                 # 会记录为失败，不进入其它定位流程。
                 "--move-final-xy",
             ])
-            strategy_name = getattr(getattr(self, "strategy_var", None), "get", lambda: "")()
-            if strategy_name == "coarse_direct":
-                try:
-                    direct_height = float(getattr(
-                        getattr(self, "coarse_direct_final_height_var", None),
-                        "get", lambda: "340",
-                    )())
-                    direct_group_size = int(getattr(
-                        getattr(self, "coarse_direct_final_max_group_size_var", None),
-                        "get", lambda: "5",
-                    )())
-                    direct_extra_frames = int(getattr(
-                        getattr(self, "coarse_direct_final_early_stop_extra_frames_var", None),
-                        "get", lambda: "5",
-                    )())
-                    direct_settle_delay = float(getattr(
-                        getattr(self, "coarse_direct_final_settle_delay_var", None),
-                        "get", lambda: "1.0",
-                    )())
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("第四策略点云参数必须是有效数字") from exc
-                if (
-                    not math.isfinite(direct_height) or direct_height <= 0.0
-                    or direct_group_size < 1 or direct_group_size > 5
-                    or direct_extra_frames < 0
-                    or not math.isfinite(direct_settle_delay)
-                    or direct_settle_delay < 0.0
-                    or direct_settle_delay > 30.0
-                ):
-                    raise ValueError("第四策略要求高度>0、每组孔数在1到5、额外确认帧数>=0、停稳等待在0到30秒")
-                command.extend([
-                    "--coarse-direct-final",
-                    "--coarse-direct-final-height-mm", str(direct_height),
-                    "--coarse-direct-final-max-group-size", str(direct_group_size),
-                    "--coarse-direct-final-early-stop-extra-frames", str(direct_extra_frames),
-                    "--coarse-direct-final-settle-delay-s", str(direct_settle_delay),
-                    "--no-batch-fine-localization",
-                    "--no-batch-fine-joint-localization",
-                    "--no-batch-fine-pointcloud-xy-fusion",
-                ])
-                if bool(getattr(
-                    getattr(self, "coarse_direct_final_capture_only_var", None),
-                    "get", lambda: False,
-                )()):
-                    command.append("--coarse-direct-final-capture-only")
-                    command.append("--no-move-final-xy")
             ids_text = self.hole_map_ids_var.get().replace(",", " ").strip()
             if ids_text:
                 try:
@@ -1329,7 +1311,6 @@ class HoleLocalizationPanel(ttk.Frame):
                 "--move-final-xy" if self.final_xy_var.get() else "--no-move-final-xy"
             )
             strategy_name = getattr(getattr(self, "strategy_var", None), "get", lambda: "")()
-            coarse_direct_strategy = strategy_name == "coarse_direct"
             cache_strategy = strategy_name == "cache"
             # 缓存开关只由检测策略决定；建图始终采集当前扇区的新鲜点云。
             reuse_session_cache = cache_strategy and not is_map_build
@@ -1344,8 +1325,6 @@ class HoleLocalizationPanel(ttk.Frame):
             )
             shared_cache_var = getattr(self, "shared_cache_validation_var", None)
             shared_cache_enabled = bool(shared_cache_var is not None and shared_cache_var.get())
-            if coarse_direct_strategy and shared_cache_enabled:
-                raise ValueError("第四策略点云中心直达不能启用共享粗定位缓存验证")
             if shared_cache_enabled:
                 if not cache_strategy:
                     raise ValueError("共享快速缓存验证要求选择“复用粗定位缓存”检测策略")
@@ -1365,7 +1344,7 @@ class HoleLocalizationPanel(ttk.Frame):
                     "--shared-cache-validation-min-valid", str(shared_min_valid),
                     "--shared-cache-validation-view-margin-px", str(shared_margin),
                 ])
-            if strategy_name in {"batch", "coarse_direct"}:
+            if strategy_name in {"batch", "fine_height_compare"}:
                 if shared_cache_enabled:
                     raise ValueError("共享快速缓存验证不能与批量粗定位同时启用")
                 try:
@@ -1398,7 +1377,7 @@ class HoleLocalizationPanel(ttk.Frame):
             fine_batch_var = getattr(self, "batch_fine_localization_var", None)
             fine_batch_enabled = bool(
                 not is_map_build
-                and strategy_name not in {"per_hole", "coarse_direct"}
+                and strategy_name != "per_hole"
                 and (fine_batch_var is None or fine_batch_var.get())
             )
             if fine_batch_enabled:
@@ -1546,7 +1525,7 @@ class HoleLocalizationPanel(ttk.Frame):
             )
             joint_batch_enabled = bool(
                 not is_map_build
-                and strategy_name not in {"per_hole", "coarse_direct"}
+                and strategy_name != "per_hole"
                 and (joint_batch_var is None or joint_batch_var.get())
             )
             pointcloud_fusion_var = getattr(
@@ -1593,48 +1572,6 @@ class HoleLocalizationPanel(ttk.Frame):
                 "--batch-fine-in-group-pose-adjustment"
                 if in_group_pose_enabled else "--no-batch-fine-in-group-pose-adjustment",
             ])
-            if coarse_direct_strategy and not is_map_build:
-                try:
-                    direct_height = float(getattr(
-                        getattr(self, "coarse_direct_final_height_var", None),
-                        "get", lambda: "340",
-                    )())
-                    direct_group_size = int(getattr(
-                        getattr(self, "coarse_direct_final_max_group_size_var", None),
-                        "get", lambda: "5",
-                    )())
-                    direct_extra_frames = int(getattr(
-                        getattr(self, "coarse_direct_final_early_stop_extra_frames_var", None),
-                        "get", lambda: "5",
-                    )())
-                    direct_settle_delay = float(getattr(
-                        getattr(self, "coarse_direct_final_settle_delay_var", None),
-                        "get", lambda: "1.0",
-                    )())
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("第四策略点云参数必须是有效数字") from exc
-                if (
-                    not math.isfinite(direct_height) or direct_height <= 0.0
-                    or direct_group_size < 1 or direct_group_size > 5
-                    or direct_extra_frames < 0
-                    or not math.isfinite(direct_settle_delay)
-                    or direct_settle_delay < 0.0
-                    or direct_settle_delay > 30.0
-                ):
-                    raise ValueError("第四策略要求高度>0、每组孔数在1到5、额外确认帧数>=0、停稳等待在0到30秒")
-                command.append("--coarse-direct-final")
-                command.extend([
-                    "--coarse-direct-final-height-mm", str(direct_height),
-                    "--coarse-direct-final-max-group-size", str(direct_group_size),
-                    "--coarse-direct-final-early-stop-extra-frames", str(direct_extra_frames),
-                    "--coarse-direct-final-settle-delay-s", str(direct_settle_delay),
-                ])
-                if bool(getattr(
-                    getattr(self, "coarse_direct_final_capture_only_var", None),
-                    "get", lambda: False,
-                )()):
-                    command.append("--coarse-direct-final-capture-only")
-                    command.append("--no-move-final-xy")
             if is_map_build:
                 command.extend([
                     "--hole-map-mode", "build",
@@ -1655,6 +1592,18 @@ class HoleLocalizationPanel(ttk.Frame):
             if bool(getattr(getattr(self, "charuco_xy_var", None), "get", lambda: True)())
             else "--no-charuco-xy-correction"
         )
+        if height_compare:
+            command.extend([
+                "--fine-height-comparison-capture-only", "--no-move-final-xy",
+            ])
+        if flyby:
+            speed = float(self.flyby_speed_var.get())
+            if not math.isfinite(speed) or not 0.005 <= speed <= 0.1:
+                raise ValueError("飞拍扫描速度必须在 0.005 到 0.1 m/s 之间")
+            command.extend([
+                "--flyby-capture-only", "--flyby-speed-m-s", str(speed),
+                "--no-move-final-xy",
+            ])
         return command
 
     def start(self) -> None:
@@ -1664,8 +1613,7 @@ class HoleLocalizationPanel(ttk.Frame):
         self._start_process("hole_map_build")
 
     def start_hole_map_execute(self) -> None:
-        # 与固定的地图调用命令保持界面状态一致，避免旧窗口状态显示关闭。
-        self.final_xy_var.set(True)
+        self.final_xy_var.set(self.strategy_var.get() not in {"fine_height_compare", "flyby"})
         self._start_process("hole_map_execute")
 
     def start_hole_map_repair(self) -> None:
@@ -1697,17 +1645,16 @@ class HoleLocalizationPanel(ttk.Frame):
         auto_next_hole = bool(
             getattr(getattr(self, "auto_next_hole_var", None), "get", lambda: False)()
         )
-        coarse_direct_strategy = bool(
+        height_compare = bool(
             getattr(getattr(self, "strategy_var", None), "get", lambda: "")()
-            == "coarse_direct"
+            == "fine_height_compare"
         )
-        coarse_direct_height = str(getattr(
-            getattr(self, "coarse_direct_final_height_var", None),
-            "get", lambda: "340",
-        )())
-        coarse_direct_capture_only = bool(getattr(
-            getattr(self, "coarse_direct_final_capture_only_var", None),
-            "get", lambda: False,
+        flyby = bool(
+            getattr(getattr(self, "strategy_var", None), "get", lambda: "")()
+            == "flyby"
+        )
+        fine_height = str(getattr(
+            getattr(self, "fine_height_var", None), "get", lambda: "260",
         )())
         if mode == "hole_map_build":
             map_selection_mode = str(
@@ -1749,20 +1696,28 @@ class HoleLocalizationPanel(ttk.Frame):
             confirmation_text = (
                 f"将调用扇区 {self.sector_id_var.get().strip() or '-'} 的粗定位地图；"
                 + (
-                    f"会在{coarse_direct_height} mm直接使用点云中心，"
-                    + (
-                        "只做点云采集评估，不执行最终XY/Z动作；"
-                        if coarse_direct_capture_only else
-                        "最终XY只应用最新ChArUco纠偏；"
-                    )
-                    + "点云失败孔不再进入其它定位流程，并"
-                    if coarse_direct_strategy else
-                    "会启动相机并在本轮重新执行260 mm精定位，成功孔随后应用最新ChArUco XY纠偏并"
+                    f"机械臂将在{fine_height} mm逐孔按地图法向连续变姿态，"
+                    "经过孔位时拍摄 RGB；"
+                    "仅保存视觉评估，不执行最终 XY/Z 落位。"
+                    if flyby else
+                    f"会在{fine_height} mm执行当轮RGB精定位，"
+                    "仅采集评估，不执行最终XY/Z落位。"
+                    if height_compare else
+                    f"会启动相机并在本轮重新执行{fine_height} mm精定位，"
+                    "成功孔随后应用最新ChArUco XY纠偏并移动到完整最终点。"
                 )
-                + "移动到完整最终点。若该扇区还没有地图，"
-                "会进入首轮340 mm粗定位建图。"
-                f"调用孔号：{self.hole_map_ids_var.get().strip() or '全部有效孔'}。"
+                + "若该扇区还没有地图，"
                 + (
+                    "此模式会拒绝启动，请先建图。"
+                    if flyby else
+                    "首轮只做340 mm粗定位建图，下一轮才能做高度对比。"
+                    if height_compare else
+                    "会进入首轮340 mm粗定位建图。"
+                )
+                + f"调用孔号：{self.hole_map_ids_var.get().strip() or '全部有效孔'}。"
+                + (
+                    "扫描期间不逐孔停稳或等待人工确认；请确认整排行程安全。"
+                    if flyby else
                     "已开启自动进入下一孔，孔间不等待人工确认；请确认运行区域安全。"
                     if auto_next_hole else
                     "当前孔完成后会等待人工确认，点击“开始执行下一个地图孔”才会继续。"
@@ -1778,13 +1733,10 @@ class HoleLocalizationPanel(ttk.Frame):
         else:
             confirmation_text = (
                 (
-                    f"将执行回原点及{coarse_direct_height} mm点云中心直达流程；"
-                    + (
-                        "仅采集评估，不执行最终XY/Z动作；"
-                        if coarse_direct_capture_only else ""
-                    )
-                    + "点云失败孔只记录失败，不进入其它定位流程，每轮完成后会自动回原点并进入下一轮选孔，"
-                    if coarse_direct_strategy else
+                    f"将执行回原点及{fine_height} mm当轮精定位高度对比；"
+                    "只移动到拍摄位，不执行最终XY/Z落位；"
+                    "每轮完成后会自动回原点并进入下一轮选孔，"
+                    if height_compare else
                     "将执行回原点及两阶段定位；每轮完成后会自动回原点并进入下一轮选孔，"
                 )
                 + "相机和机器人会话保持运行。按选孔窗口 Esc 可结束会话。\n"
@@ -2081,6 +2033,13 @@ class HoleLocalizationPanel(ttk.Frame):
         if hasattr(self, "repair_map_btn"):
             self.repair_map_btn.configure(state=tk.NORMAL)
         self.process = None
+        if (
+            self.process_mode == "hole_map_execute"
+            and str(getattr(getattr(self, "strategy_var", None), "get", lambda: "")()) == "flyby"
+        ):
+            self.status_var.set("飞拍完成" if code == 0 else f"飞拍结束，退出码={code}")
+            self._show_flyby_result()
+            return
         if code == 0:
             self.status_var.set(
                 "偏移测试完成" if self.process_mode == "offset" else
@@ -2565,6 +2524,63 @@ class HoleLocalizationPanel(ttk.Frame):
             return "[" + ", ".join(f"{float(item):.3f}" for item in value) + "]"
         except (TypeError, ValueError):
             return str(value)
+
+    def _show_flyby_result(self) -> None:
+        """Summarize the latest flyby report and open its annotated overview image."""
+        reports = sorted(
+            (
+                path for path in RUNS_DIR.glob("flyby-*/report.json")
+                if path.stat().st_mtime >= self.run_started_at - 2.0
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not reports:
+            self.result_var.set("飞拍结束，但未找到本次 flyby 报告；请查看运行日志。")
+            return
+        run_dir = reports[0].parent
+        try:
+            report = json.loads(reports[0].read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self.result_var.set(f"读取飞拍报告失败：{exc}\n报告：{reports[0]}")
+            return
+        capture = report.get("scan_capture") or {}
+        holes = report.get("holes") or {}
+        lines = [
+            f"飞拍状态：{report.get('status', '-')}    "
+            f"成功孔：{report.get('completed_holes', '-')}/{len(holes) or '-'}",
+            f"保存图像：{len(report.get('selected_images') or [])} 张    "
+            f"取帧 {capture.get('captured_frames', 0)}，"
+            f"拒绝(时间戳/位姿/静止) {capture.get('rejected_timestamp_frames', 0)}/"
+            f"{capture.get('rejected_pose_frames', 0)}/"
+            f"{capture.get('rejected_stationary_frames', 0)}",
+        ]
+        if report.get("error"):
+            lines.append(f"错误：{report['error']}")
+        for hole_id, item in holes.items():
+            lines.append(
+                f"孔 {hole_id}：{'成功' if item.get('success') else item.get('reason', '失败')} "
+                f"有效帧={item.get('valid_frames', 0)} "
+                f"散布P95={self._format_optional_mm(item.get('scatter_p95_mm'))}"
+            )
+        lines.append(f"结果目录：{run_dir}")
+        overview = run_dir / str(report.get("overview_image") or "flyby_overview.jpg")
+        if overview.exists():
+            lines.append(f"总览图：{overview}（已自动打开；单张标注图见 annotated_rgb）")
+            try:
+                os.startfile(str(overview))  # type: ignore[attr-defined]
+            except OSError as exc:
+                lines.append(f"打开总览图失败：{exc}")
+        else:
+            lines.append("本次没有生成总览图：扫描前已失败或孔位附近没有合格运动帧。")
+        self.result_var.set("\n".join(lines))
+
+    @staticmethod
+    def _format_optional_mm(value: Any) -> str:
+        try:
+            return f"{float(value):.3f} mm"
+        except (TypeError, ValueError):
+            return "-"
 
     def open_results_dir(self) -> None:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)

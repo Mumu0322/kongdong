@@ -177,6 +177,16 @@ class AuboPoseSession:
 
     def read_pose_snapshot(self) -> dict[str, Any]:
         self.connect()
+        # AUBO may return a state proxy tied to the connection handshake.  Read
+        # a fresh RobotState object when available so a just-powered controller
+        # is not reported with the transient state from connect().
+        if self.robot_if is not None:
+            try:
+                refreshed_state = self.robot_if.getRobotState()
+                if refreshed_state is not None:
+                    self.state = refreshed_state
+            except Exception:
+                pass
         if self.state is None:
             raise RuntimeError("AUBO RobotState 未初始化")
 
@@ -242,6 +252,9 @@ class AuboPoseSession:
             "power_on": power_on,
             "steady": steady,
             "collision": collision,
+            "within_safety_limits": self._safe_state_bool(
+                "isWithinSafetyLimits", default=None,
+            ),
             "robot_mode": str(self.state.getRobotModeType()),
             "safety_mode": str(self.state.getSafetyModeType()),
         }
@@ -255,6 +268,18 @@ class AuboPoseSession:
         except Exception:
             snapshot["configured_tcp_offset_sdk_m_rad"] = []
         return snapshot
+
+    def _safe_state_bool(self, method_name: str, *, default: bool | None) -> bool | None:
+        """Read optional controller state flags without masking the main pose."""
+        if self.state is None:
+            return default
+        method = getattr(self.state, method_name, None)
+        if not callable(method):
+            return default
+        try:
+            return bool(method())
+        except Exception:
+            return default
 
 
 # 全局单例：整个手眼标定流程共用一条只读连接。

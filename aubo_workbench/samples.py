@@ -234,6 +234,12 @@ def next_available_sample_index(samples: list[CalibSample] | None = None) -> int
             match = re.match(r"^sample_(\d+)(?:_|\.json$)", path.name)
             if match:
                 maximum = max(maximum, int(match.group(1)))
+        for path in (root / "deletion_reports").glob("high_error_*.json"):
+            try:
+                report = json.loads(path.read_text(encoding="utf-8"))
+                maximum = max(maximum, *(int(item["index"]) for item in report.get("deleted_samples", [])))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
     return maximum + 1
 
 
@@ -504,4 +510,3 @@ def archive_samples(
     })
     rewrite_sample_csv(remaining_samples)
     return archive_dir
-

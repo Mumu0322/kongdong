@@ -3,7 +3,7 @@
 """料框镜片实时检测前端。
 
 功能：
-    * 采集 Gemini 435Le 左/右 IR 黑白相机画面；
+    * 采集 Gemini 338Le 左/右 IR 黑白相机画面；
     * 实时显示 IR 自动曝光、曝光时间、增益、亮度和激光状态；
     * 使用同目录下的 best.pt 实时推理并叠加检测结果；
     * 支持切换左右 IR、自动/手动曝光、增益、置信度和激光开关；
@@ -113,7 +113,7 @@ def _frame_to_gray(frame: Any) -> np.ndarray | None:
 
 
 class OrbbecIRCamera:
-    """Gemini 435Le 单路 IR 相机封装。"""
+    """Gemini 338Le 单路 IR 相机封装。"""
 
     def __init__(self, side: str = "left") -> None:
         if ORBBEC_IMPORT_ERROR is not None:
@@ -146,16 +146,31 @@ class OrbbecIRCamera:
             if int(profiles.get_count()) <= 0:
                 raise RuntimeError(f"没有找到 {self.side} IR 视频 profile")
 
-            # profile 0 是当前设备的 1280x800@10 Y8，优先保证与测试结果一致。
-            self.profile = profiles.get_stream_profile_by_index(0)
+            from aubo_workbench.camera import describe_video_profiles, verify_production_camera
+
+            matches = [profile for profile in describe_video_profiles(profiles) if (
+                profile.width == 1280 and profile.height == 800
+                and profile.fps == 15 and profile.format == "Y8"
+            )]
+            if not matches:
+                raise RuntimeError(f"Gemini 338Le 没有 {self.side} IR 1280x800@15 Y8 profile")
+            self.profile = profiles.get_stream_profile_by_index(matches[0].index)
             config = Config()
             config.enable_stream(self.profile)
             self.pipeline.start(config)
+            try:
+                verify_production_camera(self.pipeline)
+            except Exception:
+                self.pipeline.stop()
+                raise
             self.device = self.pipeline.get_device()
             self._stopped = False
 
-            # 默认关闭红外投射器，避免黑白图出现激光点阵。
-            self.set_laser(False)
+            # 338Le 固件可能不允许通过此属性改激光状态；不阻断 IR 取帧。
+            try:
+                self.set_laser(False)
+            except Exception as exc:
+                print(f"[WARN] 无法关闭 IR 激光: {exc}")
             return self.status()
 
     def close(self) -> None:
@@ -324,10 +339,11 @@ class RealtimeDetectorApp:
             toolbar, text="自动曝光", variable=self.auto_exposure_var,
             command=self._on_auto_exposure,
         ).grid(row=0, column=4, padx=(0, 8))
-        ttk.Checkbutton(
+        self.laser_checkbox = ttk.Checkbutton(
             toolbar, text="激光", variable=self.laser_var,
             command=self._on_laser,
-        ).grid(row=0, column=5, padx=(0, 10))
+        )
+        self.laser_checkbox.grid(row=0, column=5, padx=(0, 10))
 
         ttk.Label(toolbar, text="置信度").grid(row=0, column=6, padx=(0, 4))
         ttk.Entry(toolbar, textvariable=self.conf_var, width=7).grid(row=0, column=7, padx=(0, 4))
@@ -459,7 +475,7 @@ class RealtimeDetectorApp:
             self.camera = camera
             status = camera.open()
             self._publish_log(
-                f"相机已启动：{status.get('side')} IR，默认激光关闭，"
+                f"相机已启动：{status.get('side')} IR，激光状态={status.get('laser')}，"
                 f"曝光={status.get('exposure')}，增益={status.get('gain')}"
             )
             self._publish_log(f"模型类别：{getattr(model, 'names', {})}")
@@ -623,18 +639,23 @@ class RealtimeDetectorApp:
 
         status = packet.camera_status
         side = "左 IR" if status.get("side") == "left" else "右 IR"
-        self.device_var.set(f"设备：Gemini 435Le | {side} | 1280×800 Y8")
+        self.device_var.set(f"设备：Gemini 338Le | {side} | 1280×800 Y8")
         self.exposure_read_var.set(self._format_status("曝光", status.get("exposure"), " μs"))
         self.gain_read_var.set(self._format_status("增益", status.get("gain"), ""))
         self.brightness_read_var.set(self._format_status("亮度", status.get("brightness"), ""))
         self.auto_read_var.set(f"自动曝光：{'开' if status.get('auto_exposure') else '关'}")
-        self.laser_read_var.set(f"激光：{'开' if status.get('laser') else '关'}")
+        laser_state = status.get("laser")
+        self.laser_read_var.set(
+            "激光：不可读取" if laser_state is None else f"激光：{'开' if laser_state else '关'}"
+        )
+        self.laser_checkbox.configure(state="disabled" if laser_state is None else "normal")
         self.performance_var.set(
             f"帧率：{packet.loop_fps:.1f} FPS | 推理：{packet.inference_ms:.1f} ms"
         )
         self.detection_count_var.set(f"检测数量：{len(packet.detections)}")
         self.auto_exposure_var.set(bool(status.get("auto_exposure", self.auto_exposure_var.get())))
-        self.laser_var.set(bool(status.get("laser", self.laser_var.get())))
+        if laser_state is not None:
+            self.laser_var.set(bool(laser_state))
         # 输入框是用户编辑区，不能每帧用相机读数覆盖；启动时为空才填充一次。
         if status.get("exposure") is not None and not self.manual_exposure_var.get().strip():
             self.manual_exposure_var.set(str(status["exposure"]))

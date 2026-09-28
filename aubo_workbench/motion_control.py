@@ -271,6 +271,7 @@ class AuboMotionSession:
         self.motion: Any | None = None
         self.manage: Any | None = None
         self.config: Any | None = None
+        self.runtime: Any | None = None
         self.robot_name = ""
         self.safety_policy = MotionSafetyPolicy()
 
@@ -314,6 +315,10 @@ class AuboMotionSession:
             self.motion = self.robot_if.getMotionControl()
             self.manage = self.robot_if.getRobotManage()
             self.config = self.robot_if.getRobotConfig()
+            try:
+                self.runtime = client.getRuntimeMachine()
+            except Exception:
+                self.runtime = None
             return self.robot_name
 
     def disconnect(self) -> None:
@@ -329,6 +334,7 @@ class AuboMotionSession:
             self.motion = None
             self.manage = None
             self.config = None
+            self.runtime = None
             self.robot_name = ""
 
     def require_connected(self) -> None:
@@ -441,6 +447,25 @@ class AuboMotionSession:
             assert self.motion is not None
             return self.motion.stopMove(False, True)
 
+    def _tcp_reached(self, pose_m_rad: list[float], position_tol_m: float, rotation_tol_deg: float) -> bool:
+        """Return True when the measured TCP already matches ``pose_m_rad``."""
+        if self.state is None:
+            return False
+        try:
+            actual = [float(v) for v in list(self.state.getTcpPose())]
+        except Exception:
+            return False
+        if len(actual) != 6 or not all(math.isfinite(v) for v in actual):
+            return False
+        if math.dist(actual[:3], pose_m_rad[:3]) > position_tol_m:
+            return False
+        ra = rpy_to_matrix(*actual[3:6])
+        rb = rpy_to_matrix(*pose_m_rad[3:6])
+        # trace(Ra^T Rb) = 1 + 2 cos(angle)
+        trace = sum(ra[k][i] * rb[k][i] for i in range(3) for k in range(3))
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0))))
+        return angle <= rotation_tol_deg
+
     def _clear_path_before_move(self, move_name: str) -> Any:
         assert self.motion is not None
         try:
@@ -470,6 +495,299 @@ class AuboMotionSession:
             assert self.motion is not None
             clear_result = self._clear_path_before_move("moveLine")
             return [clear_result, self.motion.moveLine(pose, speed, acc, 0.0, 0.0)]
+
+    def move_line_blended_path(
+        self, poses_m_rad: list[list[float]], speed_m_s: float,
+        acc_m_s2: float, blend_radius_m: float, *,
+        segment_speeds_m_s: list[float] | None = None,
+        queue_retry_timeout_s: float = 120.0,
+        queue_retry_interval_s: float = 0.05,
+        ignore_retry_timeout_s: float = 10.0,
+        abort_event: threading.Event | None = None,
+        queue_log: list[dict[str, Any]] | None = None,
+        reached_position_tolerance_m: float = 0.0005,
+        reached_rotation_tolerance_deg: float = 0.1,
+        use_runtime_machine: bool = False,
+        completion_timeout_s: float | None = None,
+        completion_settle_s: float = 0.3,
+        path_info: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Queue one continuous Cartesian path, retaining the controller's blends.
+
+        ``abort_event`` stops further queueing (e.g. after an external stopMove),
+        so a retry can never restart motion that another session has stopped.
+        ``queue_log`` receives one diagnostic record per segment.
+
+        With ``use_runtime_machine`` the controller's RuntimeMachine is started
+        before queueing and stopped only after the arm has finished the path, so
+        the call then blocks until the motion is done.  Probe 20260928_105034:
+        with the RuntimeMachine stopped the controller accepts one moveLine at a
+        time (the rest return 2), so every segment ran point-to-point; started,
+        all segments queued and the corners blended.  ``path_info`` receives
+        runtime and speed-fraction diagnostics.
+        """
+        with self.lock:
+            poses = [self._validate_vector(pose, "连续扫描目标位姿") for pose in poses_m_rad]
+            if len(poses) < 2:
+                raise ValueError("连续扫描至少需要一个孔位姿和一个退出位姿")
+            speed = self._validate_positive(speed_m_s, "连续扫描速度")
+            if segment_speeds_m_s is None:
+                segment_speeds = [speed] * len(poses)
+            else:
+                if len(segment_speeds_m_s) != len(poses):
+                    raise ValueError("连续扫描分段速度数量必须与目标位姿数量一致")
+                segment_speeds = [
+                    self._validate_positive(value, "连续扫描分段速度")
+                    for value in segment_speeds_m_s
+                ]
+            acc = self._validate_positive(acc_m_s2, "连续扫描加速度")
+            blend = self._validate_positive(blend_radius_m, "交融半径")
+            if blend < 0.001 or blend > 0.02:
+                raise ValueError("连续扫描交融半径必须在 0.001 到 0.02 m 之间")
+            retry_timeout = self._validate_positive(queue_retry_timeout_s, "规划队列重试超时")
+            retry_interval = self._validate_positive(queue_retry_interval_s, "规划队列重试间隔")
+            ignore_timeout = self._validate_positive(ignore_retry_timeout_s, "忽略请求重试超时")
+            self._require_motion_state(require_steady=True)
+            assert self.motion is not None
+            info = path_info if path_info is not None else {}
+            info["speed_fraction"] = self.speed_fraction()
+            if use_runtime_machine:
+                if self.runtime is None:
+                    raise RuntimeError("控制器 RuntimeMachine 不可用，无法连续交融下发")
+                status = str(self.runtime.getStatus())
+                info["runtime_status_before"] = status
+                if "Stopped" not in status:
+                    raise RuntimeError(
+                        f"控制器运行机状态为 {status}（示教器可能有程序在运行），已拒绝连续扫描"
+                    )
+            results = [self._clear_path_before_move("blended moveLine")]
+            feed_args = (
+                poses, results, acc, segment_speeds, blend, retry_timeout,
+                retry_interval, ignore_timeout, abort_event, queue_log,
+                reached_position_tolerance_m, reached_rotation_tolerance_deg,
+            )
+            if not use_runtime_machine:
+                return self._feed_blended_segments(*feed_args)
+            assert self.runtime is not None
+            info["runtime_start"] = ret_text(self.runtime.start())
+            try:
+                info["runtime_status_started"] = str(self.runtime.getStatus())
+            except Exception:
+                pass
+            print(
+                f"[MOTION] RuntimeMachine start={info['runtime_start']}，"
+                f"状态={info.get('runtime_status_started')}，速度倍率={info['speed_fraction']}",
+                flush=True,
+            )
+            finished = False
+            try:
+                self._feed_blended_segments(*feed_args)
+                if completion_timeout_s is None:
+                    completion_timeout_s = self._estimate_path_time_s(
+                        poses, segment_speeds, info["speed_fraction"],
+                    )
+                info["completion_timeout_s"] = round(completion_timeout_s, 1)
+                self._wait_path_finished(
+                    poses[-1], completion_timeout_s, completion_settle_s,
+                    abort_event, reached_position_tolerance_m, info,
+                )
+                finished = True
+            finally:
+                if not finished:
+                    # stopMove before RuntimeMachine.stop so the queued
+                    # remainder can never keep running on its own.
+                    try:
+                        self.motion.stopMove(False, True)
+                    except Exception:
+                        pass
+                try:
+                    info["runtime_stop"] = ret_text(self.runtime.stop())
+                except Exception as exc:
+                    info["runtime_stop"] = f"error: {exc}"
+            return results
+
+    def speed_fraction(self) -> float | None:
+        """Controller speed slider; values below 1 scale every commanded speed."""
+        getter = getattr(self.motion, "getSpeedFraction", None)
+        if not callable(getter):
+            return None
+        try:
+            value = float(getter())
+        except Exception:
+            return None
+        return value if math.isfinite(value) else None
+
+    def _estimate_path_time_s(
+        self, poses: list[list[float]], speeds: list[float], fraction: float | None,
+    ) -> float:
+        start: list[float] | None = None
+        if self.state is not None:
+            try:
+                start = [float(v) for v in list(self.state.getTcpPose())][:3]
+            except Exception:
+                start = None
+        points = [start] if start is not None and len(start) == 3 else [poses[0][:3]]
+        points += [pose[:3] for pose in poses]
+        ideal = sum(
+            math.dist(a, b) / speed for a, b, speed in zip(points, points[1:], speeds)
+        )
+        scale = 1.0 / max(0.05, fraction or 1.0)
+        return 3.0 * ideal * scale + 15.0
+
+    def _wait_path_finished(
+        self, final_pose: list[float], timeout_s: float, settle_s: float,
+        abort_event: threading.Event | None, position_tol_m: float,
+        info: dict[str, Any],
+    ) -> None:
+        """Block until the queue is empty and the arm rests on ``final_pose``."""
+        assert self.motion is not None and self.state is not None
+        started = time.monotonic()
+        deadline = started + timeout_s
+        quiet_since: float | None = None
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError("连续扫描执行中收到停止请求")
+            if bool(self.state.isCollisionOccurred()):
+                raise RuntimeError("连续扫描执行中检测到碰撞")
+            try:
+                queue_size = int(self.motion.getQueueSize())
+            except Exception:
+                queue_size = 0
+            if queue_size == 0 and bool(self.state.isSteady()):
+                quiet_since = quiet_since or time.monotonic()
+                if time.monotonic() - quiet_since >= settle_s:
+                    break
+            else:
+                quiet_since = None
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"连续扫描 {timeout_s:.0f}s 内未执行完成")
+            time.sleep(0.02)
+        info["execution_wait_s"] = round(time.monotonic() - started, 3)
+        if not self._tcp_reached(final_pose, max(position_tol_m, 0.001), 1.0):
+            raise RuntimeError("连续扫描结束后 TCP 未到达路径终点")
+
+    def _feed_blended_segments(
+        self, poses: list[list[float]], results: list[Any], acc: float,
+        segment_speeds: list[float], blend: float, retry_timeout: float,
+        retry_interval: float, ignore_timeout: float,
+        abort_event: threading.Event | None,
+        queue_log: list[dict[str, Any]] | None,
+        reached_position_tolerance_m: float, reached_rotation_tolerance_deg: float,
+    ) -> list[Any]:
+        """Send each segment once accepted; see move_line_blended_path."""
+        assert self.motion is not None
+        path_started = time.monotonic()
+        for index, pose in enumerate(poses):
+            # AUBO API order is (pose, acceleration, speed, blend, duration).
+            blend_value = blend if index < len(poses) - 1 else 0.0
+            segment_started = time.monotonic()
+            deadline = segment_started + retry_timeout
+            queue_full_since = None
+            ignored_since = None
+            attempts = 0
+            queue_full_count = 0
+            ignored_count = 0
+            already_reached = False
+            record: dict[str, Any] = {"segment": index + 1}
+            if queue_log is not None:
+                queue_log.append(record)
+            while True:
+                if abort_event is not None and abort_event.is_set():
+                    record["result"] = "aborted"
+                    raise RuntimeError(f"连续扫描路径第 {index + 1} 段下发前已收到停止请求")
+                result = self.motion.moveLine(
+                    pose, acc, segment_speeds[index], blend_value, 0.0,
+                )
+                attempts += 1
+                try:
+                    code = int(result)
+                except (TypeError, ValueError):
+                    code = None
+                # AUBO ret=2 means the controller's motion queue is full.
+                # Keep already queued segments and wait for one to be consumed;
+                # clearPath here would destroy the continuous trajectory.
+                if code == 2:
+                    queue_full_count += 1
+                    if queue_full_since is None:
+                        queue_full_since = time.monotonic()
+                        print(
+                            f"[MOTION] 连续路径第 {index + 1} 段等待控制器消费队列，"
+                            f"最多等待 {retry_timeout:.0f}s",
+                            flush=True,
+                        )
+                    if time.monotonic() >= deadline:
+                        try:
+                            queue_size = self.motion.getQueueSize()
+                        except Exception:
+                            queue_size = "unknown"
+                        record["result"] = "queue_full_timeout"
+                        raise RuntimeError(
+                            f"连续扫描路径第 {index + 1} 段队列持续满载 "
+                            f"{retry_timeout:.1f}s，当前队列={queue_size}"
+                        )
+                    time.sleep(retry_interval)
+                    continue
+                # ret=13 (AUBO_REQUEST_IGNORE): with a shallow queue the next
+                # segment can arrive while the previous one is already in its
+                # final blend, and the controller drops it.  Resending the
+                # same target is safe: it is either queued normally or, once
+                # the arm has settled, executed from the previous waypoint.
+                # If the arm is already on the target, 13 is permanent.
+                if code == 13:
+                    # The controller also answers 13 when the arm already
+                    # sits on this target (e.g. the segment ran after an
+                    # earlier ret=2).  Resending would never succeed, so
+                    # accept it once the measured TCP matches.
+                    if self._tcp_reached(pose, reached_position_tolerance_m, reached_rotation_tolerance_deg):
+                        already_reached = True
+                        break
+                    ignored_count += 1
+                    if ignored_since is None:
+                        ignored_since = time.monotonic()
+                        print(
+                            f"[MOTION] 连续路径第 {index + 1} 段返回13(请求被忽略)，"
+                            f"重新下发，最多 {ignore_timeout:.0f}s",
+                            flush=True,
+                        )
+                    if self.state is not None and bool(self.state.isCollisionOccurred()):
+                        record["result"] = "collision"
+                        raise RuntimeError(
+                            f"连续扫描路径第 {index + 1} 段返回13时检测到碰撞，停止下发"
+                        )
+                    if time.monotonic() - ignored_since >= ignore_timeout:
+                        record["result"] = "ignored_timeout"
+                        raise RuntimeError(
+                            f"连续扫描路径第 {index + 1} 段持续返回13 "
+                            f"{ignore_timeout:.1f}s，已放弃"
+                        )
+                    time.sleep(retry_interval)
+                    continue
+                break
+            record.update({
+                "queued_at_s": round(time.monotonic() - path_started, 3),
+                "wait_s": round(time.monotonic() - segment_started, 3),
+                "attempts": attempts,
+                "queue_full_retries": queue_full_count,
+                "ignored_retries": ignored_count,
+                "result": "ignored_already_reached" if already_reached else ret_text(result),
+            })
+            results.append(result)
+            if already_reached:
+                print(
+                    f"[MOTION] 连续路径第 {index + 1} 段返回13，但实测TCP已在该目标，继续下一段",
+                    flush=True,
+                )
+                continue
+            if not sdk_ok(result):
+                raise RuntimeError(
+                    f"连续扫描路径第 {index + 1} 段下发失败：{ret_text(result)}"
+                )
+            if ignored_count:
+                print(
+                    f"[MOTION] 连续路径第 {index + 1} 段重发 {ignored_count} 次后已接受",
+                    flush=True,
+                )
+        return results
 
     def speed_joint(self, speeds_rad_s: list[float], acc_rad_s2: float, duration_s: float) -> Any:
         with self.lock:

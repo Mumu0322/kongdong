@@ -19,12 +19,13 @@ import numpy as np
 from .capture import capture_burst_samples_gui
 from .camera import get_rgb_frame_bundle, init_rgb_handeye_pipeline, print_device_info
 from .charuco_detect import create_charuco_board, estimate_rgb_board_pose
-from .config import CAMERA_CFG, ROBOT_CFG, SOLVE_CFG
+from .config import AUTO_CAPTURE_CFG, CAMERA_CFG, ROBOT_CFG, SOLVE_CFG
 from .gui_common import GuiLogWriter
 from .io_utils import make_dir
 from .quality import evaluate_image_quality
 from .robot import AUBO_SESSION, close_aubo_session
 from .samples import CalibSample, archive_samples, load_existing_samples, next_available_sample_index
+from .sample_pruning import PruneThresholds, delete_high_error_samples, plan_high_error_samples
 from .solve import format_handeye_summary, solve_and_save
 try:
     from PIL import Image, ImageTk  # type: ignore
@@ -86,6 +87,12 @@ class HandEyeGuiPanel(ttk.Frame):
         self._last_pose_poll = 0.0
         self.save_dir_var = tk.StringVar(value=CAMERA_CFG.save_dir)
         self.output_json_var = tk.StringVar(value=SOLVE_CFG.output_json)
+        self.auto_prune_var = tk.BooleanVar(value=True)
+        self.prune_rmse_var = tk.StringVar(value=str(AUTO_CAPTURE_CFG.max_rgb_reprojection_rmse_px))
+        self.prune_max_var = tk.StringVar(value=str(AUTO_CAPTURE_CFG.max_rgb_reprojection_error_px))
+        self.prune_handeye_var = tk.BooleanVar(value=False)
+        self.prune_translation_var = tk.StringVar(value="0.5")
+        self.prune_rotation_var = tk.StringVar(value="0.1")
 
         self.camera_status_var = tk.StringVar(value="未启动")
         self.robot_status_var = tk.StringVar(value="未连接")
@@ -146,13 +153,30 @@ class HandEyeGuiPanel(ttk.Frame):
             toolbar, text="采集5帧选1帧", command=lambda: self.enqueue_command("capture"),
         )
         self.capture_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.solve_btn = ttk.Button(toolbar, text="求解标定", command=lambda: self.enqueue_command("solve"))
+        self.solve_btn = ttk.Button(toolbar, text="求解标定", command=self.enqueue_solve)
         self.solve_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.maintenance_btn = ttk.Menubutton(toolbar, text="样本维护")
         maintenance_menu = tk.Menu(self.maintenance_btn, tearoff=False)
         maintenance_menu.add_command(label="归档最后样本", command=lambda: self.enqueue_command("delete_last"))
         self.maintenance_btn.configure(menu=maintenance_menu)
         self.maintenance_btn.pack(side=tk.LEFT)
+
+        prune = ttk.LabelFrame(root, text="求解后自动永久删除高误差样本（RGB 图、叠加图及样本 JSON）")
+        prune.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(prune, text="启用", variable=self.auto_prune_var).pack(side=tk.LEFT, padx=(0, 8))
+        for label, variable in (
+            ("重投影 RMSE ≤", self.prune_rmse_var),
+            ("最大误差 ≤", self.prune_max_var),
+        ):
+            ttk.Label(prune, text=label).pack(side=tk.LEFT)
+            ttk.Entry(prune, textvariable=variable, width=6).pack(side=tk.LEFT, padx=(3, 2))
+            ttk.Label(prune, text="px").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(prune, text="另按手眼残差", variable=self.prune_handeye_var).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(prune, text="平移 ≤").pack(side=tk.LEFT)
+        ttk.Entry(prune, textvariable=self.prune_translation_var, width=6).pack(side=tk.LEFT, padx=(3, 2))
+        ttk.Label(prune, text="mm  旋转 ≤").pack(side=tk.LEFT)
+        ttk.Entry(prune, textvariable=self.prune_rotation_var, width=6).pack(side=tk.LEFT, padx=(3, 2))
+        ttk.Label(prune, text="°").pack(side=tk.LEFT)
 
         status = ttk.LabelFrame(root, text="状态")
         status.pack(fill=tk.X, pady=(0, 8))
@@ -338,6 +362,23 @@ class HandEyeGuiPanel(ttk.Frame):
             return
         self.command_queue.put((command, payload))
 
+    def enqueue_solve(self) -> None:
+        try:
+            thresholds = PruneThresholds(
+                reprojection_rmse_px=float(self.prune_rmse_var.get()),
+                reprojection_max_px=float(self.prune_max_var.get()),
+                use_handeye_residual=bool(self.prune_handeye_var.get()),
+                handeye_translation_mm=float(self.prune_translation_var.get()),
+                handeye_rotation_deg=float(self.prune_rotation_var.get()),
+            )
+            thresholds.validate()
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("误差阈值错误", str(exc))
+            return
+        self.enqueue_command("solve", {
+            "auto_prune": bool(self.auto_prune_var.get()), "thresholds": thresholds,
+        })
+
     def _worker_status(self, **kwargs: str) -> None:
         self.status_queue.put({k: str(v) for k, v in kwargs.items()})
 
@@ -388,6 +429,16 @@ class HandEyeGuiPanel(ttk.Frame):
                 elif command == "solve":
                     result = solve_and_save(samples)
                     if result is not None:
+                        if payload and payload.get("auto_prune"):
+                            thresholds = payload["thresholds"]
+                            decisions = plan_high_error_samples(samples, result, thresholds)
+                            if decisions:
+                                samples, report = delete_high_error_samples(samples, decisions, thresholds)
+                                print(f"[HANDEYE] 永久删除 {len(decisions)} 个高误差样本；清单：{report}")
+                                result = solve_and_save(samples)
+                                self._worker_status(samples=str(len(samples)))
+                            else:
+                                print("[HANDEYE] 所有样本均通过当前自动清理阈值，未删除图片。")
                         self._worker_status(output=SOLVE_CFG.output_json, result=format_handeye_summary(result))
                     else:
                         self._worker_status(result="样本不足，无法求解")

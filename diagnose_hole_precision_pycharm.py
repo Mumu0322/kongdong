@@ -284,15 +284,7 @@ def load_intrinsics_from_json(locator: Any) -> Any:
     from aubo_workbench.camera import CameraIntrinsics
 
     if not INTRINSICS_JSON.is_file():
-        # 使用用户实际读取到的1280x800 SDK内参作为后备值。
-        return CameraIntrinsics(
-            1280, 800,
-            610.048522949, 610.270812988,
-            648.242248535, 406.749450684,
-            (-0.033531755208969116, 0.03746772184967995,
-             0.00020212080562487245, -9.991253318730742e-05,
-             -0.01323756854981184, 0.0, 0.0, 0.0),
-        )
+        raise FileNotFoundError(f"缺少当前 Gemini 338Le 的 RGB 内参: {INTRINSICS_JSON}")
 
     payload = json.loads(INTRINSICS_JSON.read_text(encoding="utf-8"))
     data = payload.get("intrinsics", payload)

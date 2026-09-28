@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aubo-workbench"
 version = "0.1.0"
-description = "AUBO + Gemini 435Le + YOLO 两阶段孔位定位工作台"
+description = "AUBO + Gemini 338Le + YOLO 两阶段孔位定位工作台"
 readme = "README.md"
 
 # 厂商 SDK pyaubo_sdk 只提供 cp310-win_amd64 的二进制扩展
@@ -32,7 +32,7 @@ aubo-workbench = "aubo_workbench.workbench:main"
 
 # 以下依赖不通过 pip 管理，由 aubo_workbench.sdk_paths 在运行时加入 sys.path：
 #   pyaubo_sdk    -> third_party/aubo_sdk
-#   pyorbbecsdk   -> third_party/orbbec_runtime（CPython 3.10 Windows 扩展）
+#   pyorbbecsdk   -> third_party/orbbec_runtime_338le（CPython 3.10 Windows 扩展）
 # 升级或替换 SDK 时另行建立版本记录，不要写进 dependencies。
 
 [tool.setuptools]

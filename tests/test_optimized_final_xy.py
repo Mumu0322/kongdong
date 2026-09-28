@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -20,12 +21,7 @@ from run_yolo_eye_in_hand_optimized import (
     hole_camera_point,
 )
 from aubo_workbench.camera import CameraIntrinsics
-from aubo_workbench.hole_localization_planning import (
-    CHARUCO_XY_MODEL_BIAS_MM,
-    CHARUCO_XY_MODEL_MATRIX,
-    CHARUCO_XY_MODEL_READY,
-    CHARUCO_XY_MODEL_SOURCE,
-)
+import aubo_workbench.hole_localization_planning as planning
 
 
 class FinalXyPlanningTests(unittest.TestCase):
@@ -61,16 +57,24 @@ class FinalXyPlanningTests(unittest.TestCase):
         ])
         tcp[:3, 3] = np.array([100.0, 200.0, 300.0])
         visual_xy = np.array([443.0, -165.0])
-        target, before = plan_final_tcp_xy(
-            tcp, np.array([*visual_xy, -99.0]), use_charuco_model=True,
-        )
-        expected_xy = CHARUCO_XY_MODEL_MATRIX @ visual_xy + CHARUCO_XY_MODEL_BIAS_MM
-        self.assertTrue(CHARUCO_XY_MODEL_SOURCE.is_file())
-        self.assertTrue(CHARUCO_XY_MODEL_READY)
+        matrix = np.array([[1.01, 0.02], [-0.01, 0.99]])
+        bias = np.array([2.0, -3.0])
+        with patch.object(planning, "CHARUCO_XY_MODEL_MATRIX", matrix), \
+             patch.object(planning, "CHARUCO_XY_MODEL_BIAS_MM", bias), \
+             patch.object(planning, "CHARUCO_XY_MODEL_READY", True):
+            target, before = plan_final_tcp_xy(
+                tcp, np.array([*visual_xy, -99.0]), use_charuco_model=True,
+            )
+        expected_xy = matrix @ visual_xy + bias
         np.testing.assert_allclose(target[:2, 3], expected_xy)
         self.assertEqual(target[2, 3], 300.0)
         np.testing.assert_allclose(target[:3, :3], tcp[:3, :3])
         np.testing.assert_allclose(before, tcp[:3, 3])
+
+    def test_charuco_requires_new_camera_model(self):
+        with patch.object(planning, "CHARUCO_XY_MODEL_READY", False):
+            with self.assertRaisesRegex(RuntimeError, "尚无 ChArUco XY 纠偏模型"):
+                plan_final_tcp_xy(np.eye(4), np.array([443.0, -165.0, -99.0]))
 
     def test_charuco_correction_is_enabled_by_default_from_cli(self):
         parser = build_parser()

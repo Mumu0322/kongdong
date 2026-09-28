@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Gemini 435Le 相机初始化、取帧、RGB/Depth/点云格式转换。
+"""Gemini 338Le 相机初始化、取帧、RGB/Depth/点云格式转换。
 
 所有 pyorbbecsdk 相关的细节都封装在这里；其余模块只应该调用
 `init_pipeline()` / `get_aligned_rgb_depth_xyz()` / `print_device_info()`，
@@ -16,7 +16,7 @@ import time
 import cv2
 import numpy as np
 
-from .config import CAMERA_CFG
+from .config import CAMERA_CFG, ROBOT_CAMERA_INTEGRATION_CFG
 from .orbbec_paths import add_orbbec_runtime_path
 
 add_orbbec_runtime_path()
@@ -112,12 +112,16 @@ class RgbFrameBundle:
     color_frame_index: int | None
     host_timestamp_ns: int
     intrinsics: CameraIntrinsics | None = None
+    color_system_timestamp_us: int | None = None
+    color_exposure_us: int | None = None
 
     def metadata_dict(self) -> dict:
         return {
             "color_timestamp_us": self.color_timestamp_us,
             "color_frame_index": self.color_frame_index,
             "host_timestamp_ns": int(self.host_timestamp_ns),
+            "color_system_timestamp_us": self.color_system_timestamp_us,
+            "color_exposure_us": self.color_exposure_us,
             "width": int(self.color_bgr.shape[1]),
             "height": int(self.color_bgr.shape[0]),
             "intrinsics": None if self.intrinsics is None else self.intrinsics.as_dict(),
@@ -172,7 +176,7 @@ def format_orbbec_error_hint(exc: Exception) -> str:
     if "VendorTCPClient" in text or "192.168.1.10" in text or "port=8090" in text:
         hints.extend([
             "[ERROR] SDK 正在按以太网相机访问 192.168.1.10:8090，但该地址/端口没有响应。",
-            "[CHECK] 这不是 AUBO 机械臂 192.168.50.200 的错误，而是 Gemini 435Le 相机网络错误。",
+            "[CHECK] 这不是 AUBO 机械臂 192.168.50.200 的错误，而是 Gemini 338Le 相机网络错误。",
             "[CHECK] 如果相机走网口，请确认本机连接相机的网卡在 192.168.1.x/24 网段，且能 ping 通 192.168.1.10。",
             "[CHECK] 如果相机走 USB，请检查 Orbbec SDK/设备配置里是否误把相机切到了 ethernet 模式。",
         ])
@@ -181,7 +185,7 @@ def format_orbbec_error_hint(exc: Exception) -> str:
 
 def print_device_info() -> bool:
     if _ORBBEC_IMPORT_ERROR is not None:
-        print("[ERROR] 未能导入 pyorbbecsdk。请在 Gemini 435Le 相机运行环境中执行本脚本。")
+        print("[ERROR] 未能导入 pyorbbecsdk。请在 Gemini 338Le 相机运行环境中执行本脚本。")
         print("[ERROR] import error:", _ORBBEC_IMPORT_ERROR)
         return False
     try:
@@ -216,7 +220,20 @@ def print_device_info() -> bool:
 
 def get_depth_profile(pipeline: "Pipeline"):
     depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-    depth_profile = depth_profiles.get_default_video_stream_profile()
+    descriptions = describe_video_profiles(depth_profiles)
+    matches = [profile for profile in descriptions if (
+        profile.width == CAMERA_CFG.preferred_depth_width
+        and profile.height == CAMERA_CFG.preferred_depth_height
+        and profile.fps == CAMERA_CFG.preferred_depth_fps
+        and profile.format == CAMERA_CFG.preferred_depth_format
+    )]
+    if not matches:
+        raise RuntimeError(
+            "Gemini 338Le 不支持配置的 Depth profile: "
+            f"{CAMERA_CFG.preferred_depth_width}x{CAMERA_CFG.preferred_depth_height} "
+            f"@{CAMERA_CFG.preferred_depth_fps} {CAMERA_CFG.preferred_depth_format}"
+        )
+    depth_profile = depth_profiles.get_stream_profile_by_index(matches[0].index)
     print("[INFO] 使用 Depth Profile:", depth_profile)
     return depth_profile
 
@@ -251,10 +268,13 @@ def describe_video_profiles(profile_list) -> list[VideoProfileInfo]:
     return result
 
 
-def choose_color_profile_index(profiles: list[VideoProfileInfo]) -> int:
+def choose_color_profile_index(
+    profiles: list[VideoProfileInfo], *, preferred_fps: int | None = None,
+) -> int:
     """纯函数：显式按配置选择彩色流，便于离线单测。"""
     if not profiles:
         raise RuntimeError("相机没有可用的彩色流 profile")
+    target_fps = CAMERA_CFG.preferred_color_fps if preferred_fps is None else int(preferred_fps)
     preferred_formats = [str(x).upper().removeprefix("OB_FORMAT_") for x in CAMERA_CFG.preferred_color_formats]
 
     def format_rank(name: str) -> int:
@@ -269,15 +289,15 @@ def choose_color_profile_index(profiles: list[VideoProfileInfo]) -> int:
         height_match = CAMERA_CFG.preferred_color_height <= 0 or info.height == CAMERA_CFG.preferred_color_height
         dimension_match = int(width_match and height_match)
         area = int(info.width * info.height)
-        fps_distance = abs(int(info.fps) - int(CAMERA_CFG.preferred_color_fps))
-        return dimension_match, area, format_rank(info.format), -fps_distance, info.fps
+        fps_distance = abs(int(info.fps) - target_fps)
+        return dimension_match, area, -fps_distance, format_rank(info.format), info.fps
 
     return int(max(profiles, key=key).index)
 
 
 def print_video_profiles(title: str, profiles: list[VideoProfileInfo], selected_index: int | None = None) -> None:
     print(f"[INFO] {title} profiles ({len(profiles)}):")
-    for info in profiles:
+    for info in profiles[:20] + [item for item in profiles[20:] if item.index == selected_index]:
         marker = "*" if selected_index == info.index else " "
         print(
             f"[INFO] {marker} index={info.index:2d} {info.width}x{info.height} "
@@ -285,10 +305,10 @@ def print_video_profiles(title: str, profiles: list[VideoProfileInfo], selected_
         )
 
 
-def get_color_profile(pipeline: "Pipeline"):
+def get_color_profile(pipeline: "Pipeline", *, fps: int | None = None):
     color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
     descriptions = describe_video_profiles(color_profiles)
-    selected_index = choose_color_profile_index(descriptions)
+    selected_index = choose_color_profile_index(descriptions, preferred_fps=fps)
     print_video_profiles("Color", descriptions, selected_index)
     color_profile = color_profiles.get_stream_profile_by_index(selected_index)
     print(f"[INFO] 显式选择 Color Profile index={selected_index}:", color_profile)
@@ -336,6 +356,17 @@ def get_device_identity(pipeline) -> dict:
         return result
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def verify_production_camera(pipeline) -> dict:
+    identity = get_device_identity(pipeline)
+    expected = ROBOT_CAMERA_INTEGRATION_CFG.production_camera_serial
+    actual = identity.get("serial_number", "")
+    if not expected or actual != expected:
+        raise RuntimeError(f"上部相机序列号不匹配：预期 {expected!r}，实际 {actual!r}")
+    if "338Le" not in identity.get("name", ""):
+        raise RuntimeError(f"上部相机型号不匹配：{identity.get('name')!r}")
+    return identity
 
 
 def configure_color_controls(
@@ -455,6 +486,11 @@ def init_pipeline(depth_filter_mode: str = "none"):
     except Exception as exc:
         print("[WARN] 设置 FULL_FRAME_REQUIRE 失败，继续运行:", exc)
     pipeline.start(config)
+    try:
+        verify_production_camera(pipeline)
+    except Exception:
+        pipeline.stop()
+        raise
     print("[INFO] pipeline 启动成功")
 
     if CAMERA_CFG.lock_color_auto_exposure or CAMERA_CFG.color_exposure is not None or CAMERA_CFG.color_gain is not None:
@@ -506,11 +542,16 @@ def init_pipeline(depth_filter_mode: str = "none"):
 
 
 def init_rgb_handeye_pipeline():
-    """启动仅彩色流的手眼pipeline；正式RGB-PnP链路不依赖Depth设备帧。"""
+    """启动 1280x800@60 仅彩色流；正式RGB-PnP链路不依赖Depth设备帧。"""
     pipeline = Pipeline()
     config = Config()
-    config.enable_stream(get_color_profile(pipeline))
+    config.enable_stream(get_color_profile(pipeline, fps=CAMERA_CFG.rgb_only_color_fps))
     pipeline.start(config)
+    try:
+        verify_production_camera(pipeline)
+    except Exception:
+        pipeline.stop()
+        raise
     print("[INFO] RGB-PnP手眼pipeline启动成功：仅启用Color流，不启用Depth/PointCloud")
     if CAMERA_CFG.lock_color_auto_exposure or CAMERA_CFG.color_exposure is not None or CAMERA_CFG.color_gain is not None:
         controls = configure_color_controls(
@@ -526,6 +567,13 @@ def init_rgb_handeye_pipeline():
 def _frame_optional_int(frame, method_name: str) -> int | None:
     try:
         return int(getattr(frame, method_name)())
+    except Exception:
+        return None
+
+
+def _color_exposure_us(frame) -> int | None:
+    try:
+        return int(frame.get_metadata_value(OBFrameMetadataType.EXPOSURE))
     except Exception:
         return None
 
@@ -614,6 +662,8 @@ def get_rgb_frame_bundle(pipeline) -> RgbFrameBundle | None:
         color_frame_index=_frame_optional_int(color_frame, "get_index"),
         host_timestamp_ns=host_timestamp_ns,
         intrinsics=intrinsics,
+        color_system_timestamp_us=_frame_optional_int(color_frame, "get_system_timestamp_us"),
+        color_exposure_us=_color_exposure_us(color_frame),
     )
 
 

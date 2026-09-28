@@ -417,7 +417,7 @@ def solve_and_save(samples: list[CalibSample]) -> dict[str, Any] | None:
     pose_source = pose_sources[0]
     calibration_frame = calibration_frame_for_samples(fit_samples)
     is_rgb = calibration_frame == "rgb_camera"
-    sensor_frame_name = "gemini435le_rgb_optical_frame" if is_rgb else "gemini435le_pointcloud_xyz_map_frame"
+    sensor_frame_name = "gemini338le_rgb_optical_frame" if is_rgb else "gemini338le_pointcloud_xyz_map_frame"
     method_name = "charuco_rgb_pnp_handeye" if is_rgb else "legacy_charuco_pointcloud_handeye_diagnostic"
     reference_frame = {
         "tcp": "tool_tcp",
